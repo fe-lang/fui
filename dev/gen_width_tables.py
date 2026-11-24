@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Writes the Unicode tables of `tui::text`: src/text/tables.fe, the
+properties of each scalar, and src/text/grapheme_tests.fe, the cases of
+GraphemeBreakTest.txt as a test.
+
+Widths come from Python's `unicodedata`; the rest is not in it, so it comes
+from the Unicode Character Database files of the same version, in the
+directory given as the argument:
+
+    V=16.0.0  # python3 -c 'import unicodedata; print(unicodedata.unidata_version)'
+    U=https://www.unicode.org/Public/$V/ucd
+    curl -O $U/auxiliary/GraphemeBreakProperty.txt -O $U/auxiliary/GraphemeBreakTest.txt \\
+        -O $U/emoji/emoji-data.txt -O $U/emoji/emoji-variation-sequences.txt \\
+        -O $U/DerivedCoreProperties.txt
+    python3 dev/gen_width_tables.py .
+
+Width 0: the controls (Cc), general categories Mn, Me and Cf (except U+00AD
+SOFT HYPHEN, which terminals show) and the Hangul medial vowels and final
+consonants, which join the leading consonant before them. Width 2: East
+Asian Wide and Fullwidth, which since Unicode 9 includes every emoji of
+default emoji presentation. Everything else is width 1.
+"""
+import pathlib
+import sys
+import unicodedata
+
+HANGUL_JOINING = [(0x1160, 0x11FF), (0xD7B0, 0xD7C6), (0xD7CB, 0xD7FB)]
+HANGUL_SYLLABLES = (0xAC00, 0xD7A3)
+
+# The layout of a property value; `text.fe` reads it with the same numbers.
+GRAPHEME_BREAK = [
+    "Other", "CR", "LF", "Control", "Extend", "ZWJ", "Regional_Indicator", "Prepend",
+    "SpacingMark", "L", "V", "T", "LV", "LVT",
+]
+INCB = {"Consonant": 1, "Linker": 2, "Extend": 3}
+BREAK_SHIFT = 2
+PICTOGRAPHIC = 1 << 6
+INCB_SHIFT = 7
+VARIATION_BASE = 1 << 9
+DEFAULT = 1  # width 1, Other, nothing else
+
+
+def entries(path):
+    """The (first, last, fields) of each data line of a UCD file."""
+    for line in path.read_text().splitlines():
+        data = line.split("#")[0].strip()
+        if data:
+            fields = [field.strip() for field in data.split(";")]
+            first, _, last = fields[0].partition("..")
+            yield int(first, 16), int(last or first, 16), fields[1:]
+
+
+def check_version(path, version):
+    first = path.read_text().splitlines()[0]
+    if f"-{version}.txt" not in first:
+        sys.exit(f"{path} is not of Unicode {version}: {first}")
+
+
+def width(cp):
+    ch = chr(cp)
+    category = unicodedata.category(ch)
+    if category == "Cc" or any(lo <= cp <= hi for lo, hi in HANGUL_JOINING):
+        return 0
+    if category in ("Mn", "Me", "Cf") and cp != 0xAD:
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def fe_array(name, kind, values):
+    body = "".join(f"    {v},\n" for v in values)
+    return f"const {name}: [{kind}; {len(values)}] = [\n{body}]\n"
+
+
+def properties(data):
+    breaks = {}
+    for first, last, (value,) in entries(data / "GraphemeBreakProperty.txt"):
+        for cp in range(first, last + 1):
+            breaks[cp] = GRAPHEME_BREAK.index(value)
+    pictographic = set()
+    for first, last, (value,) in entries(data / "emoji-data.txt"):
+        if value == "Extended_Pictographic":
+            pictographic.update(range(first, last + 1))
+    incb = {}
+    for first, last, fields in entries(data / "DerivedCoreProperties.txt"):
+        if fields[0] == "InCB":
+            for cp in range(first, last + 1):
+                incb[cp] = INCB[fields[1]]
+    bases = set()
+    for line in (data / "emoji-variation-sequences.txt").read_text().splitlines():
+        fields = line.split("#")[0].split(";")
+        if len(fields) >= 2 and fields[1].strip() == "emoji style":
+            base, selector = fields[0].split()
+            assert selector == "FE0F", line
+            bases.add(int(base, 16))
+    lv = GRAPHEME_BREAK.index("LV")
+    lvt = GRAPHEME_BREAK.index("LVT")
+    for cp in range(0, 0x110000):
+        if 0xD800 <= cp <= 0xDFFF:
+            continue
+        brk = breaks.get(cp, 0)
+        # One range holds the Hangul syllables; `text.fe` tells LVT from LV.
+        if HANGUL_SYLLABLES[0] <= cp <= HANGUL_SYLLABLES[1]:
+            assert brk == (lv if (cp - 0xAC00) % 28 == 0 else lvt)
+            brk = lv
+        value = width(cp) | brk << BREAK_SHIFT | incb.get(cp, 0) << INCB_SHIFT
+        if cp in pictographic:
+            assert brk == 0, hex(cp)
+            value |= PICTOGRAPHIC
+        if cp in bases:
+            value |= VARIATION_BASE
+        yield cp, value
+
+
+def ranges(points):
+    """Merges code points with equal values into (first, last, value)."""
+    out = []
+    for cp, value in points:
+        if out and out[-1][1] == cp - 1 and out[-1][2] == value:
+            out[-1][1] = cp
+        else:
+            out.append([cp, cp, value])
+    return out
+
+
+def tables(version, data):
+    table = [r for r in ranges(properties(data)) if r[2] != DEFAULT]
+    packed = [f"0x{s << 40 | e << 16 | v:016x}" for s, e, v in table]
+    text = (
+        f"//! Unicode {version} scalar properties, generated by\n"
+        "//! `dev/gen_width_tables.py` from Python's `unicodedata` and the\n"
+        f"//! Unicode {version} data files. Do not edit.\n\n"
+        "/// The Unicode version of the tables.\n"
+        f'pub const UNICODE_VERSION: String<{len(version)}> = "{version}"\n\n'
+        "/// The scalars whose properties are not the default (width 1, grapheme\n"
+        "/// break Other, nothing else), as sorted disjoint ranges\n"
+        "/// `first << 40 | last << 16 | value`. A value holds the width in bits\n"
+        "/// 0 and 1, the grapheme break property in bits 2 to 5 (`GB_*` in\n"
+        "/// `text.fe`), Extended_Pictographic in bit 6, Indic_Conjunct_Break in\n"
+        "/// bits 7 and 8 (Consonant 1, Linker 2, Extend 3) and, in bit 9, whether\n"
+        "/// the scalar takes an emoji presentation with U+FE0F. The Hangul\n"
+        "/// syllables are one range of grapheme break LV.\n"
+        "pub(ingot) " + fe_array("PROPERTIES", "u64", packed)
+    )
+    return text, len(table)
+
+
+# A case scalar with this bit set starts a cluster; `CASE_END` ends a case.
+BREAK_BEFORE = 1 << 31
+CASE_END = 0x7FFFFFFF
+
+
+def grapheme_tests(version, data):
+    values = []
+    cases = 0
+    for line in (data / "GraphemeBreakTest.txt").read_text().splitlines():
+        tokens = line.split("#")[0].split()
+        if not tokens:
+            continue
+        case = []
+        for mark, scalar in zip(tokens[0::2], tokens[1::2]):
+            cp = int(scalar, 16)
+            assert not 0xD800 <= cp <= 0xDFFF, line
+            case.append(cp | (BREAK_BEFORE if mark == "÷" else 0))
+        values += [f"0x{v:08x}" for v in case] + [f"0x{CASE_END:08x}"]
+        cases += 1
+    text = (
+        f"//! The {cases} cases of GraphemeBreakTest.txt of Unicode {version},\n"
+        "//! generated by `dev/gen_width_tables.py`. Do not edit.\n"
+        "use core::{MemBuffer, MemVec}\n"
+        "use super::{encode, next_cluster}\n\n"
+        "// Each case is its scalars, each with bit 31 set if a cluster starts at\n"
+        "// it, then `CASE_END`.\n"
+        + fe_array("CASES", "u32", values)
+        + f"\nconst BREAK_BEFORE: u32 = 0x{BREAK_BEFORE:08x}\n"
+        f"const CASE_END: u32 = 0x{CASE_END:08x}\n"
+        """
+#[test]
+fn clusters_match_the_unicode_grapheme_break_tests() {
+    var i: usize = 0
+    var failures: usize = 0
+    while i < CASES.len() {
+        var text = MemBuffer::empty()
+        var starts: MemVec<usize> = MemVec::new()
+        while CASES[i] != CASE_END {
+            if CASES[i] & BREAK_BEFORE != 0 {
+                starts.push(text.len())
+            }
+            encode(CASES[i] & (BREAK_BEFORE - 1), mut text)
+            i += 1
+        }
+        i += 1
+        var offset: usize = 0
+        var cluster: usize = 0
+        var same = true
+        while offset < text.len() {
+            same = same && cluster < starts.len() && starts[cluster] == offset
+            let next = next_cluster(text.span(), offset)
+            same = same && next.width <= 2
+            offset += next.len
+            cluster += 1
+        }
+        if !same || cluster != starts.len() {
+            failures += 1
+        }
+    }
+    assert(failures == 0)
+}
+"""
+    )
+    return text, cases
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: gen_width_tables.py <directory of the UCD files>")
+    version = unicodedata.unidata_version
+    data = pathlib.Path(sys.argv[1])
+    for name in ["GraphemeBreakProperty.txt", "GraphemeBreakTest.txt", "DerivedCoreProperties.txt"]:
+        check_version(data / name, version)
+    out = pathlib.Path(__file__).resolve().parent.parent / "src" / "text"
+    text, count = tables(version, data)
+    (out / "tables.fe").write_text(text)
+    text, cases = grapheme_tests(version, data)
+    (out / "grapheme_tests.fe").write_text(text)
+    print(f"Unicode {version}: {count} property ranges, {cases} grapheme break cases")
+
+
+main()
