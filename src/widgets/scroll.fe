@@ -27,6 +27,8 @@
 //! the content's length less the viewport's, so the last screenful of
 //! content fills the viewport rather than scrolling off it.
 use core::ops::Eq
+use ingot::event::{Mouse, MouseKind}
+use ingot::geom::Rect
 
 /// The rows a notch of the mouse wheel scrolls a list or a table by.
 pub const WHEEL_ROWS: u16 = 3
@@ -152,6 +154,24 @@ impl ScrollState {
     /// Scrolls to the end: the last position.
     pub fn to_end(mut self) {
         self.position = self.max_position()
+    }
+
+    /// Handles a mouse event over `area`, where the content is drawn: each
+    /// notch of the wheel scrolls by `WHEEL_ROWS` units. Returns whether it
+    /// was a notch over the area, so the view may have moved.
+    pub fn handle_mouse(mut self, _ mouse: Mouse, _ area: Rect) -> bool {
+        if !area.contains(mouse.pos) {
+            return false
+        }
+        let step = WHEEL_ROWS as isize
+        match mouse.kind {
+            MouseKind::ScrollDown => self.scroll_by(step),
+            MouseKind::ScrollUp => self.scroll_by(-step),
+            _ => {
+                return false
+            },
+        }
+        true
     }
 
     /// Scrolls as little as shows the unit at `index`: to it if it is
@@ -296,4 +316,49 @@ fn recorded_lengths_clamp_the_position() {
     s.scroll_to(60)
     s.set_lengths(content: 200, viewport: 50)
     assert(s.position() == 60)
+}
+
+#[test]
+fn the_wheel_over_the_area_scrolls() {
+    use ingot::event::{Modifiers, MouseButton}
+    use ingot::geom::Pos
+
+    var scroll = ScrollState::new()
+    scroll.set_lengths(content: 10, viewport: 4)
+    let area = Rect::new(x: 2, y: 2, width: 5, height: 4)
+    let over = Pos::new(x: 3, y: 5)
+    assert(
+        scroll.handle_mouse(
+                Mouse::new(MouseKind::ScrollDown, over, Modifiers::NONE),
+                area,
+            ),
+    )
+    assert(scroll.position() == 3)
+    assert(
+        scroll.handle_mouse(
+                Mouse::new(MouseKind::ScrollDown, over, Modifiers::NONE),
+                area,
+            ),
+    )
+    assert(scroll.position() == 6)
+    assert(
+        scroll.handle_mouse(
+                Mouse::new(MouseKind::ScrollUp, over, Modifiers::NONE),
+                area,
+            ),
+    )
+    assert(scroll.position() == 3)
+    // Outside the area, or not the wheel: nothing.
+    let outside = Pos::new(x: 7, y: 2)
+    assert(
+        !scroll.handle_mouse(
+                Mouse::new(MouseKind::ScrollDown, outside, Modifiers::NONE),
+                area,
+            ),
+    )
+    let click = MouseKind::Down(MouseButton::Left)
+    assert(
+        !scroll.handle_mouse(Mouse::new(click, over, Modifiers::NONE), area),
+    )
+    assert(scroll.position() == 3)
 }
