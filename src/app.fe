@@ -1,0 +1,351 @@
+//! Programs as a model, an update and a view, and the loop that runs them.
+//!
+//! An `App` is a model with two methods. `update` takes each event and
+//! changes the model, with the effects its row `E` names, and says what to
+//! do next with a `Flow`. `view` draws the model into the frame; it takes no
+//! host capability, so drawing cannot do I/O. `run` takes the process's
+//! terminal over and runs the loop: it draws the first frame before
+//! waiting, then gives each event to `update` and draws again when asked.
+//!
+//! ```fe
+//! struct Counter { count: u64 }
+//!
+//! impl App for Counter {
+//!     uses E = ()
+//!
+//!     fn update(mut self, _ event: Event) -> Flow uses E {
+//!         match event {
+//!             Event::Key(Key { code: KeyCode::Char(b'q'), .. }) => Flow::Quit,
+//!             Event::Key(Key { code: KeyCode::Up, .. }) => {
+//!                 self.count += 1
+//!                 Flow::Redraw
+//!             },
+//!             _ => Flow::Unchanged,
+//!         }
+//!     }
+//!
+//!     fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+//!         print(area.pos(), self.count, Style::new())
+//!     }
+//! }
+//!
+//! pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
+//!     var app = Counter { count: 0 }
+//!     match tui::run(mut app, Options::new()) {
+//!         Result::Ok(()) => 0,
+//!         Result::Err(_) => 1,
+//!     }
+//! }
+//! ```
+//!
+//! An app whose `update` needs capabilities names them in its row,
+//! `uses E = (fs: mut Fs)`, and `main` provides them along with `run`'s
+//! own. A row may name `run`'s own capabilities too, `Clock` or `Tty`: one
+//! provider then gives both, and `Tty::open` from `update` fails while
+//! `run` holds the terminal.
+use core::{Option, Result}
+use core::ops::Eq
+use std::io::Error
+use std::term::Tty
+use std::time::{Clock, Duration}
+use ingot::backend::{Backend, TermBackend}
+use ingot::event::{Event, KeyboardFlags}
+use ingot::frame::Frame
+use ingot::geom::Rect
+use ingot::input::MouseTracking
+use ingot::render::ColorDepth
+use ingot::session::Session
+use ingot::theme::Theme
+
+/// A program run by `run`: a model that events update and a view draws.
+pub trait App {
+    /// The effects `update` may use, such as `(fs: mut Fs)`, or `()`.
+    uses E
+
+    /// Handles `event`: changes the model and says what the loop does
+    /// next.
+    fn update(mut self, _ event: Event) -> Flow uses E
+
+    /// Draws the model into `area`, the whole screen, through the frame.
+    /// It may change the model's view state, such as a list's scroll
+    /// offset, but can use no host capability.
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame)
+}
+
+/// What the loop does after `update`.
+pub enum Flow {
+    /// The model changed: draw it again.
+    Redraw,
+    /// Nothing to draw: wait for the next event. A resize or a resume is
+    /// drawn anyway.
+    Unchanged,
+    /// End the loop: `run` gives the terminal back and returns.
+    Quit,
+    /// Stop the process as Ctrl-Z does in a shell, and draw again once it
+    /// continues.
+    Suspend,
+}
+
+impl Copy for Flow {}
+
+impl Eq for Flow {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (Flow::Redraw, Flow::Redraw) => true,
+            (Flow::Unchanged, Flow::Unchanged) => true,
+            (Flow::Quit, Flow::Quit) => true,
+            (Flow::Suspend, Flow::Suspend) => true,
+            _ => false,
+        }
+    }
+}
+
+/// How `run` and `Session::enter` set the terminal up and run the loop.
+/// Build it from `Options::new()`:
+/// `Options::new().mouse(MouseTracking::Clicks).tick(Duration::from_millis(250))`.
+pub struct Options {
+    /// The mouse actions reported, or `None` for none (the default), which
+    /// leaves the terminal's own selection and scrolling to the user.
+    pub mouse: Option<MouseTracking>,
+    /// Whether a paste arrives as one `Event::Paste` (the default) rather
+    /// than as keys.
+    pub bracketed_paste: bool,
+    /// Whether the terminal reports `Event::FocusGained` and
+    /// `Event::FocusLost` (off by default).
+    pub focus_events: bool,
+    /// The kitty keyboard protocol enhancements asked for, none by default.
+    /// Terminals with the protocol (kitty, WezTerm, foot, Ghostty, recent
+    /// iTerm2 and Alacritty) then tell apart keys that legacy encodings
+    /// merge, such as Ctrl+I and Tab or Ctrl+H and Backspace, send Esc
+    /// without the wait `esc_timeout` adds, and with
+    /// `KeyboardFlags::REPORT_EVENT_TYPES` report repeats and releases.
+    /// Other terminals ignore the request.
+    pub keyboard: KeyboardFlags,
+    /// The time between `Event::Tick`s, or `None` for no ticks (the
+    /// default). Ticks keep to the monotonic clock whatever else comes.
+    pub tick: Option<Duration>,
+    /// The colors the terminal shows, `ColorDepth::Ansi256` by default.
+    pub color_depth: ColorDepth,
+    /// The theme the frame starts with, `Theme::dark()` by default.
+    pub theme: Theme,
+    /// How long a lone `ESC` waits for more input before it is the Esc key:
+    /// 25 ms by default. Over a slow connection a sequence such as an arrow
+    /// key's may take longer to arrive whole.
+    pub esc_timeout: Duration,
+    /// Whether `update` gets `Event::Terminate`, rather than `run` ending
+    /// at once (the default).
+    pub handle_terminate: bool,
+    /// Whether Ctrl+C ends `run` (the default) rather than going to
+    /// `update`.
+    pub ctrl_c_quits: bool,
+    /// Whether Ctrl+Z suspends (the default) rather than going to `update`.
+    pub ctrl_z_suspends: bool,
+}
+
+impl Copy for Options {}
+
+impl Options {
+    /// The defaults: no mouse, bracketed paste, no focus events, no kitty
+    /// keyboard enhancements, no ticks, 256 colors, the dark theme, a 25 ms
+    /// Esc timeout, and Ctrl+C, Ctrl+Z and termination handled by `run`.
+    pub fn new() -> Self {
+        Options {
+            mouse: Option::None,
+            bracketed_paste: true,
+            focus_events: false,
+            keyboard: KeyboardFlags::NONE,
+            tick: Option::None,
+            color_depth: ColorDepth::Ansi256,
+            theme: Theme::dark(),
+            esc_timeout: Duration::from_millis(25),
+            handle_terminate: false,
+            ctrl_c_quits: true,
+            ctrl_z_suspends: true,
+        }
+    }
+
+    /// Reports the mouse actions of `tracking`.
+    pub fn mouse(var own self, _ tracking: MouseTracking) -> Self {
+        self.mouse = Option::Some(tracking)
+        self
+    }
+
+    pub fn bracketed_paste(var own self, _ on: bool) -> Self {
+        self.bracketed_paste = on
+        self
+    }
+
+    pub fn focus_events(var own self, _ on: bool) -> Self {
+        self.focus_events = on
+        self
+    }
+
+    /// Asks for the kitty keyboard enhancements `flags`; see the field.
+    pub fn keyboard(var own self, _ flags: KeyboardFlags) -> Self {
+        self.keyboard = flags
+        self
+    }
+
+    /// Sends `Event::Tick` every `interval`.
+    pub fn tick(var own self, _ interval: Duration) -> Self {
+        self.tick = Option::Some(interval)
+        self
+    }
+
+    pub fn color_depth(var own self, _ depth: ColorDepth) -> Self {
+        self.color_depth = depth
+        self
+    }
+
+    pub fn theme(var own self, _ theme: Theme) -> Self {
+        self.theme = theme
+        self
+    }
+
+    pub fn esc_timeout(var own self, _ timeout: Duration) -> Self {
+        self.esc_timeout = timeout
+        self
+    }
+
+    /// Gives `Event::Terminate` to `update` rather than ending the loop. An
+    /// app that sets this must end the loop itself: after a hangup the
+    /// terminal is gone, and the loop's next wait fails.
+    pub fn handle_terminate(var own self, _ on: bool) -> Self {
+        self.handle_terminate = on
+        self
+    }
+
+    pub fn ctrl_c_quits(var own self, _ on: bool) -> Self {
+        self.ctrl_c_quits = on
+        self
+    }
+
+    pub fn ctrl_z_suspends(var own self, _ on: bool) -> Self {
+        self.ctrl_z_suspends = on
+        self
+    }
+}
+
+/// `Options::new()`.
+impl Default for Options {
+    fn default() -> Self {
+        Options::new()
+    }
+}
+
+/// Runs `app` on the process's terminal until it quits: takes the terminal
+/// over with `options`, draws the first frame, then runs the loop of
+/// `run_session`. Gives the terminal back as it was on every return,
+/// including a failure, which it returns.
+pub fn run<A: App>(_ app: mut A, _ options: Options) -> Result<Error, ()>
+uses (tty: mut Tty, clock: Clock, A::E)
+{
+    var session = Session::enter(TermBackend::open()?, options)?
+    let ran = run_session(mut app, mut session)
+    let left = session.leave()
+    ran?
+    left
+}
+
+/// Runs `app` on a session until it quits, as `run` does on the process's
+/// terminal, with the session's options.
+///
+/// It draws a frame, then loops: takes the next event, gives it to
+/// `update`, and draws again if the `Flow` asks or the event was a resize
+/// or a resume, once no more events are queued. With `Options::tick` it
+/// sends `Event::Tick` at each interval of the session's clock, before
+/// other events once one is due, skipping ticks it was too busy for.
+/// Unless the options give them to `update`, `Event::Terminate` and Ctrl+C
+/// end the loop and Ctrl+Z suspends.
+///
+/// The session stays entered: leaving it is the caller's.
+pub fn run_session<B: Backend, A: App>(_ app: mut A, _ session: mut Session<B>) -> Result<Error, ()>
+uses (B::E, A::E)
+{
+    let tick = session.options().tick
+    var next_tick = match tick {
+        Option::Some(interval) => Option::Some(session.now() + interval),
+        Option::None => Option::None,
+    }
+    var dirty = true
+    while true {
+        if dirty && !session.has_events() {
+            draw(mut app, mut session)?
+            dirty = false
+        }
+        let now = session.now()
+        let event = match (next_tick, tick) {
+            (Option::Some(at), Option::Some(interval)) => if now >= at {
+                let after = at + interval
+                next_tick = Option::Some(if after > now { after } else { now + interval })
+                Event::Tick
+            } else {
+                match session.next_event(Option::Some(at - now))? {
+                    Option::Some(event) => event,
+                    Option::None => {
+                        continue
+                    },
+                }
+            },
+            _ => match session.next_event(Option::None)? {
+                Option::Some(event) => event,
+                Option::None => {
+                    continue
+                },
+            },
+        }
+        if handle(mut app, mut session, event, mut dirty)? {
+            return Result::Ok(())
+        }
+    }
+    Result::Ok(())
+}
+
+// Gives `event` to `app` as `run_session` does, setting `dirty` if the
+// screen needs drawing: whether the loop ends.
+pub(ingot) fn handle<B: Backend, A: App>(
+    _ app: mut A,
+    _ session: mut Session<B>,
+    _ event: Event,
+    _ dirty: mut bool,
+) -> Result<Error, bool>
+uses A::E
+{
+    let options = session.options()
+    match event {
+        Event::Terminate => if !options.handle_terminate {
+            return Result::Ok(true)
+        },
+        Event::Key(key) => {
+            if options.ctrl_c_quits && key.ctrl(b'c') {
+                return Result::Ok(true)
+            }
+            if options.ctrl_z_suspends && key.ctrl(b'z') {
+                session.suspend()?
+                return Result::Ok(false)
+            }
+        },
+        Event::Resize(_) => dirty = true,
+        Event::Resume => dirty = true,
+        _ => {},
+    }
+    let flow = app.update(event)
+    match flow {
+        Flow::Redraw => dirty = true,
+        Flow::Suspend => session.suspend()?,
+        _ => {},
+    }
+    Result::Ok(flow == Flow::Quit)
+}
+
+// Draws a frame of `app` and shows it.
+pub(ingot) fn draw<B: Backend, A: App>(_ app: mut A, _ session: mut Session<B>) -> Result<
+    Error,
+    (),
+> {
+    let area = session.area()
+    with (Frame = session.frame()) {
+        app.view(area)
+    }
+    session.present()
+}
