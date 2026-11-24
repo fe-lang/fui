@@ -1,0 +1,56 @@
+//! What a typical view and update function needs, for `use tui::prelude::*`.
+//!
+//! The geometry, styles, layout, drawing functions, widgets with their
+//! states, styled text and input events. Modules such as `buffer`, `render`
+//! and `input`, which programs that run their own loop use, stay under
+//! their own names.
+pub use ingot::event::{Event, Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
+pub use ingot::frame::{
+    Frame,
+    area,
+    clipped,
+    fill,
+    measure,
+    print,
+    print_in,
+    print_line,
+    print_line_with_ellipsis,
+    set_style,
+    theme,
+    themed,
+}
+pub use ingot::geom::{Pos, Rect, Size}
+pub use ingot::layout::{Constraint, Flex, Layout}
+pub use ingot::layout::Constraint::{Fill, Length, Max, Min, Percent, Ratio}
+pub use ingot::style::{Color, Modifier, Style}
+pub use ingot::text::{Alignment, Line, Lines, WrapMode}
+pub use ingot::theme::Theme
+pub use ingot::widgets::{
+    Block,
+    BorderType,
+    Borders,
+    Column,
+    Gauge,
+    LineGauge,
+    List,
+    ListRow,
+    ListState,
+    Padding,
+    Paragraph,
+    ScrollState,
+    Scrollbar,
+    Sparkline,
+    Spinner,
+    Table,
+    TableCell,
+    TableHit,
+    TableRow,
+    TableState,
+    Tabs,
+    TabsState,
+    TextInput,
+    TextInputState,
+    TextLimit,
+    clear,
+    popup,
+}
