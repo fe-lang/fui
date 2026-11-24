@@ -1,0 +1,503 @@
+//! A terminal taken over by a full-screen program: its modes, its screen and
+//! its input.
+//!
+//! `Session::enter` puts a terminal in raw mode on the alternate screen with
+//! the cursor hidden and the input modes the `Options` ask for, and leaving
+//! it, by `leave` or by destroying it, gives the terminal back as it was.
+//! The bytes that undo the modes are given to the backend before any mode
+//! is turned on, so a panic or an exit at any later point restores them too.
+//!
+//! Drawing is a projection and a call. The frame, a `Frame` over the
+//! session's back buffer, is provided to view code with `with`, and
+//! `present` then writes what changed since the frame before:
+//!
+//! ```fe
+//! let area = session.area()
+//! with (Frame = session.frame()) {
+//!     app.view(area)
+//! }
+//! session.present()?
+//! ```
+//!
+//! Inside the block, draw through the frame effect only, and do not name
+//! the session: the frame's access holds it. `present` is a call of its own, rather than the slide of
+//! `frame`, so that a failed write is returned where it happens, and a
+//! block left early, by `return` or `?`, shows no half-drawn frame.
+//!
+//! `next_event` waits for the next `Event`: keys, mouse actions, pastes and
+//! focus changes decoded from the terminal's input, and the signals a
+//! program on a terminal handles (`Event::Resize`, `Event::Terminate`,
+//! `Event::Resume`). A program that waits on more than its terminal, with
+//! its own `std::net::Poller`, watches `input_fd()` and `signal_fd()` and
+//! calls `pump`, `pop_event` and `pending_timeout` instead.
+use core::{MemBuffer, MemVec, Option, Result}
+use core::mem::replace
+use core::ops::Drop
+use std::io::{Error, ErrorKind}
+use std::term::Signal
+use std::time::Duration
+use ingot::app::Options
+use ingot::backend::{Backend, TermBackend}
+use ingot::buffer::Buffer
+use ingot::event::{Event, KeyboardFlags}
+use ingot::frame::Frame
+use ingot::geom::{Rect, Size}
+use ingot::input::{
+    Parser,
+    disable_bracketed_paste,
+    disable_focus_events,
+    disable_mouse,
+    enable_bracketed_paste,
+    enable_focus_events,
+    enable_mouse,
+    pop_keyboard_flags,
+    push_keyboard_flags,
+}
+use ingot::render::Renderer
+
+/// A terminal in raw mode on the alternate screen, drawn a frame at a time,
+/// and read as events.
+pub struct Session<B: Backend> {
+    backend: B,
+    options: Options,
+    size: Size,
+    // The frame being drawn, over the back buffer, and what the terminal
+    // shows.
+    frame: Frame,
+    front: Buffer,
+    renderer: Renderer,
+    // The next `present` draws everything, not what changed.
+    full: bool,
+    // Bytes to write, and input read.
+    out: MemBuffer,
+    input: MemBuffer,
+    parser: Parser,
+    // Events not yet taken, from `head` on.
+    events: MemVec<Event>,
+    head: usize,
+    // When the input that left the parser waiting for more came.
+    pending_since: Option<Duration>,
+    // The terminal's input has ended.
+    ended: bool,
+    // The terminal has hung up, by the end of its input or `SIGHUP`.
+    hung_up: bool,
+}
+
+impl<B: Backend> Session<B> {
+    /// Takes over the terminal of `backend`: raw mode, the alternate screen,
+    /// the cursor hidden, the screen cleared, and the mouse, paste, focus
+    /// and keyboard modes of `options`. Fails, with the terminal restored,
+    /// if the backend fails.
+    pub fn enter(_ backend: own B, _ options: Options) -> Result<Error, Self> {
+        let none = Size::new(width: 0, height: 0)
+        var session = Session {
+            backend,
+            options,
+            size: none,
+            frame: Frame::new(Buffer::new(none), options.theme),
+            front: Buffer::new(none),
+            renderer: Renderer::new(options.color_depth),
+            full: true,
+            out: MemBuffer::empty(),
+            input: MemBuffer::empty(),
+            parser: Parser::new(),
+            events: MemVec::new(),
+            head: 0,
+            pending_since: Option::None,
+            ended: false,
+            hung_up: false,
+        }
+        var restore = MemBuffer::empty()
+        restore_sequence(mut restore, options)
+        session.backend.enter_raw(restore.span())?
+        session.write_setup()?
+        let size = session.backend.size()?
+        session.set_size(size)
+        Result::Ok(session)
+    }
+
+    /// Gives the terminal back as it was before `enter`: the restore bytes,
+    /// then the settings from before raw mode. Destroying the session does
+    /// this too; nothing if done already. Once the terminal has hung up,
+    /// by the end of its input or `SIGHUP`, there is nothing to give back,
+    /// and a failure is no error.
+    pub fn leave(mut self) -> Result<Error, ()> {
+        let left = self.backend.leave_raw()
+        if self.hung_up { Result::Ok(()) } else { left }
+    }
+
+    /// The backend.
+    pub fn backend(mut? self) -> mut? B {
+        mut? self.backend
+    }
+
+    /// The options the session was entered with.
+    pub fn options(self) -> Options {
+        self.options
+    }
+
+    /// The terminal's size, as of the last `Event::Resize`.
+    pub fn size(self) -> Size {
+        self.size
+    }
+
+    /// The backend's clock: the time since it began.
+    pub fn now(self) -> Duration uses B::E {
+        self.backend.now()
+    }
+
+    /// The whole screen, from the top left.
+    pub fn area(self) -> Rect {
+        Rect::of(self.size)
+    }
+
+    /// The frame to draw the next screen into, until `present`: what is
+    /// drawn into it adds to what was drawn since the last `present`, which
+    /// left it empty with the cursor hidden.
+    pub fn frame(mut self) -> mut Frame {
+        mut self.frame
+    }
+
+    /// Makes the terminal show the frame: writes, in one write, what changed
+    /// since the frame before, or everything for the first frame and after
+    /// a resize, a resume or `invalidate`. Then empties the frame for the
+    /// next one, whether the write succeeded or not; after a failure the
+    /// next frame is drawn whole. A terminal of no columns or rows is
+    /// written nothing, and so is one whose input has ended. A write that
+    /// fails because the terminal has hung up is no error: the session
+    /// queues `Event::Terminate` instead, as when it reads the end.
+    pub fn present(mut self) -> Result<Error, ()> {
+        var written: Result<Error, ()> = Result::Ok(())
+        if self.size.area() != 0 && !self.ended {
+            written = self.render()
+        }
+        if written.is_err() && self.is_gone() {
+            self.end_input()
+            written = Result::Ok(())
+        }
+        self.frame.buffer().clear()
+        self.frame.hide_cursor()
+        written
+    }
+
+    /// Makes the next `present` draw the whole screen, as when something
+    /// other than the session wrote to the terminal.
+    pub fn invalidate(mut self) {
+        self.renderer = Renderer::new(self.options.color_depth)
+        self.full = true
+    }
+
+    /// The next event, waiting at most `timeout` for it, or forever without
+    /// one: `None` if the time passed first.
+    ///
+    /// The session handles what comes before passing it on: a resize gives
+    /// the frame the new size and makes the next frame whole before its
+    /// `Event::Resize`; an interrupt, a request to terminate or a hangup,
+    /// signalled or of the terminal itself, is `Event::Terminate`; a
+    /// request to stop suspends the session (see `suspend`); and a continue
+    /// after a stop by something else is `Event::Resume` with the next frame
+    /// whole. A lone `ESC` is the Esc key once `Options::esc_timeout` has
+    /// passed without more input; events before it are not held back.
+    ///
+    /// Once the terminal has hung up and its `Event::Terminate` has been
+    /// taken, an `UnexpectedEof` error.
+    pub fn next_event(mut self, _ timeout: Option<Duration>) -> Result<Error, Option<Event>>
+    uses B::E
+    {
+        let deadline = match timeout {
+            Option::Some(timeout) => Option::Some(self.backend.now() + timeout),
+            Option::None => Option::None,
+        }
+        while true {
+            if let Option::Some(event) = self.pop_event() {
+                return Result::Ok(Option::Some(event))
+            }
+            if self.ended {
+                return Result::Err(Error::new(ErrorKind::UnexpectedEof))
+            }
+            let now = self.backend.now()
+            if let Option::Some(deadline) = deadline && now >= deadline {
+                return Result::Ok(Option::None)
+            }
+            let wait = earliest(
+                match deadline {
+                    Option::Some(deadline) => Option::Some(deadline - now),
+                    Option::None => Option::None,
+                },
+                self.escape_wait(now),
+            )
+            let ready = self.backend.wait(wait)?
+            if ready.input || ready.hangup {
+                self.read_input()?
+            }
+            if ready.signal {
+                self.read_signals()?
+            }
+            self.expire_escape()
+        }
+        Result::Ok(Option::None)
+    }
+
+    /// Reads, without waiting, the input and signals that have come, and
+    /// queues their events for `pop_event`, handling them as `next_event`
+    /// does. Resolves a lone `ESC` once its timeout has passed. For a
+    /// program that waits on the terminal's descriptors itself: call it
+    /// when either is readable and when `pending_timeout` has passed.
+    pub fn pump(mut self) -> Result<Error, ()> uses B::E {
+        self.read_input()?
+        self.read_signals()?
+        self.expire_escape()
+        Result::Ok(())
+    }
+
+    /// Takes the next queued event, without waiting or reading.
+    pub fn pop_event(mut self) -> Option<Event> {
+        if self.head >= self.events.len() {
+            return Option::None
+        }
+        let event = self.events.replace(self.head, Event::Tick)
+        self.head += 1
+        if self.head == self.events.len() {
+            self.events.clear()
+            self.head = 0
+        }
+        Option::Some(event)
+    }
+
+    /// Whether events are queued for `pop_event`.
+    pub fn has_events(self) -> bool {
+        self.head < self.events.len()
+    }
+
+    /// How long a program that waits itself may wait before calling `pump`
+    /// with no input: the time left before a lone `ESC` becomes the Esc
+    /// key, or `None` if no input waits for more.
+    pub fn pending_timeout(self) -> Option<Duration> uses B::E {
+        self.escape_wait(self.backend.now())
+    }
+
+    /// Stops the process as Ctrl-Z does in a shell: gives the terminal back
+    /// as `leave` does, stops, and once the process continues takes the
+    /// terminal over again, makes the next frame whole and queues
+    /// `Event::Resume`.
+    pub fn suspend(mut self) -> Result<Error, ()> {
+        self.backend.suspend()?
+        self.write_setup()?
+        self.invalidate()
+        self.events.push(Event::Resume)
+        Result::Ok(())
+    }
+
+    // Writes what the frame shows, whole or what changed.
+    fn render(mut self) -> Result<Error, ()> {
+        self.out.clear()
+        let cursor = self.frame.cursor()
+        if self.full {
+            self.renderer.full(self.frame.buffer(), cursor, mut self.out)
+        } else {
+            self.renderer.diff(self.front, self.frame.buffer(), cursor, mut self.out)
+        }
+        self.full = true
+        self.backend.write_all(self.out.span())?
+        self.full = false
+        // The frame shown becomes the front buffer, and the old front the
+        // back.
+        let shown = replace(
+            mut self.front,
+            Buffer::new(Size::new(width: 0, height: 0)),
+        )
+        self.front = replace(mut self.frame.buffer(), shown)
+        Result::Ok(())
+    }
+
+    // Turns on the screen and input modes.
+    fn write_setup(mut self) -> Result<Error, ()> {
+        self.out.clear()
+        setup_sequence(mut self.out, self.options)
+        self.backend.write_all(self.out.span())
+    }
+
+    // Gives the buffers `size` and makes the next frame whole.
+    fn set_size(mut self, _ size: Size) {
+        self.size = size
+        self.frame = Frame::new(Buffer::new(size), self.options.theme)
+        self.front = Buffer::new(size)
+        self.invalidate()
+    }
+
+    // Reads the input that has come and decodes it.
+    fn read_input(mut self) -> Result<Error, ()> uses B::E {
+        self.input.clear()
+        match self.backend.read_available(mut self.input) {
+            Result::Ok(0) => {},
+            Result::Ok(_) => {
+                self.parser.feed(self.input.span(), mut self.events)
+                self.pending_since = if self.parser.is_pending() {
+                    Option::Some(self.backend.now())
+                } else {
+                    Option::None
+                }
+            },
+            Result::Err(error) => if is_end(error) {
+                self.end_input()
+            } else {
+                return Result::Err(error)
+            },
+        }
+        Result::Ok(())
+    }
+
+    // Whether the terminal reports that it has hung up.
+    fn is_gone(mut self) -> bool {
+        match self.backend.wait(Option::Some(Duration::from_nanos(0))) {
+            Result::Ok(ready) => ready.hangup,
+            Result::Err(_) => false,
+        }
+    }
+
+    // The terminal's input has ended: what came before is resolved, then
+    // `Event::Terminate`, once.
+    fn end_input(mut self) {
+        if self.ended { return }
+        self.parser.flush(mut self.events)
+        self.pending_since = Option::None
+        self.ended = true
+        self.hung_up = true
+        self.events.push(Event::Terminate)
+    }
+
+    // Takes the signals that wait and queues their events.
+    fn read_signals(mut self) -> Result<Error, ()> {
+        while let Option::Some(signal) = self.backend.next_signal()? {
+            match signal {
+                Signal::Resize => {
+                    let size = self.backend.size()?
+                    self.set_size(size)
+                    self.events.push(Event::Resize(size))
+                },
+                Signal::Suspend => self.suspend()?,
+                Signal::Continue => {
+                    self.invalidate()
+                    self.events.push(Event::Resume)
+                },
+                Signal::Hangup => {
+                    self.hung_up = true
+                    self.events.push(Event::Terminate)
+                },
+                _ => self.events.push(Event::Terminate),
+            }
+        }
+        Result::Ok(())
+    }
+
+    // Resolves a lone `ESC` whose timeout has passed.
+    fn expire_escape(mut self) uses B::E {
+        if let Option::Some(wait) = self.escape_wait(self.backend.now())
+            && wait == Duration::from_nanos(0) {
+            self.parser.flush(mut self.events)
+            self.pending_since = Option::None
+        }
+    }
+
+    // The time left, at `now`, before the parser's incomplete input is
+    // resolved, if it has any.
+    fn escape_wait(self, _ now: Duration) -> Option<Duration> {
+        let since = self.pending_since?
+        let deadline = since + self.options.esc_timeout
+        Option::Some(
+            if deadline > now {
+                deadline - now
+            } else {
+                Duration::from_nanos(0)
+            },
+        )
+    }
+}
+
+impl Session<TermBackend> {
+    /// The descriptor the terminal reads, readable when it has input: for a
+    /// program's own `std::net::Poller`, beside `signal_fd`.
+    pub fn input_fd(self) -> i32 {
+        self.backend.terminal().input_fd()
+    }
+
+    /// The descriptor of the terminal's signal queue, readable when a
+    /// signal waits.
+    pub fn signal_fd(self) -> i32 {
+        self.backend.terminal().signal_fd()
+    }
+}
+
+/// Gives the terminal back, ignoring a failure.
+impl<B: Backend> Drop for Session<B> {
+    fn drop(var own self) {
+        let _ = self.backend.leave_raw()
+    }
+}
+
+// Whether `error` is the end of the terminal's input.
+fn is_end(_ error: Error) -> bool {
+    match error.kind() {
+        ErrorKind::UnexpectedEof => true,
+        _ => false,
+    }
+}
+
+// The shorter of two optional waits; `None` is forever.
+fn earliest(_ a: Option<Duration>, _ b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Option::Some(a), Option::Some(b)) => Option::Some(if a < b { a } else { b }),
+        (Option::Some(a), Option::None) => Option::Some(a),
+        (Option::None, b) => b,
+    }
+}
+
+fn csi<T: std::io::Display>(_ out: mut MemBuffer, _ rest: T) {
+    out.push(0x1b)
+    out.push(b'[')
+    write!(mut out, rest)
+}
+
+// Appends the sequences that take the screen over: the alternate screen,
+// the cursor hidden, the screen cleared, then the input modes.
+fn setup_sequence(_ out: mut MemBuffer, _ options: Options) {
+    csi(mut out, "?1049h")
+    csi(mut out, "?25l")
+    csi(mut out, "0m")
+    csi(mut out, "H")
+    csi(mut out, "2J")
+    if let Option::Some(tracking) = options.mouse {
+        enable_mouse(mut out, tracking)
+    }
+    if options.bracketed_paste {
+        enable_bracketed_paste(mut out)
+    }
+    if options.focus_events {
+        enable_focus_events(mut out)
+    }
+    if options.keyboard != KeyboardFlags::NONE {
+        push_keyboard_flags(mut out, options.keyboard)
+    }
+}
+
+// Appends the sequences that undo `setup_sequence`'s, in reverse: the
+// keyboard flags are popped on the alternate screen that pushed them, and
+// synchronized output ends in case a frame was cut short.
+fn restore_sequence(_ out: mut MemBuffer, _ options: Options) {
+    if options.keyboard != KeyboardFlags::NONE {
+        pop_keyboard_flags(mut out)
+    }
+    if options.focus_events {
+        disable_focus_events(mut out)
+    }
+    if options.bracketed_paste {
+        disable_bracketed_paste(mut out)
+    }
+    if options.mouse.is_some() {
+        disable_mouse(mut out)
+    }
+    csi(mut out, "?2026l")
+    csi(mut out, "0m")
+    csi(mut out, "?25h")
+    csi(mut out, "?1049l")
+}

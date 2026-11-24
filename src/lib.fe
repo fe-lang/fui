@@ -1,6 +1,26 @@
 //! Terminal user interfaces for native Fe programs.
 pub use geom::{Pos, Rect, Size}
 pub use style::{Color, Modifier, Style}
+pub use app::{App, Flow, Options, run, run_session}
+pub use backend::{Backend, TermBackend, TestBackend}
+pub use event::{
+    Event,
+    Key,
+    KeyCode,
+    KeyKind,
+    KeyboardFlags,
+    Modifiers,
+    Mouse,
+    MouseButton,
+    MouseKind,
+}
+pub use frame::Frame
+pub use harness::Harness
+pub use input::MouseTracking
+pub use layout::{Constraint, Layout}
+pub use render::ColorDepth
+pub use session::Session
+pub use theme::Theme
 pub use geom
 pub use style
 pub use text
@@ -13,3 +33,7 @@ pub use input
 pub use vt
 pub use render
 pub use widgets
+pub use backend
+pub use session
+pub use app
+pub use harness

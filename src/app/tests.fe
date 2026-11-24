@@ -1,0 +1,320 @@
+use core::MemBuffer
+use std::io::Display
+use std::fs::Fs
+use std::term::{Signal, Tty}
+use std::time::{Clock, Duration}
+use ingot::backend::TestBackend
+use ingot::event::{Event, Key, KeyCode}
+use ingot::frame::{Frame, print}
+use ingot::geom::{Rect, Size}
+use ingot::session::Session
+use ingot::style::Style
+use super::{App, Flow, Options, run, run_session}
+
+// Counts what it gets, quits on `q`, and asks to suspend on `s`.
+struct Recorder {
+    keys: MemBuffer,
+    ticks: usize,
+    terminates: usize,
+    resumes: usize,
+    resizes: usize,
+    // `update` asks to redraw.
+    redraw: bool,
+    views: usize,
+}
+
+impl Recorder {
+    fn new() -> Self {
+        Recorder {
+            keys: MemBuffer::empty(),
+            ticks: 0,
+            terminates: 0,
+            resumes: 0,
+            resizes: 0,
+            redraw: true,
+            views: 0,
+        }
+    }
+}
+
+impl App for Recorder {
+    uses E = ()
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        let changed = if self.redraw {
+            Flow::Redraw
+        } else {
+            Flow::Unchanged
+        }
+        match event {
+            Event::Key(Key { code: KeyCode::Char(b'q'), .. }) => Flow::Quit,
+            Event::Key(Key { code: KeyCode::Char(b's'), .. }) => Flow::Suspend,
+            Event::Key(key) => {
+                write!(mut self.keys, key, " ")
+                changed
+            },
+            Event::Tick => {
+                self.ticks += 1
+                changed
+            },
+            Event::Terminate => {
+                self.terminates += 1
+                Flow::Quit
+            },
+            Event::Resume => {
+                self.resumes += 1
+                changed
+            },
+            Event::Resize(_) => {
+                self.resizes += 1
+                changed
+            },
+            _ => changed,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        self.views += 1
+        print(area.pos(), self.keys, Style::new())
+    }
+}
+
+fn bytes<T: Display>(_ text: T) -> MemBuffer {
+    format!(text)
+}
+
+fn ms(_ millis: u64) -> Duration {
+    Duration::from_millis(millis)
+}
+
+fn backend() -> TestBackend {
+    TestBackend::new(Size::new(width: 20, height: 2))
+}
+
+fn run_on(_ backend: own TestBackend, _ options: Options, _ app: mut Recorder) -> Session<
+    TestBackend,
+> {
+    var session = Session::enter(backend, options).unwrap()
+    run_session(mut app, mut session).unwrap()
+    session
+}
+
+#[test]
+fn the_loop_draws_first_and_quits_on_q() {
+    var backend = backend()
+    backend.push_input(bytes("ab").span())
+    backend.pause(ms(10))
+    backend.push_input(bytes("qc").span())
+    var app = Recorder::new()
+    let session = run_on(backend, Options::new(), mut app)
+    assert(app.keys == "a b ")
+    // The first frame, then one for the keys that came together.
+    assert(app.views == 2)
+    assert(session.backend().vt().to_text() == "a b\n")
+    assert(session.now() == ms(10))
+}
+
+#[test]
+fn ctrl_c_quits_unless_the_options_say_otherwise() {
+    var input = MemBuffer::empty()
+    input.push(b'x')
+    input.push(3)
+    input.push(b'y')
+    var b = backend()
+    b.push_input(input.span())
+    var app = Recorder::new()
+    let _ = run_on(b, Options::new(), mut app)
+    assert(app.keys == "x " && app.terminates == 0)
+    var b = backend()
+    b.push_input(input.span())
+    var app = Recorder::new()
+    let _ = run_on(b, Options::new().ctrl_c_quits(false), mut app)
+    // The script ends: the terminal hangs up, which terminates.
+    assert(app.keys == "x Ctrl+C y " && app.terminates == 0)
+}
+
+#[test]
+fn terminate_quits_unless_the_app_handles_it() {
+    var b = backend()
+    b.push_signal(Signal::Terminate)
+    b.pause(ms(5))
+    b.push_input(bytes("a").span())
+    var app = Recorder::new()
+    let session = run_on(b, Options::new(), mut app)
+    assert(
+        app.terminates == 0 && app.keys.is_empty() && session.now() == ms(0),
+    )
+    var b = backend()
+    b.push_signal(Signal::Interrupt)
+    var app = Recorder::new()
+    let _ = run_on(b, Options::new().handle_terminate(true), mut app)
+    assert(app.terminates == 1)
+}
+
+#[test]
+fn a_hangup_ends_the_loop() {
+    var b = backend()
+    b.push_input(bytes("a").span())
+    b.push_hangup()
+    var app = Recorder::new()
+    let _ = run_on(b, Options::new(), mut app)
+    assert(app.keys == "a ")
+    // An app that handles termination and does not quit fails the loop's
+    // next wait.
+    var b = backend()
+    b.push_hangup()
+    var session = Session::enter(b, Options::new().handle_terminate(true)).unwrap()
+    var stubborn = Ignorer {}
+    assert(run_session(mut stubborn, mut session).is_err())
+}
+
+struct Ignorer {}
+
+impl App for Ignorer {
+    uses E = ()
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        Flow::Unchanged
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {}
+}
+
+#[test]
+fn ticks_keep_to_the_clock_under_input() {
+    // A key every 30 ms for 300 ms, then `q` at 310 ms: ticks at 100, 200
+    // and 300 ms come whatever the keys do.
+    var b = backend()
+    for _ in 0 .. 10 {
+        b.pause(ms(30))
+        b.push_input(bytes("k").span())
+    }
+    b.pause(ms(10))
+    b.push_input(bytes("q").span())
+    var app = Recorder::new()
+    let session = run_on(b, Options::new().tick(ms(100)), mut app)
+    assert(app.ticks == 3 && app.keys.len() == 20)
+    assert(session.now() == ms(310))
+    // Idle, the loop ticks on its own.
+    var b = backend()
+    b.pause(ms(450))
+    b.push_input(bytes("q").span())
+    var app = Recorder::new()
+    let _ = run_on(b, Options::new().tick(ms(100)), mut app)
+    assert(app.ticks == 4)
+}
+
+#[test]
+fn resizes_and_resumes_redraw_whatever_update_says() {
+    var b = backend()
+    b.push_input(bytes("a").span())
+    b.pause(ms(5))
+    b.push_resize(Size::new(width: 10, height: 1))
+    b.pause(ms(5))
+    b.push_signal(Signal::Continue)
+    b.pause(ms(5))
+    b.push_input(bytes("q").span())
+    var app = Recorder::new()
+    app.redraw = false
+    let session = run_on(b, Options::new(), mut app)
+    assert(app.resizes == 1 && app.resumes == 1)
+    // The first frame, the resize and the resume; not the key.
+    assert(app.views == 3)
+    assert(session.backend().vt().to_text() == "a")
+}
+
+#[test]
+fn ctrl_z_and_flow_suspend_stop_the_process() {
+    var input = MemBuffer::empty()
+    input.push(26)
+    var b = backend()
+    b.push_input(input.span())
+    b.pause(ms(5))
+    b.push_input(bytes("s").span())
+    b.pause(ms(5))
+    b.push_input(bytes("q").span())
+    var app = Recorder::new()
+    let session = run_on(b, Options::new(), mut app)
+    assert(
+        session.backend().stops() == 2 && session.backend().restored_at_stops(),
+    )
+    assert(app.resumes == 2 && app.keys.is_empty())
+    var b = backend()
+    b.push_input(input.span())
+    var app = Recorder::new()
+    let session = run_on(b, Options::new().ctrl_z_suspends(false), mut app)
+    assert(session.backend().stops() == 0 && app.keys == "Ctrl+Z ")
+}
+
+// An app whose row holds a capability `run` also takes.
+struct Timed { reads: usize }
+
+impl App for Timed {
+    uses E = (clock: Clock)
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        let _ = clock.instant()
+        self.reads += 1
+        match event {
+            Event::Key(_) => Flow::Quit,
+            _ => Flow::Redraw,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        print(area.pos(), self.reads, Style::new())
+    }
+}
+
+#[test]
+fn an_app_row_with_a_host_capability_runs() uses (clock: Clock) {
+    var b = backend()
+    b.push_signal(Signal::Continue)
+    b.pause(ms(5))
+    b.push_input(bytes("x").span())
+    var session = Session::enter(b, Options::new()).unwrap()
+    var app = Timed { reads: 0 }
+    run_session(mut app, mut session).unwrap()
+    assert(
+        app.reads == 2 && session.backend().vt().to_text() == "1\n",
+    )
+}
+
+// Apps whose rows name other capabilities, or `run`'s own: each runs under
+// `run`, which this function type-checks (it needs a terminal to run).
+struct Filer {}
+
+impl App for Filer {
+    uses E = (fs: mut Fs)
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        Flow::Quit
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {}
+}
+
+struct Opener {}
+
+impl App for Opener {
+    uses E = (tty: mut Tty, clock: Clock)
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        let _ = tty.open()
+        let _ = clock.instant()
+        Flow::Quit
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {}
+}
+
+fn runs_with_any_row() -> bool uses (tty: mut Tty, clock: Clock, fs: mut Fs) {
+    var recorder = Recorder::new()
+    var filer = Filer {}
+    var timed = Timed { reads: 0 }
+    var opener = Opener {}
+    run(mut recorder, Options::new()).is_ok()
+        && run(mut filer, Options::new()).is_ok()
+        && run(mut timed, Options::new()).is_ok()
+        && run(mut opener, Options::new()).is_ok()
+}

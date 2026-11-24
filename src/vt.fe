@@ -141,6 +141,29 @@ impl Screen {
         }
     }
 
+    // This screen of `from` cells at `to`: the cells that fit keep their
+    // places from the top left, the rest are blank, and a wide cluster cut
+    // by the new right edge leaves a blank.
+    fn resized(mut self, _ from: Size, _ to: Size) -> Screen {
+        var screen = Screen::new(to)
+        screen.saved = self.saved
+        screen.keyboard = replace(mut self.keyboard, MemVec::new())
+        let width = min(from.width as usize, to.width as usize)
+        let height = min(from.height as usize, to.height as usize)
+        for y in 0 .. height {
+            for x in 0 .. width {
+                let at = y * to.width as usize + x
+                screen.cells[at] = replace(mut self.cells[y * from.width as usize + x], Cell::new())
+            }
+            if width > 0
+                && width == to.width as usize
+                && screen.cells[y * width + width - 1].width == 2 {
+                screen.cells[y * width + width - 1].clear_symbol()
+            }
+        }
+        screen
+    }
+
     // Moves the rows up by `n`, erasing the rows that come in at the bottom.
     fn scroll_up(mut self, _ n: usize, _ bg: Color) {
         let len = self.cells.len()
@@ -348,6 +371,18 @@ impl Vt {
             y += 1
         }
         out
+    }
+
+    /// Gives the terminal `size`, as resizing its window does. Both screens
+    /// keep the cells that fit, from the top left, and blank the rest; a
+    /// wide cluster cut by the new right edge leaves a blank. The cursor
+    /// moves into the screen, and the modes stay.
+    pub fn resize(mut self, _ size: Size) {
+        let from = self.size
+        self.grid = self.grid.resized(from, size)
+        self.other = self.other.resized(from, size)
+        self.size = size
+        self.move_to(self.x, self.y)
     }
 
     /// Reads `bytes` as the terminal would.

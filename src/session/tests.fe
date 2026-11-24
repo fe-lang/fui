@@ -1,0 +1,369 @@
+use core::{MemBuffer, Option}
+use std::io::Display
+use std::term::Signal
+use std::time::Duration
+use ingot::app::Options
+use ingot::backend::{Backend, TestBackend}
+use ingot::event::{Event, Key, KeyCode, KeyboardFlags, Modifiers}
+use ingot::frame::{Frame, print}
+use ingot::geom::{Pos, Size}
+use ingot::input::MouseTracking
+use ingot::style::{Color, Modifier, Style}
+use ingot::vt::Vt
+use super::Session
+
+// The bytes of `text`, with `^[` for ESC.
+fn bytes<T: Display>(_ text: T) -> MemBuffer {
+    let source = format!(text)
+    var out = MemBuffer::empty()
+    var i: usize = 0
+    while i < source.len() {
+        if source[i] == b'^' && i + 1 < source.len() && source[i + 1] == b'[' {
+            out.push(0x1b)
+            i += 2
+        } else {
+            out.push(source[i])
+            i += 1
+        }
+    }
+    out
+}
+
+fn size(width: u16, height: u16) -> Size {
+    Size::new(width, height)
+}
+
+fn ms(_ millis: u64) -> Duration {
+    Duration::from_millis(millis)
+}
+
+fn enter(_ backend: own TestBackend) -> Session<TestBackend> {
+    Session::enter(backend, Options::new()).unwrap()
+}
+
+// Draws `text` at `pos` and presents it.
+fn show<T: Display>(_ session: mut Session<TestBackend>, _ pos: Pos, _ text: T) {
+    with (Frame = session.frame()) {
+        print(pos, text, Style::new())
+    }
+    session.present().unwrap()
+}
+
+fn next(_ session: mut Session<TestBackend>) -> Event {
+    session.next_event(Option::None).unwrap().unwrap()
+}
+
+fn is_key(_ event: Event, _ code: KeyCode) -> bool {
+    event == Event::Key(Key::new(code, Modifiers::NONE))
+}
+
+fn every_mode() -> Options {
+    Options::new()
+        .mouse(MouseTracking::Motion)
+        .focus_events(true)
+        .keyboard(
+            KeyboardFlags::DISAMBIGUATE | KeyboardFlags::REPORT_EVENT_TYPES,
+        )
+}
+
+#[test]
+fn entering_sets_the_modes_and_leaving_restores_them() {
+    for options in [Options::new(), every_mode(), Options::new().bracketed_paste(false)] {
+        var session = Session::enter(TestBackend::new(size(width: 8, height: 2)), options).unwrap()
+        let backend = ref session.backend()
+        assert(backend.is_raw())
+        let vt = ref backend.vt()
+        assert(vt.alternate_screen() && !vt.cursor_visible())
+        assert(vt.mode(2004) == options.bracketed_paste)
+        assert(vt.mode(1004) == options.focus_events)
+        assert(
+            vt.mode(1003) == options.mouse.is_some() && vt.mode(1006) == options.mouse.is_some(),
+        )
+        assert(vt.keyboard_flags() == options.keyboard.bits() as u32)
+        // The restore bytes undo the setup on their own, as a panic would
+        // write them.
+        var replay = Vt::new(size(width: 8, height: 2))
+        replay.feed(backend.output())
+        replay.feed(backend.restore_bytes())
+        assert(
+            replay.cursor_visible() && !replay.alternate_screen() && replay.keyboard_depth() == 0,
+        )
+        assert(
+            !replay.mode(1003) && !replay.mode(1004) && !replay.mode(1006) && !replay.mode(2004),
+        )
+        show(mut session, Pos::new(x: 0, y: 0), "drawn")
+        session.leave().unwrap()
+        session.leave().unwrap()
+        let backend = mut session.backend()
+        assert(!backend.is_raw() && backend.is_restored())
+        // Text written after leaving is in the default style, on the screen
+        // from before.
+        backend.write_all(bytes("^[[1;1Hx").span()).unwrap()
+        let cell = ref backend.vt().cell(Pos::new(x: 0, y: 0))
+        assert(
+            cell.fg == Color::RESET && cell.bg == Color::RESET && cell.modifier == Modifier::NONE,
+        )
+        assert(backend.vt().to_text() == "x\n")
+    }
+}
+
+#[test]
+fn frames_show_what_was_drawn_and_start_empty() {
+    var session = enter(TestBackend::new(size(width: 10, height: 3)))
+    assert(
+        session.area() == ingot::geom::Rect::new(x: 0, y: 0, width: 10, height: 3),
+    )
+    assert(session.full)
+    show(mut session, Pos::new(x: 1, y: 0), "hello")
+    assert(session.backend().vt().to_text() == " hello\n\n")
+    assert(!session.full)
+    // The next frame starts empty: only what it draws shows.
+    show(mut session, Pos::new(x: 2, y: 2), "world")
+    assert(session.backend().vt().to_text() == "\n\n  world")
+    assert(!session.full)
+    // Frames drawn in two blocks before a `present` add up.
+    with (Frame = session.frame()) {
+        print(Pos::new(x: 0, y: 0), "a", Style::new())
+    }
+    with (Frame = session.frame()) {
+        print(Pos::new(x: 0, y: 1), "b", Style::new())
+    }
+    session.present().unwrap()
+    assert(session.backend().vt().to_text() == "a\nb\n")
+    // `present` writes once per frame.
+    let writes = session.backend().writes()
+    show(mut session, Pos::new(x: 0, y: 0), "c")
+    assert(session.backend().writes() == writes + 1)
+    session.invalidate()
+    assert(session.full)
+}
+
+fn ask_cursor(_ pos: Pos) uses (frame: mut Frame) {
+    frame.set_cursor(pos)
+}
+
+#[test]
+fn the_cursor_shows_where_the_frame_asks() {
+    var session = enter(TestBackend::new(size(width: 6, height: 3)))
+    with (Frame = session.frame()) {
+        ask_cursor(Pos::new(x: 4, y: 1))
+    }
+    session.present().unwrap()
+    assert(session.backend().vt().cursor_visible())
+    assert(session.backend().vt().cursor() == Pos::new(x: 4, y: 1))
+    show(mut session, Pos::new(x: 0, y: 0), "x")
+    assert(!session.backend().vt().cursor_visible())
+}
+
+#[test]
+fn a_resize_resizes_the_frame_and_redraws_whole() {
+    var backend = TestBackend::new(size(width: 10, height: 3))
+    backend.push_resize(size(width: 4, height: 2))
+    var session = enter(backend)
+    show(mut session, Pos::new(x: 0, y: 0), "0123456789")
+    assert(
+        next(mut session) == Event::Resize(size(width: 4, height: 2)),
+    )
+    assert(
+        session.size() == size(width: 4, height: 2) && session.full,
+    )
+    assert(
+        session.frame().area() == ingot::geom::Rect::new(x: 0, y: 0, width: 4, height: 2),
+    )
+    show(mut session, Pos::new(x: 0, y: 1), "abcdef")
+    assert(session.backend().vt().to_text() == "\nabcd")
+}
+
+#[test]
+fn a_lone_esc_waits_for_the_timeout() {
+    var backend = TestBackend::new(size(width: 4, height: 1))
+    backend.push_input(bytes("a^[").span())
+    var session = enter(backend)
+    // The key before it is not held back.
+    assert(is_key(next(mut session), KeyCode::Char(b'a')))
+    assert(session.now() == ms(0))
+    assert(session.pending_timeout() == Option::Some(ms(25)))
+    assert(is_key(next(mut session), KeyCode::Esc))
+    assert(
+        session.now() == ms(25) && session.pending_timeout().is_none(),
+    )
+}
+
+#[test]
+fn a_sequence_split_within_the_timeout_is_one_key() {
+    var backend = TestBackend::new(size(width: 4, height: 1))
+    backend.push_input(bytes("^[").span())
+    backend.pause(ms(10))
+    backend.push_input(bytes("[").span())
+    backend.pause(ms(20))
+    backend.push_input(bytes("A").span())
+    var session = Session::enter(backend, Options::new().esc_timeout(ms(25))).unwrap()
+    assert(is_key(next(mut session), KeyCode::Up))
+    assert(session.now() == ms(30))
+    // Too late, a sequence's rest is keys of its own.
+    session.backend().push_input(bytes("^[").span())
+    session.backend().pause(ms(40))
+    session.backend().push_input(bytes("[B").span())
+    assert(is_key(next(mut session), KeyCode::Esc))
+    assert(session.now() == ms(55))
+    assert(is_key(next(mut session), KeyCode::Char(b'[')))
+    assert(is_key(next(mut session), KeyCode::Char(b'B')))
+}
+
+#[test]
+fn a_wait_ends_at_its_timeout() {
+    var session = enter(TestBackend::new(size(width: 4, height: 1)))
+    assert(
+        session.next_event(Option::Some(ms(100))).unwrap().is_none(),
+    )
+    assert(session.now() == ms(100))
+    session.backend().pause(ms(150))
+    session.backend().push_input(bytes("x").span())
+    assert(
+        session.next_event(Option::Some(ms(30))).unwrap().is_none(),
+    )
+    assert(session.now() == ms(130))
+    assert(
+        is_key(
+            session.next_event(Option::Some(ms(30))).unwrap().unwrap(),
+            KeyCode::Char(b'x'),
+        ),
+    )
+    assert(session.now() == ms(150))
+}
+
+#[test]
+fn signals_become_events() {
+    var backend = TestBackend::new(size(width: 4, height: 1))
+    backend.push_signal(Signal::Terminate)
+    backend.push_signal(Signal::Interrupt)
+    backend.push_signal(Signal::Hangup)
+    backend.pause(ms(5))
+    backend.push_signal(Signal::Continue)
+    var session = enter(backend)
+    show(mut session, Pos::new(x: 0, y: 0), "x")
+    assert(next(mut session) == Event::Terminate)
+    assert(next(mut session) == Event::Terminate)
+    assert(next(mut session) == Event::Terminate)
+    assert(!session.full)
+    assert(next(mut session) == Event::Resume)
+    assert(session.full)
+}
+
+#[test]
+fn a_stop_request_suspends_and_resumes() {
+    var backend = TestBackend::new(size(width: 6, height: 2))
+    backend.push_signal(Signal::Suspend)
+    var session = Session::enter(backend, every_mode()).unwrap()
+    show(mut session, Pos::new(x: 0, y: 0), "before")
+    assert(next(mut session) == Event::Resume)
+    let backend = ref session.backend()
+    assert(backend.stops() == 1 && backend.restored_at_stops())
+    // Taken over again: the modes are back on, and the next frame is whole.
+    assert(
+        backend.is_raw() && backend.vt().alternate_screen() && !backend.vt().cursor_visible(),
+    )
+    assert(
+        backend.vt().mode(1003) && backend.vt().keyboard_depth() == 1,
+    )
+    assert(session.full)
+    show(mut session, Pos::new(x: 0, y: 1), "after")
+    assert(session.backend().vt().to_text() == "\nafter")
+    // `suspend` called directly does the same.
+    session.suspend().unwrap()
+    assert(
+        session.backend().stops() == 2 && session.backend().restored_at_stops(),
+    )
+    assert(next(mut session) == Event::Resume)
+}
+
+#[test]
+fn a_hangup_terminates_after_the_input_before_it() {
+    var backend = TestBackend::new(size(width: 4, height: 1))
+    backend.push_input(bytes("a^[").span())
+    backend.push_hangup()
+    var session = enter(backend)
+    assert(is_key(next(mut session), KeyCode::Char(b'a')))
+    assert(is_key(next(mut session), KeyCode::Esc))
+    assert(next(mut session) == Event::Terminate)
+    assert(session.next_event(Option::None).is_err())
+    assert(session.next_event(Option::Some(ms(5))).is_err())
+    // The terminal is gone: there is nothing to draw on or give back.
+    let writes = session.backend().writes()
+    show(mut session, Pos::new(x: 0, y: 0), "x")
+    assert(session.backend().writes() == writes)
+    assert(session.leave().is_ok())
+}
+
+#[test]
+fn a_write_to_a_terminal_that_hung_up_terminates() {
+    var session = enter(TestBackend::new(size(width: 4, height: 1)))
+    session.backend().push_hangup()
+    let _ = session.backend().wait(Option::Some(ms(0)))
+    show(mut session, Pos::new(x: 0, y: 0), "x")
+    assert(next(mut session) == Event::Terminate)
+    assert(session.next_event(Option::None).is_err())
+}
+
+#[test]
+fn leaving_fails_if_the_terminal_fails() {
+    var backend = TestBackend::new(size(width: 4, height: 1))
+    backend.push_signal(Signal::Hangup)
+    var session = enter(backend)
+    assert(next(mut session) == Event::Terminate)
+    // A hangup signalled: what fails after it is no error.
+    session.backend().push_hangup()
+    let _ = session.backend().wait(Option::Some(ms(0)))
+    assert(session.leave().is_ok())
+    var session = enter(TestBackend::new(size(width: 4, height: 1)))
+    session.backend().push_hangup()
+    let _ = session.backend().wait(Option::Some(ms(0)))
+    // The session has not seen the hangup: leaving reports the failure.
+    assert(session.leave().is_err())
+}
+
+#[test]
+fn a_finished_script_hangs_up_a_wait_without_timeout() {
+    var session = enter(TestBackend::new(size(width: 4, height: 1)))
+    assert(next(mut session) == Event::Terminate)
+    assert(session.next_event(Option::None).is_err())
+}
+
+#[test]
+fn a_terminal_without_a_size_is_drawn_nothing() {
+    var backend = TestBackend::new(size(width: 0, height: 0))
+    backend.push_resize(size(width: 5, height: 1))
+    var session = enter(backend)
+    assert(session.area().is_empty())
+    let writes = session.backend().writes()
+    show(mut session, Pos::new(x: 0, y: 0), "hello")
+    assert(session.backend().writes() == writes && session.full)
+    assert(
+        next(mut session) == Event::Resize(size(width: 5, height: 1)),
+    )
+    show(mut session, Pos::new(x: 0, y: 0), "hello")
+    assert(session.backend().vt().to_text() == "hello")
+}
+
+#[test]
+fn pumping_reads_without_waiting() {
+    var backend = TestBackend::new(size(width: 4, height: 1))
+    backend.push_input(bytes("q^[").span())
+    backend.push_signal(Signal::Resize)
+    var session = enter(backend)
+    assert(session.pop_event().is_none() && !session.has_events())
+    session.pump().unwrap()
+    assert(session.has_events())
+    assert(is_key(session.pop_event().unwrap(), KeyCode::Char(b'q')))
+    assert(
+        session.pop_event().unwrap() == Event::Resize(size(width: 4, height: 1)),
+    )
+    assert(session.pop_event().is_none())
+    assert(session.pending_timeout() == Option::Some(ms(25)))
+    // The caller waits out the timeout itself, then pumps.
+    let ready = session.backend().wait(session.pending_timeout()).unwrap()
+    assert(ready.timed_out())
+    session.pump().unwrap()
+    assert(is_key(session.pop_event().unwrap(), KeyCode::Esc))
+    assert(session.now() == ms(25))
+}
