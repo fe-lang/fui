@@ -1,0 +1,302 @@
+//! Colors, text attributes and styles.
+//!
+//! A `Style` is a change to how cells look: it sets the foreground, the
+//! background and attributes, or leaves each as it is. Widgets take styles
+//! and apply them over what is drawn already, so `Style::new().bold()` on a
+//! selected row keeps the row's colors.
+use core::ops::{BitAnd, BitOr, Eq}
+
+/// A color of a cell's text or background.
+pub struct Color { bits: u32 }
+
+impl Copy for Color {}
+
+impl Eq for Color {
+    fn eq(self, _ other: Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+// The kinds of a color, in its top byte; the rest is the kind's value.
+const KIND_KEEP: u32 = 0
+const KIND_RESET: u32 = 1
+const KIND_ANSI: u32 = 2
+const KIND_INDEXED: u32 = 3
+const KIND_RGB: u32 = 4
+
+/// What a `Color` holds.
+pub enum ColorKind {
+    /// No color: a style with it leaves the cell's color as it is.
+    Keep,
+    /// The terminal's default foreground or background.
+    Reset,
+    /// One of the 16 ANSI colors, 0 to 15.
+    Ansi(u8),
+    /// One of the 256 indexed colors.
+    Indexed(u8),
+    /// Red, green and blue.
+    Rgb(u8, u8, u8),
+}
+
+impl Color {
+    /// No color: a style with it leaves the cell's color as it is.
+    pub const KEEP: Color = Color { bits: 0 }
+    /// The terminal's default foreground or background.
+    pub const RESET: Color = Color { bits: 0x01000000 }
+    pub const BLACK: Color = Color { bits: 0x02000000 }
+    pub const RED: Color = Color { bits: 0x02000001 }
+    pub const GREEN: Color = Color { bits: 0x02000002 }
+    pub const YELLOW: Color = Color { bits: 0x02000003 }
+    pub const BLUE: Color = Color { bits: 0x02000004 }
+    pub const MAGENTA: Color = Color { bits: 0x02000005 }
+    pub const CYAN: Color = Color { bits: 0x02000006 }
+    pub const GRAY: Color = Color { bits: 0x02000007 }
+    pub const DARK_GRAY: Color = Color { bits: 0x02000008 }
+    pub const LIGHT_RED: Color = Color { bits: 0x02000009 }
+    pub const LIGHT_GREEN: Color = Color { bits: 0x0200000a }
+    pub const LIGHT_YELLOW: Color = Color { bits: 0x0200000b }
+    pub const LIGHT_BLUE: Color = Color { bits: 0x0200000c }
+    pub const LIGHT_MAGENTA: Color = Color { bits: 0x0200000d }
+    pub const LIGHT_CYAN: Color = Color { bits: 0x0200000e }
+    pub const WHITE: Color = Color { bits: 0x0200000f }
+
+    /// The ANSI color `index`, 0 to 15: the eight normal colors, then the
+    /// eight bright ones.
+    pub fn ansi(_ index: u8) -> Self {
+        assert(index < 16)
+        Color { bits: KIND_ANSI << 24 | index as u32 }
+    }
+
+    /// The color `index` of the 256-color palette.
+    pub fn indexed(_ index: u8) -> Self {
+        Color { bits: KIND_INDEXED << 24 | index as u32 }
+    }
+
+    pub fn rgb(_ r: u8, _ g: u8, _ b: u8) -> Self {
+        Color { bits: KIND_RGB << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32 }
+    }
+
+    /// The color `0xRRGGBB`.
+    pub fn hex(_ rgb: u32) -> Self {
+        Color { bits: KIND_RGB << 24 | rgb & 0xffffff }
+    }
+
+    pub fn kind(self) -> ColorKind {
+        let value = self.bits & 0xffffff
+        let low: u8 = (value & 0xff).downcast_truncate()
+        match self.bits >> 24 {
+            KIND_RESET => ColorKind::Reset,
+            KIND_ANSI => ColorKind::Ansi(low),
+            KIND_INDEXED => ColorKind::Indexed(low),
+            KIND_RGB => ColorKind::Rgb(
+                (value >> 16).downcast_truncate(),
+                (value >> 8 & 0xff).downcast_truncate(),
+                low,
+            ),
+            _ => ColorKind::Keep,
+        }
+    }
+
+    /// Whether this is `KEEP`.
+    pub fn is_keep(self) -> bool {
+        self.bits == 0
+    }
+
+    /// This color, or `under` if this is `KEEP`.
+    pub fn over(self, _ under: Color) -> Color {
+        if self.is_keep() { under } else { self }
+    }
+}
+
+/// A set of text attributes: `Modifier::BOLD | Modifier::ITALIC`.
+pub struct Modifier { bits: u16 }
+
+impl Copy for Modifier {}
+
+impl Eq for Modifier {
+    fn eq(self, _ other: Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+impl BitOr for Modifier {
+    fn bitor(own self, _ other: own Self) -> Self {
+        Modifier { bits: self.bits | other.bits }
+    }
+}
+
+impl BitAnd for Modifier {
+    fn bitand(own self, _ other: own Self) -> Self {
+        Modifier { bits: self.bits & other.bits }
+    }
+}
+
+impl Modifier {
+    pub const NONE: Modifier = Modifier { bits: 0 }
+    pub const BOLD: Modifier = Modifier { bits: 1 }
+    pub const DIM: Modifier = Modifier { bits: 2 }
+    pub const ITALIC: Modifier = Modifier { bits: 4 }
+    pub const UNDERLINED: Modifier = Modifier { bits: 8 }
+    pub const BLINK: Modifier = Modifier { bits: 16 }
+    pub const REVERSED: Modifier = Modifier { bits: 32 }
+    pub const HIDDEN: Modifier = Modifier { bits: 64 }
+    pub const CROSSED_OUT: Modifier = Modifier { bits: 128 }
+    pub const ALL: Modifier = Modifier { bits: 255 }
+
+    pub fn bits(self) -> u16 {
+        self.bits
+    }
+
+    pub fn from_bits(_ bits: u16) -> Self {
+        Modifier { bits: bits & 255 }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    /// Whether every attribute of `other` is in this set.
+    pub fn contains(self, _ other: Modifier) -> bool {
+        self.bits & other.bits == other.bits
+    }
+
+    /// This set without the attributes of `other`.
+    pub fn without(self, _ other: Modifier) -> Modifier {
+        Modifier { bits: self.bits & (other.bits ^ 255) }
+    }
+}
+
+/// A change to how cells look: the colors to set, where not `Color::KEEP`,
+/// the attributes to add and those to remove.
+pub struct Style { pub fg: Color, pub bg: Color, pub add: Modifier, pub remove: Modifier }
+
+impl Copy for Style {}
+
+impl Eq for Style {
+    fn eq(self, _ other: Self) -> bool {
+        self.fg == other.fg
+            && self.bg == other.bg
+            && self.add == other.add
+            && self.remove == other.remove
+    }
+}
+
+impl Style {
+    /// The style that changes nothing.
+    pub const NONE: Style = Style {
+        fg: Color::KEEP,
+        bg: Color::KEEP,
+        add: Modifier::NONE,
+        remove: Modifier::NONE,
+    }
+
+    /// The style that changes nothing.
+    pub fn new() -> Self {
+        Style::NONE
+    }
+
+    /// The style that sets the terminal's default colors and no attribute.
+    pub fn reset() -> Self {
+        Style { fg: Color::RESET, bg: Color::RESET, add: Modifier::NONE, remove: Modifier::ALL }
+    }
+
+    pub fn fg(own self, _ color: Color) -> Self {
+        Style { fg: color, bg: self.bg, add: self.add, remove: self.remove }
+    }
+
+    pub fn bg(own self, _ color: Color) -> Self {
+        Style { fg: self.fg, bg: color, add: self.add, remove: self.remove }
+    }
+
+    /// Adds the attributes of `modifier`.
+    pub fn with(own self, _ modifier: Modifier) -> Self {
+        Style {
+            fg: self.fg,
+            bg: self.bg,
+            add: self.add | modifier,
+            remove: self.remove.without(modifier),
+        }
+    }
+
+    /// Removes the attributes of `modifier`.
+    pub fn without(own self, _ modifier: Modifier) -> Self {
+        Style {
+            fg: self.fg,
+            bg: self.bg,
+            add: self.add.without(modifier),
+            remove: self.remove | modifier,
+        }
+    }
+
+    pub fn bold(own self) -> Self {
+        self.with(Modifier::BOLD)
+    }
+
+    pub fn dim(own self) -> Self {
+        self.with(Modifier::DIM)
+    }
+
+    pub fn italic(own self) -> Self {
+        self.with(Modifier::ITALIC)
+    }
+
+    pub fn underlined(own self) -> Self {
+        self.with(Modifier::UNDERLINED)
+    }
+
+    pub fn reversed(own self) -> Self {
+        self.with(Modifier::REVERSED)
+    }
+
+    pub fn crossed_out(own self) -> Self {
+        self.with(Modifier::CROSSED_OUT)
+    }
+
+    /// This style, then `other` over it: `other`'s colors where it sets
+    /// them, and its added and removed attributes after this style's.
+    pub fn patch(own self, _ other: Style) -> Self {
+        Style {
+            fg: other.fg.over(self.fg),
+            bg: other.bg.over(self.bg),
+            add: self.add.without(other.remove) | other.add,
+            remove: self.remove.without(other.add) | other.remove,
+        }
+    }
+
+    /// The attributes of a cell with `current` after this style.
+    pub fn apply_modifier(self, _ current: Modifier) -> Modifier {
+        current.without(self.remove) | self.add
+    }
+}
+
+#[test]
+fn colors_keep_their_values() {
+    assert(Color::rgb(1, 2, 3) == Color::hex(0x010203))
+    assert(Color::ansi(9) == Color::LIGHT_RED)
+    assert(Color::KEEP.is_keep() && !Color::RESET.is_keep())
+    match Color::rgb(10, 20, 30).kind() {
+        ColorKind::Rgb(r, g, b) => assert(r == 10 && g == 20 && b == 30),
+        _ => assert(false),
+    }
+    match Color::indexed(200).kind() {
+        ColorKind::Indexed(i) => assert(i == 200),
+        _ => assert(false),
+    }
+    assert(Color::KEEP.over(Color::RED) == Color::RED)
+    assert(Color::BLUE.over(Color::RED) == Color::BLUE)
+}
+
+#[test]
+fn styles_patch_in_order() {
+    let base = Style::new().fg(Color::RED).bold()
+    let over = Style::new().bg(Color::BLUE).without(Modifier::BOLD).italic()
+    let both = base.patch(over)
+    assert(both.fg == Color::RED && both.bg == Color::BLUE)
+    assert(both.add == Modifier::ITALIC)
+    assert(both.remove == Modifier::BOLD)
+    assert(
+        both.apply_modifier(Modifier::BOLD | Modifier::DIM) == Modifier::DIM | Modifier::ITALIC,
+    )
+    assert(Style::reset().apply_modifier(Modifier::ALL).is_empty())
+    assert(base.patch(Style::NONE) == base)
+}

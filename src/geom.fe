@@ -1,0 +1,251 @@
+//! Positions, sizes and rectangles of terminal cells. `x` grows to the
+//! right and `y` down, from the top left cell at `(0, 0)`.
+use core::ops::Eq
+
+/// A cell: a column and a row.
+pub struct Pos { pub x: u16, pub y: u16 }
+
+impl Copy for Pos {}
+
+impl Pos {
+    pub fn new(x: u16, y: u16) -> Self {
+        Pos { x, y }
+    }
+}
+
+impl Eq for Pos {
+    fn eq(self, _ other: Self) -> bool {
+        self.x == other.x && self.y == other.y
+    }
+}
+
+/// A number of columns and rows.
+pub struct Size { pub width: u16, pub height: u16 }
+
+impl Copy for Size {}
+
+impl Size {
+    pub fn new(width: u16, height: u16) -> Self {
+        Size { width, height }
+    }
+
+    /// The number of cells.
+    pub fn area(self) -> usize {
+        self.width as usize * self.height as usize
+    }
+}
+
+impl Eq for Size {
+    fn eq(self, _ other: Self) -> bool {
+        self.width == other.width && self.height == other.height
+    }
+}
+
+/// A rectangle of cells: its top left cell and its size. One without width
+/// or height holds no cell.
+pub struct Rect { pub x: u16, pub y: u16, pub width: u16, pub height: u16 }
+
+impl Copy for Rect {}
+
+impl Eq for Rect {
+    fn eq(self, _ other: Self) -> bool {
+        self.x == other.x
+            && self.y == other.y
+            && self.width == other.width
+            && self.height == other.height
+    }
+}
+
+impl Rect {
+    /// The rectangle that holds no cell.
+    pub const ZERO: Rect = Rect { x: 0, y: 0, width: 0, height: 0 }
+
+    /// A rectangle clamped to the `u16` coordinates: its right and bottom
+    /// edges stop at 65535.
+    pub fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
+        Rect { x, y, width: min(width, 65535 - x), height: min(height, 65535 - y) }
+    }
+
+    /// The rectangle of `size` at the top left.
+    pub fn of(_ size: Size) -> Self {
+        Rect { x: 0, y: 0, width: size.width, height: size.height }
+    }
+
+    pub fn size(self) -> Size {
+        Size { width: self.width, height: self.height }
+    }
+
+    pub fn pos(self) -> Pos {
+        Pos { x: self.x, y: self.y }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// The number of cells.
+    pub fn area(self) -> usize {
+        self.width as usize * self.height as usize
+    }
+
+    /// The column after the last.
+    pub fn right(self) -> u16 {
+        self.x + self.width
+    }
+
+    /// The row after the last.
+    pub fn bottom(self) -> u16 {
+        self.y + self.height
+    }
+
+    pub fn contains(self, _ pos: Pos) -> bool {
+        pos.x >= self.x && pos.x < self.right() && pos.y >= self.y && pos.y < self.bottom()
+    }
+
+    /// The cells in both rectangles, or an empty rectangle.
+    pub fn intersect(self, _ other: Rect) -> Rect {
+        let x = max(self.x, other.x)
+        let y = max(self.y, other.y)
+        let right = min(self.right(), other.right())
+        let bottom = min(self.bottom(), other.bottom())
+        if right <= x || bottom <= y {
+            return Rect { x, y, width: 0, height: 0 }
+        }
+        Rect { x, y, width: right - x, height: bottom - y }
+    }
+
+    /// The smallest rectangle that holds both. An empty one adds nothing.
+    pub fn union(self, _ other: Rect) -> Rect {
+        if self.is_empty() {
+            return other
+        }
+        if other.is_empty() {
+            return self
+        }
+        let x = min(self.x, other.x)
+        let y = min(self.y, other.y)
+        Rect {
+            x,
+            y,
+            width: max(self.right(), other.right()) - x,
+            height: max(self.bottom(), other.bottom()) - y,
+        }
+    }
+
+    /// The rectangle without `margin` cells on every side, empty if they
+    /// take it all.
+    pub fn inner(self, _ margin: u16) -> Rect {
+        self.shrink(top: margin, right: margin, bottom: margin, left: margin)
+    }
+
+    /// The rectangle without the given cells on each side, empty if they
+    /// take it all.
+    pub fn shrink(self, top: u16, right: u16, bottom: u16, left: u16) -> Rect {
+        if left as u32 + right as u32 >= self.width as u32
+            || top as u32 + bottom as u32 >= self.height as u32 {
+            return Rect { x: self.x, y: self.y, width: 0, height: 0 }
+        }
+        Rect {
+            x: self.x + left,
+            y: self.y + top,
+            width: self.width - left - right,
+            height: self.height - top - bottom,
+        }
+    }
+
+    /// The top `rows` rows and the rest. More rows than there are take all.
+    pub fn split_top(self, _ rows: u16) -> (Rect, Rect) {
+        let rows = min(rows, self.height)
+        (
+            Rect { x: self.x, y: self.y, width: self.width, height: rows },
+            Rect { x: self.x, y: self.y + rows, width: self.width, height: self.height - rows },
+        )
+    }
+
+    /// The rest and the bottom `rows` rows.
+    pub fn split_bottom(self, _ rows: u16) -> (Rect, Rect) {
+        let rows = min(rows, self.height)
+        self.split_top(self.height - rows)
+    }
+
+    /// The left `columns` columns and the rest.
+    pub fn split_left(self, _ columns: u16) -> (Rect, Rect) {
+        let columns = min(columns, self.width)
+        (
+            Rect { x: self.x, y: self.y, width: columns, height: self.height },
+            Rect {
+                x: self.x + columns,
+                y: self.y,
+                width: self.width - columns,
+                height: self.height,
+            },
+        )
+    }
+
+    /// The rest and the right `columns` columns.
+    pub fn split_right(self, _ columns: u16) -> (Rect, Rect) {
+        let columns = min(columns, self.width)
+        self.split_left(self.width - columns)
+    }
+
+    /// A rectangle of at most `width` by `height` cells in the middle.
+    pub fn centered(self, width: u16, height: u16) -> Rect {
+        let width = min(width, self.width)
+        let height = min(height, self.height)
+        Rect {
+            x: self.x + (self.width - width) / 2,
+            y: self.y + (self.height - height) / 2,
+            width,
+            height,
+        }
+    }
+}
+
+pub fn min(_ a: u16, _ b: u16) -> u16 {
+    if a < b { a } else { b }
+}
+
+pub fn max(_ a: u16, _ b: u16) -> u16 {
+    if a > b { a } else { b }
+}
+
+#[test]
+fn rects_intersect_and_union() {
+    let a = Rect::new(x: 0, y: 0, width: 10, height: 5)
+    let b = Rect::new(x: 5, y: 2, width: 10, height: 10)
+    assert(
+        a.intersect(b) == Rect::new(x: 5, y: 2, width: 5, height: 3),
+    )
+    assert(a.union(b) == Rect::new(x: 0, y: 0, width: 15, height: 12))
+    assert(
+        a.intersect(Rect::new(x: 20, y: 0, width: 1, height: 1)).is_empty(),
+    )
+    assert(a.union(Rect::ZERO) == a)
+}
+
+#[test]
+fn rects_shrink_and_split() {
+    let a = Rect::new(x: 2, y: 1, width: 10, height: 6)
+    assert(a.inner(1) == Rect::new(x: 3, y: 2, width: 8, height: 4))
+    assert(a.inner(3).is_empty())
+    let (top, rest) = a.split_top(2)
+    assert(top == Rect::new(x: 2, y: 1, width: 10, height: 2))
+    assert(rest == Rect::new(x: 2, y: 3, width: 10, height: 4))
+    let (rest, bottom) = a.split_bottom(1)
+    assert(rest.height == 5 && bottom.y == 6 && bottom.height == 1)
+    let (left, right) = a.split_left(20)
+    assert(left == a && right.is_empty())
+    let (left, right) = a.split_right(3)
+    assert(left.width == 7 && right.x == 9 && right.width == 3)
+    assert(
+        a.centered(width: 4, height: 2) == Rect::new(x: 5, y: 3, width: 4, height: 2),
+    )
+}
+
+#[test]
+fn rects_clamp_to_the_coordinate_range() {
+    let a = Rect::new(x: 65530, y: 0, width: 100, height: 1)
+    assert(a.right() == 65535)
+    assert(a.contains(Pos::new(x: 65534, y: 0)))
+    assert(!a.contains(Pos::new(x: 65529, y: 0)))
+}
