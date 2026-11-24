@@ -293,6 +293,20 @@ impl Frame {
         written
     }
 
+    // Intersects the clip with `area` until `restore_clip` restores the one
+    // this returns. Where a `with (Frame = clipped(area))` cannot provide
+    // the frame, around a call of a generic callable whose row takes the
+    // caller's frame, this clips that frame in place.
+    pub(ingot) fn clip_to(mut self, _ area: Rect) -> Rect {
+        let old = self.clip
+        self.clip = old.intersect(area)
+        old
+    }
+
+    pub(ingot) fn restore_clip(mut self, _ clip: Rect) {
+        self.clip = clip
+    }
+
     /// The columns the `Display` text of `text` takes; see `text::width`.
     pub fn measure<T: Display>(mut self, _ text: T) -> usize {
         self.scratch.clear()
