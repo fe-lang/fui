@@ -33,7 +33,6 @@
 use core::{MemBuffer, MemSpan, MemVec, Option}
 use core::mem::replace
 use core::ops::Eq
-use std::io::Display
 use ingot::event::{
     Event,
     Key,
@@ -169,6 +168,7 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// A parser between sequences.
     pub fn new() -> Self {
         Parser {
             state: State::Ground,

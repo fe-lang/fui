@@ -1,9 +1,12 @@
 //! The events a program handles: keys, mouse actions, pastes, resizes and
-//! focus changes from the terminal, and the ticks and signals the runtime
-//! adds. They are made to be matched:
+//! focus changes from the terminal (read by `tui::input::Parser`), and the
+//! ticks and signals the runtime adds. They are made to be matched, with
+//! byte literals for ASCII keys and predicates where a pattern cannot say
+//! it:
 //!
 //! ```fe
 //! match event {
+//!     Event::Key(Key { code: KeyCode::Char(b'q'), mods, .. }) => if mods.is_empty() { .. },
 //!     Event::Key(key) => if key.ctrl(b'c') { .. } else if key.is(KeyCode::Enter) { .. },
 //!     Event::Mouse(Mouse { kind: MouseKind::Down(MouseButton::Left), pos, .. }) => ..,
 //!     Event::Resize(size) => ..,
@@ -134,11 +137,14 @@ impl BitAnd for Modifiers {
 }
 
 impl Modifiers {
+    /// No modifier.
     pub const NONE: Modifiers = Modifiers { bits: 0 }
+    /// Shift.
     pub const SHIFT: Modifiers = Modifiers { bits: 1 }
     /// Alt, or Option on macOS. A terminal sends it as an `ESC` before the
     /// key unless it speaks the kitty keyboard protocol.
     pub const ALT: Modifiers = Modifiers { bits: 2 }
+    /// Control.
     pub const CTRL: Modifiers = Modifiers { bits: 4 }
     /// Super: the Windows, Command or Meta key, which xterm calls Meta.
     pub const SUPER: Modifiers = Modifiers { bits: 8 }
@@ -146,6 +152,7 @@ impl Modifiers {
     pub const HYPER: Modifiers = Modifiers { bits: 16 }
     /// Meta as X11 knows it, reported only by the kitty keyboard protocol.
     pub const META: Modifiers = Modifiers { bits: 32 }
+    /// Every modifier.
     pub const ALL: Modifiers = Modifiers { bits: 63 }
 
     /// The set of the bits terminals use: 1 shift, 2 alt, 4 ctrl, 8 super,
@@ -154,10 +161,12 @@ impl Modifiers {
         Modifiers { bits: bits & 63 }
     }
 
+    /// The set's bits, as `from_bits` takes them.
     pub fn bits(self) -> u8 {
         self.bits
     }
 
+    /// Whether the set has no modifier.
     pub fn is_empty(self) -> bool {
         self.bits == 0
     }
@@ -595,6 +604,7 @@ impl Eq for Mouse {
 }
 
 impl Mouse {
+    /// The event `kind` at the cell `pos` with `mods` held.
     pub fn new(_ kind: MouseKind, _ pos: Pos, _ mods: Modifiers) -> Self {
         Mouse { kind, pos, mods }
     }
@@ -730,10 +740,13 @@ impl KeyboardFlags {
     /// Add the text a key types, which the parser ignores.
     pub const REPORT_TEXT: KeyboardFlags = KeyboardFlags { bits: 16 }
 
+    /// The flags of the protocol's bits: 1, 2, 4, 8 and 16. Other bits
+    /// are dropped.
     pub fn from_bits(_ bits: u8) -> Self {
         KeyboardFlags { bits: bits & 31 }
     }
 
+    /// The flags' bits, as `CSI > flags u` sends them.
     pub fn bits(self) -> u8 {
         self.bits
     }
