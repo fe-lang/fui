@@ -30,7 +30,8 @@ use super::scroll::ScrollState
 /// each row is aligned on its own. Without, each line takes one row, cut
 /// after its last cluster that fits, and `scroll_x` shifts every line left
 /// by that many columns. Every empty line of a `Text` or `Line` takes a
-/// row, and empty bytes take none.
+/// row, and empty bytes take none. Controls are not drawn (see `buffer`),
+/// though `Wrap` counts a tab as a column: replace tabs before drawing.
 ///
 /// The paragraph's style, over the theme's `text` style, is applied to its
 /// whole area first, so a background fills it. Rows scroll by a
