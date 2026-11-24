@@ -59,6 +59,7 @@ pub struct List {
     highlight_symbol: String<31>,
     item_height: u16,
     placeholder: String<31>,
+    placeholder_style: Style,
 }
 
 impl Copy for List {}
@@ -79,65 +80,47 @@ impl List {
             highlight_symbol: "",
             item_height: 1,
             placeholder: "",
+            placeholder_style: Style::NONE,
         }
     }
 
     /// Applies `style` over the theme's text style, in the whole area.
-    pub fn style(own self, _ style: Style) -> Self {
-        List {
-            style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: self.item_height,
-            placeholder: self.placeholder,
-        }
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
     }
 
     /// Applies `style` over the theme's highlight style for the selected
     /// row.
-    pub fn highlight_style(own self, _ style: Style) -> Self {
-        List {
-            style: self.style,
-            highlight_style: style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: self.item_height,
-            placeholder: self.placeholder,
-        }
+    pub fn highlight_style(var own self, _ style: Style) -> Self {
+        self.highlight_style = style
+        self
     }
 
     /// Starts the selected row with `symbol`, such as `"> "`, and every
     /// other row with as many blank columns.
-    pub fn highlight_symbol(own self, _ symbol: String<31>) -> Self {
-        List {
-            style: self.style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: symbol,
-            item_height: self.item_height,
-            placeholder: self.placeholder,
-        }
+    pub fn highlight_symbol(var own self, _ symbol: String<31>) -> Self {
+        self.highlight_symbol = symbol
+        self
     }
 
     /// Gives each item `rows` rows, at least one. An item the area's
     /// bottom cuts is drawn as far as it fits.
-    pub fn item_height(own self, _ rows: u16) -> Self {
-        List {
-            style: self.style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: if rows == 0 { 1 } else { rows },
-            placeholder: self.placeholder,
-        }
+    pub fn item_height(var own self, _ rows: u16) -> Self {
+        self.item_height = if rows == 0 { 1 } else { rows }
+        self
     }
 
-    /// Draws `text` in the theme's muted style when there are no items.
-    pub fn placeholder(own self, _ text: String<31>) -> Self {
-        List {
-            style: self.style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: self.item_height,
-            placeholder: text,
-        }
+    /// Draws `text` when there are no items.
+    pub fn placeholder(var own self, _ text: String<31>) -> Self {
+        self.placeholder = text
+        self
+    }
+
+    /// Applies `style` over the theme's muted style for the placeholder.
+    pub fn placeholder_style(var own self, _ style: Style) -> Self {
+        self.placeholder_style = style
+        self
     }
 
     /// Draws the `Display` text of each item in `area`, on the first row
@@ -177,7 +160,11 @@ impl List {
         let theme = theme()
         set_style(area, theme.text.patch(self.style))
         if len == 0 {
-            print_in(area, self.placeholder, theme.muted)
+            print_in(
+                area,
+                self.placeholder,
+                theme.muted.patch(self.placeholder_style),
+            )
             return
         }
         let highlight = theme.highlight.patch(self.highlight_style)
@@ -815,11 +802,15 @@ fn an_empty_list_shows_its_placeholder() {
     var state = ListState::new()
     let none: [String<1>; 0] = []
     with (frame) {
-        List::new().placeholder("No items").render(area, none, mut state)
+        List::new()
+            .placeholder("No items")
+            .placeholder_style(Style::new().fg(Color::RED))
+            .render(area, none, mut state)
     }
     assert(frame.buffer().to_text() == "No items\n")
+    let cell = frame.buffer().get(Pos::new(x: 0, y: 0)).unwrap()
     assert(
-        frame.buffer().get(Pos::new(x: 0, y: 0)).unwrap().modifier() == Modifier::DIM,
+        cell.modifier() == Modifier::DIM && cell.fg() == Color::RED,
     )
     state.select_next()
     state.page_down()

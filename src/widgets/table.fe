@@ -5,13 +5,14 @@ use core::ops::{Eq, Index, Len}
 use std::io::Display
 use ingot::buffer::Buffer
 use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, print, theme}
+use ingot::frame::{Frame, measure, print, print_in, theme}
 use ingot::geom::{Pos, Rect, Size}
 use ingot::layout::{Constraint, Layout}
 use ingot::layout::Constraint::{Fill, Length}
 use ingot::style::{Color, Modifier, Style}
 use ingot::text::{Alignment, ELLIPSIS, truncate, truncate_with_ellipsis, width}
 use ingot::theme::Theme
+use super::clamp_u16
 use super::list::ListState
 use super::scroll::ScrollState
 
@@ -35,7 +36,7 @@ impl<T> Column<T> {
     }
 
     /// This column, with its title and cells placed by `alignment`.
-    pub fn align(var own self, _ alignment: Alignment) -> Self {
+    pub fn alignment(var own self, _ alignment: Alignment) -> Self {
         self.alignment = alignment
         self
     }
@@ -81,7 +82,7 @@ impl Copy for TableCell {}
 /// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
 ///     let columns = [
 ///         Column::new("Name", Fill(1)),
-///         Column::new("Size", Length(8)).align(Alignment::Right),
+///         Column::new("Size", Length(8)).alignment(Alignment::Right),
 ///     ]
 ///     Table::new().separator(true).render(area, columns, self.files, mut self.table)
 /// }
@@ -108,6 +109,7 @@ pub struct Table {
     style: Style,
     header_style: Style,
     highlight_style: Style,
+    highlight_symbol: String<31>,
     spacing: u16,
     header: bool,
     separator: bool,
@@ -124,6 +126,7 @@ impl Table {
             style: Style::NONE,
             header_style: Style::NONE,
             highlight_style: Style::NONE,
+            highlight_symbol: "",
             spacing: 1,
             header: true,
             separator: false,
@@ -148,6 +151,14 @@ impl Table {
     /// selected row.
     pub fn highlight_style(var own self, _ style: Style) -> Self {
         self.highlight_style = style
+        self
+    }
+
+    /// This table, starting the selected row with `symbol`, such as `"> "`,
+    /// in columns that every row and the header leave blank before the
+    /// first column.
+    pub fn highlight_symbol(var own self, _ symbol: String<31>) -> Self {
+        self.highlight_symbol = symbol
         self
     }
 
@@ -237,6 +248,11 @@ impl Table {
                 frame.restore_clip(clip)
             }
             if selected {
+                print_in(
+                    Rect { x: area.x, y, width: area.width, height: 1 },
+                    self.highlight_symbol,
+                    Style::NONE,
+                )
                 self.highlight(area, y)
             }
         }
@@ -259,7 +275,8 @@ impl Table {
         for (i, ref column) in columns.enumerate() {
             constraints[i] = column.constraint
         }
-        let rects = Layout::columns().spacing(self.spacing).split(area, constraints)
+        let (_, columns_area) = area.split_left(clamp_u16(measure(self.highlight_symbol)))
+        let rects = Layout::columns().spacing(self.spacing).split(columns_area, constraints)
         state.column_count = 0
         for rect in rects.take(MAX_COLUMNS) {
             state.columns[state.column_count] = rect
@@ -595,7 +612,7 @@ fn columns_solve_their_widths_and_cut_cells() {
     let columns = [
         Column::new("Name", Length(4)),
         Column::new("Kind", Fill(1)),
-        Column::new("Size", Length(3)).align(Alignment::Right),
+        Column::new("Size", Length(3)).alignment(Alignment::Right),
     ]
     let rows = [["abcdef", "x", "7"], ["ab", "yyyy", "1234"]]
     var state = TableState::new()
@@ -648,8 +665,8 @@ fn columns_solve_their_widths_and_cut_cells() {
 fn cells_and_titles_follow_their_alignment() {
     let columns = [
         Column::new("L", Length(5)),
-        Column::new("C", Length(5)).align(Alignment::Center),
-        Column::new("R", Length(5)).align(Alignment::Right),
+        Column::new("C", Length(5)).alignment(Alignment::Center),
+        Column::new("R", Length(5)).alignment(Alignment::Right),
     ]
     let rows = [["ab", "ab", "ab"], ["abcd", "abcd", "abcd"]]
     var state = TableState::new()
@@ -759,6 +776,27 @@ fn the_selected_row_is_highlighted_across_its_gaps() {
             modifier_at(buffer, x, 1).is_empty() && modifier_at(buffer, x, 3).is_empty(),
         )
     }
+}
+
+#[test]
+fn the_selected_row_starts_with_the_highlight_symbol() {
+    let columns = [Column::new("A", Length(2)), Column::new("B", Fill(1))]
+    let rows = [["a", "1"], ["b", "2"]]
+    var state = TableState::new()
+    state.select(1)
+    let buffer = rendered(
+        Table::new().highlight_symbol("> "),
+        width: 7,
+        height: 3,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(buffer.to_text() == "  A  B\n  a  1\n> b  2")
+    assert(
+        state.column(0) == Option::Some(Rect::new(x: 2, y: 0, width: 2, height: 3)),
+    )
+    assert(modifier_at(buffer, 0, 2) == Modifier::REVERSED)
 }
 
 #[test]

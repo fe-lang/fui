@@ -94,22 +94,18 @@ impl Gauge {
 /// given, and a space stands between it and the line. The filled part
 /// takes the theme's `accent` style, the rest its `muted` style and the
 /// label its `text` style, each with the gauge's own style for it over it.
-pub struct LineGauge { filled_style: Style, unfilled_style: Style, label_style: Style }
+pub struct LineGauge { style: Style, unfilled_style: Style, label_style: Style }
 
 impl Copy for LineGauge {}
 
 impl LineGauge {
     pub fn new() -> Self {
-        LineGauge {
-            filled_style: Style::NONE,
-            unfilled_style: Style::NONE,
-            label_style: Style::NONE,
-        }
+        LineGauge { style: Style::NONE, unfilled_style: Style::NONE, label_style: Style::NONE }
     }
 
     /// The style for the filled part, over the theme's `accent` style.
-    pub fn filled_style(var own self, _ style: Style) -> Self {
-        self.filled_style = style
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
         self
     }
 
@@ -144,7 +140,7 @@ impl LineGauge {
             .split_left(
                 filled(line.width, done, total, parts: 1).downcast_truncate(),
             )
-        fill(filled_part, "━", theme().accent.patch(self.filled_style))
+        fill(filled_part, "━", theme().accent.patch(self.style))
         fill(rest, "━", theme().muted.patch(self.unfilled_style))
     }
 }
@@ -449,7 +445,7 @@ fn line_gauges_fill_whole_cells() {
         |frame, area| {
             with (frame) {
                 LineGauge::new()
-                    .filled_style(Style::new().fg(Color::GREEN))
+                    .style(Style::new().fg(Color::GREEN))
                     .unfilled_style(Style::new().fg(Color::RED))
                     .label_style(Style::new().italic())
                     .render_labeled(area, done: 1, total: 2, label: "a")

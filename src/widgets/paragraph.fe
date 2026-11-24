@@ -53,13 +53,15 @@ impl Paragraph {
     }
 
     /// Applies `style` over the theme's text style.
-    pub fn style(own self, _ style: Style) -> Self {
-        Paragraph { style, alignment: self.alignment, wrap: self.wrap, scroll_x: self.scroll_x }
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
     }
 
     /// Places each row in the area as `alignment` says.
-    pub fn alignment(own self, _ alignment: Alignment) -> Self {
-        Paragraph { style: self.style, alignment, wrap: self.wrap, scroll_x: self.scroll_x }
+    pub fn alignment(var own self, _ alignment: Alignment) -> Self {
+        self.alignment = alignment
+        self
     }
 
     /// Aligns rows left, as a new paragraph does.
@@ -78,24 +80,16 @@ impl Paragraph {
     }
 
     /// Wraps lines wider than the area as `mode` breaks them.
-    pub fn wrap(own self, _ mode: WrapMode) -> Self {
-        Paragraph {
-            style: self.style,
-            alignment: self.alignment,
-            wrap: Option::Some(mode),
-            scroll_x: self.scroll_x,
-        }
+    pub fn wrap(var own self, _ mode: WrapMode) -> Self {
+        self.wrap = Option::Some(mode)
+        self
     }
 
     /// Shifts lines left by `columns`, hiding the columns before it. Only a
     /// paragraph that does not wrap scrolls this way.
-    pub fn scroll_x(own self, _ columns: usize) -> Self {
-        Paragraph {
-            style: self.style,
-            alignment: self.alignment,
-            wrap: self.wrap,
-            scroll_x: columns,
-        }
+    pub fn scroll_x(var own self, _ columns: usize) -> Self {
+        self.scroll_x = columns
+        self
     }
 
     /// The rows `text` takes in an area `width` columns wide.
