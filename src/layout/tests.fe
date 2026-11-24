@@ -1,0 +1,242 @@
+use super::{Constraint, Flex, Layout}
+use super::Constraint::{Fill, Length, Max, Min, Percent, Ratio}
+use ingot::geom::Rect
+
+// The offset and length of each row of `rows`.
+fn spans<const N: usize>(_ rows: [Rect; N]) -> [(u16, u16); N] {
+    var out: [(u16, u16); N] = [(0, 0); N]
+    for (i, row) in rows.enumerate() {
+        out[i] = (row.y, row.height)
+    }
+    out
+}
+
+fn column(_ height: u16) -> Rect {
+    Rect::new(x: 0, y: 0, width: 4, height)
+}
+
+#[test]
+fn lengths_take_their_size() {
+    let rows = column(10).rows([Length(2), Length(3), Length(1)])
+    assert(spans(rows) == [(0, 2), (2, 3), (5, 1)])
+    assert(rows[1] == Rect::new(x: 0, y: 2, width: 4, height: 3))
+}
+
+#[test]
+fn fills_share_by_weight_and_sum_exactly() {
+    assert(
+        spans(column(11).rows([Fill(1), Fill(1)])) == [(0, 6), (6, 5)],
+    )
+    assert(
+        spans(column(10).rows([Fill(1), Fill(1), Fill(1)])) == [(0, 4), (4, 3), (7, 3)],
+    )
+    assert(
+        spans(column(10).rows([Fill(1), Fill(2)])) == [(0, 4), (4, 6)],
+    )
+    assert(
+        spans(column(7).rows([Fill(0), Fill(3), Length(1)])) == [(0, 0), (0, 6), (6, 1)],
+    )
+    assert(
+        spans(column(65535).rows([Fill(65535), Fill(65535), Fill(1)]))
+            == [(0, 32768), (32768, 32767), (65535, 0)],
+    )
+}
+
+#[test]
+fn requests_are_served_by_priority_when_room_is_short() {
+    // Length, then Min, then Percent and Ratio, then Max.
+    assert(
+        spans(column(7).rows([Max(4), Percent(50), Min(3), Length(5)]))
+            == [(0, 0), (0, 0), (0, 2), (2, 5)],
+    )
+    assert(
+        spans(column(9).rows([Max(4), Percent(50), Min(3), Length(5)]))
+            == [(0, 0), (0, 1), (1, 3), (4, 5)],
+    )
+    assert(
+        spans(column(13).rows([Max(4), Percent(50), Min(3), Length(5)]))
+            == [(0, 0), (0, 5), (5, 3), (8, 5)],
+    )
+    // Within one rank, the first segments first.
+    assert(
+        spans(column(7).rows([Length(5), Length(5), Fill(1)])) == [(0, 5), (5, 2), (7, 0)],
+    )
+}
+
+#[test]
+fn bounds_hold_when_room_allows() {
+    assert(
+        spans(column(10).rows([Min(3), Fill(1)])) == [(0, 3), (3, 7)],
+    )
+    assert(
+        spans(column(10).rows([Length(2), Min(3)])) == [(0, 2), (2, 8)],
+    )
+    assert(
+        spans(column(11).rows([Min(1), Min(1), Length(2)])) == [(0, 5), (5, 4), (9, 2)],
+    )
+    assert(
+        spans(column(10).rows([Max(3), Fill(1)])) == [(0, 3), (3, 7)],
+    )
+    assert(
+        spans(column(10).rows([Max(3), Length(2)])) == [(0, 3), (3, 2)],
+    )
+    assert(spans(column(2).rows([Max(3)])) == [(0, 2)])
+}
+
+#[test]
+fn shares_of_the_room_round_down() {
+    assert(
+        spans(column(11).rows([Percent(50), Percent(50)])) == [(0, 5), (5, 5)],
+    )
+    assert(
+        spans(column(10).rows([Ratio(1, 3), Ratio(1, 3), Ratio(1, 3)])) == [(0, 3), (3, 3), (6, 3)],
+    )
+    assert(
+        spans(
+                column(10).rows([Ratio(1, 0), Percent(200), Ratio(4000000000, 1)]),
+            )
+            == [(0, 0), (0, 10), (10, 0)],
+    )
+    assert(
+        spans(column(10).rows([Percent(30), Fill(1)])) == [(0, 3), (3, 7)],
+    )
+}
+
+#[test]
+fn flex_places_the_room_left() {
+    let parts = [Length(2), Length(2)]
+    let area = column(10)
+    assert(
+        spans(Layout::rows().split(area, parts)) == [(0, 2), (2, 2)],
+    )
+    assert(
+        spans(Layout::rows().flex(Flex::End).split(area, parts)) == [(6, 2), (8, 2)],
+    )
+    assert(
+        spans(Layout::rows().flex(Flex::Center).split(area, parts)) == [(3, 2), (5, 2)],
+    )
+    assert(
+        spans(Layout::rows().flex(Flex::Center).split(area, [Length(3)])) == [(3, 3)],
+    )
+    assert(
+        spans(Layout::rows().flex(Flex::SpaceBetween).split(area, parts)) == [(0, 2), (8, 2)],
+    )
+    assert(
+        spans(
+                Layout::rows()
+                    .flex(Flex::SpaceBetween)
+                    .split(area, [Length(1), Length(1), Length(1)]),
+            )
+            == [(0, 1), (5, 1), (9, 1)],
+    )
+    assert(
+        spans(
+                Layout::rows().flex(Flex::SpaceBetween).split(area, [Length(1)]),
+            ) == [(0, 1)],
+    )
+    // A segment that grows leaves no room for the flex.
+    assert(
+        spans(
+                Layout::rows().flex(Flex::End).split(area, [Length(2), Fill(1)]),
+            ) == [(0, 2), (2, 8)],
+    )
+}
+
+#[test]
+fn spacing_comes_between_segments() {
+    let spaced = Layout::rows().spacing(1)
+    assert(
+        spans(spaced.split(column(11), [Fill(1), Fill(1)])) == [(0, 5), (6, 5)],
+    )
+    assert(
+        spans(spaced.split(column(10), [Length(2), Length(2)])) == [(0, 2), (3, 2)],
+    )
+    assert(
+        spans(
+                spaced.flex(Flex::SpaceBetween).split(column(10), [Length(2), Length(2)]),
+            )
+            == [(0, 2), (8, 2)],
+    )
+    // Gaps that take more than the length shrink.
+    assert(
+        spans(
+                Layout::rows().spacing(10).split(column(5), [Length(1), Length(1), Length(1)]),
+            )
+            == [(0, 1), (3, 0), (5, 0)],
+    )
+    assert(spans(spaced.split(column(4), [Fill(1)])) == [(0, 4)])
+}
+
+#[test]
+fn margins_and_offsets_place_segments_in_the_area() {
+    let area = Rect::new(x: 5, y: 3, width: 10, height: 8)
+    let (left, right) = Layout::columns().margin(1).split(area, (Length(3), Fill(1)))
+    assert(left == Rect::new(x: 6, y: 4, width: 3, height: 6))
+    assert(right == Rect::new(x: 9, y: 4, width: 5, height: 6))
+    let rows = Layout::rows().margin(5).split(area, [Fill(1), Length(1)])
+    assert(
+        rows[0] == Rect::new(x: 10, y: 8, width: 0, height: 0) && rows[1] == rows[0],
+    )
+}
+
+#[test]
+fn splits_nest() {
+    let (head, body, status) = Rect::new(x: 0, y: 0, width: 20, height: 10)
+        .rows((Length(1), Fill(1), Length(1)))
+    assert(
+        head.height == 1 && body == Rect::new(x: 0, y: 1, width: 20, height: 8) && status.y == 9,
+    )
+    let (nav, main) = body.columns((Percent(25), Fill(1)))
+    assert(nav == Rect::new(x: 0, y: 1, width: 5, height: 8))
+    assert(main == Rect::new(x: 5, y: 1, width: 15, height: 8))
+    let cells = main.rows([Fill(1), Fill(1), Fill(1)])
+    assert(cells[2] == Rect::new(x: 5, y: 7, width: 15, height: 2))
+}
+
+#[test]
+fn every_arity_splits() {
+    let area = Rect::new(x: 0, y: 0, width: 6, height: 1)
+    let one = Length(1)
+    let (a, b) = area.columns((one, Fill(1)))
+    assert(a.width == 1 && b.width == 5)
+    let (a, b, c) = area.columns((one, one, Fill(1)))
+    assert(a.x == 0 && b.x == 1 && c.width == 4)
+    let (_, _, _, d) = area.columns((one, one, one, Fill(1)))
+    assert(d.x == 3 && d.width == 3)
+    let (_, _, _, _, e) = area.columns((one, one, one, one, Fill(1)))
+    assert(e.x == 4 && e.width == 2)
+    let (_, _, _, _, _, f) = area.columns((one, one, one, one, one, Fill(1)))
+    assert(f.x == 5 && f.width == 1)
+}
+
+#[test]
+fn slices_split_into_vectors() {
+    var constraints: MemVec<Constraint> = MemVec::new()
+    constraints.push(Length(2))
+    constraints.push(Fill(1))
+    constraints.push(Max(1))
+    let rows = column(10).rows(constraints.as_slice())
+    assert(rows.len() == 3)
+    assert(
+        rows[0].height == 2
+            && rows[1] == Rect::new(x: 0, y: 2, width: 4, height: 7)
+            && rows[2].y == 9,
+    )
+    let empty: MemVec<Constraint> = MemVec::new()
+    assert(column(10).rows(empty.as_slice()).is_empty())
+}
+
+#[test]
+fn empty_inputs_make_empty_segments() {
+    let constraints: [Constraint; 0] = []
+    assert(column(10).rows(constraints).len() == 0)
+    assert(
+        spans(column(0).rows([Length(3), Fill(1), Percent(50)])) == [(0, 0), (0, 0), (0, 0)],
+    )
+    let flat = Rect::new(x: 2, y: 2, width: 0, height: 5).columns([Fill(1), Length(2)])
+    assert(flat[0] == Rect::new(x: 2, y: 2, width: 0, height: 5))
+    assert(flat[1].x == 2)
+    assert(Length(1) == Length(1))
+    assert(Length(1) != Min(1))
+    assert(Ratio(1, 2) != Ratio(1, 3))
+}
