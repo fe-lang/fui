@@ -244,7 +244,7 @@ fn the_count_stays_centered_when_the_terminal_resizes() {
 
 ## What is checked
 
-- 290 library tests; the examples add 22 (`counter` 2, `events` 3, `gallery` 8,
+- 291 library tests; the examples add 22 (`counter` 2, `events` 3, `gallery` 8,
   `files` 8, `listen` 1). The `files` tests build a directory tree through `Fs`.
 - All 1093 cases of Unicode 16.0.0 `GraphemeBreakTest.txt` for cluster breaks.
 - The renderer's property test: 6000 random buffers of random sizes, contents
