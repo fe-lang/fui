@@ -4,6 +4,7 @@ use ingot::frame::{Frame, fill, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
 use super::{drawn, drawn_text}
+use super::scroll::ScrollState
 
 /// Which way a `Scrollbar` runs.
 pub enum Orientation {
@@ -142,6 +143,19 @@ impl Scrollbar {
             self.thumb_area(area, content_length, viewport_length, position),
             self.thumb,
             theme().text.patch(self.thumb_style),
+        )
+    }
+
+    /// Draws the scrollbar in `area` for the view `scroll` records, such as
+    /// a `ListState`'s: `Scrollbar::vertical().render_for(area, self.list.scroll())`.
+    pub fn render_for(self, _ area: Rect, _ scroll: ScrollState)
+    uses (frame: mut Frame)
+    {
+        self.render(
+            area,
+            content_length: scroll.content(),
+            viewport_length: scroll.viewport(),
+            position: scroll.position(),
         )
     }
 
@@ -455,6 +469,23 @@ fn scrollbars_draw_along_an_edge() {
     assert(
         buffer.get(Pos::new(x: 0, y: 1)).unwrap().modifier() == Modifier::DIM,
     )
+}
+
+#[test]
+fn scrollbars_draw_a_scroll_state() {
+    var scroll = ScrollState::new()
+    scroll.set_lengths(content: 8, viewport: 4)
+    scroll.scroll_to(2)
+    let text = drawn_text(
+        width: 3,
+        height: 4,
+        |frame, area| {
+            with (frame) {
+                Scrollbar::vertical().render_for(area, scroll)
+            }
+        },
+    )
+    assert(text == "  │\n  █\n  █\n  │")
 }
 
 #[test]
