@@ -11,11 +11,13 @@
 //! symbol turns the other half into a space, so the grid always holds whole
 //! symbols.
 //!
-//! Text never puts control characters in cells, since a terminal would act
-//! on them: a cluster with a C0 control (below `0x20`), DEL (`0x7f`) or a C1
-//! control (U+0080 to U+009F) is skipped, as is any cluster of width 0, so
-//! a drawn string takes exactly the columns `text::width` counts for its
-//! other clusters. A byte that is no UTF-8 is drawn as U+FFFD.
+//! No control character reaches a cell, since a terminal would act on it:
+//! drawing skips a cluster with a C0 control (below `0x20`, such as ESC,
+//! tab and newline), DEL (`0x7f`) or a C1 control (U+0080 to U+009F), and
+//! any other cluster of width 0, such as a combining mark with no base
+//! before it. A cluster with bytes that are no UTF-8 is drawn as U+FFFD,
+//! one column wide. So a string takes the columns `text::width` counts for
+//! it, which are 0 for controls.
 use core::ops::Eq
 use super::geom::{Pos, Rect, Size, min}
 use super::style::{Color, Modifier, Style}
