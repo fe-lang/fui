@@ -1,0 +1,683 @@
+use core::{MemBuffer, MemSpan}
+use ingot::geom::{Pos, Size}
+use ingot::style::{Color, Modifier}
+use ingot::text::encode
+use super::Vt
+
+// `text` with caret notation for C0 controls: "^[" is ESC, "^G" BEL, "^H"
+// BS.
+fn bytes(_ text: MemSpan) -> MemBuffer {
+    var out = MemBuffer::empty()
+    var i: usize = 0
+    while i < text.len() {
+        if text[i] == b'^' && i + 1 < text.len() && text[i + 1] >= b'@' && text[i + 1] <= b'_' {
+            out.push(text[i + 1] - b'@')
+            i += 2
+        } else {
+            out.push(text[i])
+            i += 1
+        }
+    }
+    out
+}
+
+fn fed<T: std::io::Display>(width: u16, height: u16, _ input: T) -> Vt {
+    var vt = Vt::new(Size { width, height })
+    vt.feed(bytes(format!(input).span()).span())
+    vt
+}
+
+fn feed<T: std::io::Display>(_ vt: mut Vt, _ input: T) {
+    vt.feed(bytes(format!(input).span()).span())
+}
+
+fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for c in scalars {
+        encode(c, mut out)
+    }
+    out
+}
+
+fn at(x: u16, y: u16) -> Pos {
+    Pos { x, y }
+}
+
+// Whether two terminals show the same screen in the same state.
+fn same(_ a: Vt, _ b: Vt) -> bool {
+    if a.size() != b.size() || a.cursor() != b.cursor() || a.pending_wrap() != b.pending_wrap() {
+        return false
+    }
+    if a.keyboard_depth() != b.keyboard_depth() || a.keyboard_flags() != b.keyboard_flags() {
+        return false
+    }
+    for mode in [25, 1000, 1002, 1003, 1004, 1006, 1049, 2004, 2026] {
+        if a.mode(mode) != b.mode(mode) {
+            return false
+        }
+    }
+    var y: u16 = 0
+    while y < a.size().height {
+        var x: u16 = 0
+        while x < a.size().width {
+            let p = ref a.cell(at(x, y))
+            let q = ref b.cell(at(x, y))
+            if p.symbol() != q.symbol()
+                || p.width != q.width
+                || p.fg != q.fg
+                || p.bg != q.bg
+                || p.modifier != q.modifier {
+                return false
+            }
+            x += 1
+        }
+        y += 1
+    }
+    true
+}
+
+// Whether every wide cell has its right half after it and every right
+// half its wide cell before it, and the cursor is on the screen.
+fn consistent(_ vt: Vt) -> bool {
+    let size = vt.size()
+    if size.width > 0
+        && size.height > 0
+        && (vt.cursor().x >= size.width || vt.cursor().y >= size.height) {
+        return false
+    }
+    var y: u16 = 0
+    while y < size.height {
+        var x: u16 = 0
+        var wide = false
+        while x < size.width {
+            let w = vt.cell(at(x, y)).width
+            if (w == 0) != wide || (w == 0 && vt.cell(at(x, y)).symbol().len() > 0) {
+                return false
+            }
+            wide = w == 2
+            x += 1
+        }
+        if wide { return false }
+        y += 1
+    }
+    true
+}
+
+#[test]
+fn writes_text_and_controls() {
+    let vt = fed(width: 10, height: 3, "hello")
+    assert(
+        vt.to_text() == "hello\n\n" && vt.cursor() == at(x: 5, y: 0),
+    )
+    let vt = fed(width: 10, height: 3, "ab\r\ncd\nef")
+    assert(vt.to_text() == "ab\ncd\n  ef")
+    let vt = fed(width: 10, height: 3, "abc^H")
+    assert(vt.cursor() == at(x: 2, y: 0))
+}
+
+#[test]
+fn tabs_stop_every_eight_columns() {
+    let vt = fed(width: 20, height: 1, "a^Ib^I^I^Ic")
+    assert(
+        vt.to_text() == "a       b          c" && vt.cursor() == at(x: 19, y: 0),
+    )
+}
+
+#[test]
+fn moves_the_cursor_within_the_screen() {
+    var vt = Vt::new(Size { width: 10, height: 5 })
+    feed(mut vt, "^[[3;4H")
+    assert(vt.cursor() == at(x: 3, y: 2))
+    feed(mut vt, "^[[H")
+    assert(vt.cursor() == at(x: 0, y: 0))
+    feed(mut vt, "^[[99;99f")
+    assert(vt.cursor() == at(x: 9, y: 4))
+    feed(mut vt, "^[[2A^[[3D")
+    assert(vt.cursor() == at(x: 6, y: 2))
+    feed(mut vt, "^[[A^[[D^[[0C^[[B")
+    assert(vt.cursor() == at(x: 6, y: 2))
+    feed(mut vt, "^[[50A^[[50D")
+    assert(vt.cursor() == at(x: 0, y: 0))
+    feed(mut vt, "^[[50B^[[50C")
+    assert(vt.cursor() == at(x: 9, y: 4))
+    feed(mut vt, "^[[3G")
+    assert(vt.cursor() == at(x: 2, y: 4))
+    feed(mut vt, "^[[2d")
+    assert(vt.cursor() == at(x: 2, y: 1))
+    feed(mut vt, "^[[2E")
+    assert(vt.cursor() == at(x: 0, y: 3))
+    feed(mut vt, "^[[5G^[[F")
+    assert(vt.cursor() == at(x: 0, y: 2))
+    feed(mut vt, "^[[;5H")
+    assert(vt.cursor() == at(x: 4, y: 0))
+}
+
+#[test]
+fn erases_the_screen_and_lines() {
+    let full = "abcde^M^Jfghij^M^Jklmno"
+    var vt = fed(width: 5, height: 3, full)
+    feed(mut vt, "^[[2;3H^[[J")
+    assert(vt.to_text() == "abcde\nfg\n")
+    vt = fed(width: 5, height: 3, full)
+    feed(mut vt, "^[[2;3H^[[1J")
+    assert(vt.to_text() == "\n   ij\nklmno")
+    vt = fed(width: 5, height: 3, full)
+    feed(mut vt, "^[[2J")
+    assert(vt.to_text() == "\n\n" && vt.cursor() == at(x: 4, y: 2))
+    vt = fed(width: 5, height: 3, full)
+    feed(mut vt, "^[[3J")
+    assert(vt.to_text() == "abcde\nfghij\nklmno")
+    vt = fed(width: 5, height: 3, full)
+    feed(mut vt, "^[[2;3H^[[K")
+    assert(vt.to_text() == "abcde\nfg\nklmno")
+    feed(mut vt, "^[[1;3H^[[1K")
+    assert(vt.to_text() == "   de\nfg\nklmno")
+    feed(mut vt, "^[[3;1H^[[2K")
+    assert(vt.to_text() == "   de\nfg\n")
+    vt = fed(width: 5, height: 3, full)
+    feed(mut vt, "^[[1;2H^[[2X")
+    assert(
+        vt.to_text() == "a  de\nfghij\nklmno" && vt.cursor() == at(x: 1, y: 0),
+    )
+    feed(mut vt, "^[[2;4H^[[9X^[[3;1H^[[X")
+    assert(vt.to_text() == "a  de\nfgh\n lmno")
+}
+
+#[test]
+fn erasing_uses_the_background() {
+    let vt = fed(width: 4, height: 2, "^[[41;1;32m^[[2J")
+    let cell = ref vt.cell(at(x: 3, y: 1))
+    assert(
+        cell.bg == Color::RED && cell.fg == Color::RESET && cell.modifier == Modifier::NONE,
+    )
+    assert(cell.symbol() == " " && cell.width == 1)
+}
+
+#[test]
+fn sets_attributes_and_colors() {
+    var vt = fed(
+        width: 20,
+        height: 1,
+        "^[[1;3;4;5;7;8;9ma^[[22;23;24;25;27;28;29mb^[[2mc^[[0md",
+    )
+    let all = Modifier::BOLD
+        | Modifier::ITALIC
+        | Modifier::UNDERLINED
+        | Modifier::BLINK
+        | Modifier::REVERSED
+        | Modifier::HIDDEN
+        | Modifier::CROSSED_OUT
+    assert(vt.cell(at(x: 0, y: 0)).modifier == all)
+    assert(vt.cell(at(x: 1, y: 0)).modifier == Modifier::NONE)
+    assert(vt.cell(at(x: 2, y: 0)).modifier == Modifier::DIM)
+    assert(vt.cell(at(x: 3, y: 0)).modifier == Modifier::NONE)
+    vt = fed(
+        width: 20,
+        height: 1,
+        "^[[31;42ma^[[91;102mb^[[39mc^[[49md^[[37;47me^[[97;107mf",
+    )
+    assert(
+        vt.cell(at(x: 0, y: 0)).fg == Color::RED && vt.cell(at(x: 0, y: 0)).bg == Color::GREEN,
+    )
+    assert(
+        vt.cell(at(x: 1, y: 0)).fg == Color::LIGHT_RED
+            && vt.cell(at(x: 1, y: 0)).bg == Color::LIGHT_GREEN,
+    )
+    assert(
+        vt.cell(at(x: 2, y: 0)).fg == Color::RESET
+            && vt.cell(at(x: 2, y: 0)).bg == Color::LIGHT_GREEN,
+    )
+    assert(vt.cell(at(x: 3, y: 0)).bg == Color::RESET)
+    assert(
+        vt.cell(at(x: 4, y: 0)).fg == Color::GRAY && vt.cell(at(x: 4, y: 0)).bg == Color::GRAY,
+    )
+    assert(
+        vt.cell(at(x: 5, y: 0)).fg == Color::WHITE && vt.cell(at(x: 5, y: 0)).bg == Color::WHITE,
+    )
+}
+
+#[test]
+fn sets_extended_colors() {
+    let vt = fed(
+        width: 20,
+        height: 1,
+        "^[[38;5;200;48;2;1;2;3ma^[[38:2::4:5:6;48:5:17mb^[[38:2:7:8:9mc^[[1;38;5;300;4md^[[38;5m",
+    )
+    assert(vt.cell(at(x: 0, y: 0)).fg == Color::indexed(200))
+    assert(vt.cell(at(x: 0, y: 0)).bg == Color::rgb(1, 2, 3))
+    assert(vt.cell(at(x: 1, y: 0)).fg == Color::rgb(4, 5, 6))
+    assert(vt.cell(at(x: 1, y: 0)).bg == Color::indexed(17))
+    assert(vt.cell(at(x: 2, y: 0)).fg == Color::rgb(7, 8, 9))
+    // An invalid index leaves the color and the parameters after it apply.
+    let d = ref vt.cell(at(x: 3, y: 0))
+    assert(
+        d.fg == Color::rgb(7, 8, 9) && d.modifier == Modifier::BOLD | Modifier::UNDERLINED,
+    )
+    // `38:5:n` underline colors are read and ignored; `4:0` is no underline.
+    let vt = fed(width: 5, height: 1, "^[[4;58:5:3ma^[[4:0mb^[[4:3mc")
+    assert(
+        vt.cell(at(x: 0, y: 0)).modifier == Modifier::UNDERLINED
+            && vt.cell(at(x: 0, y: 0)).fg == Color::RESET,
+    )
+    assert(vt.cell(at(x: 1, y: 0)).modifier == Modifier::NONE)
+    assert(vt.cell(at(x: 2, y: 0)).modifier == Modifier::UNDERLINED)
+}
+
+#[test]
+fn wraps_at_the_right_edge_as_xterm() {
+    var vt = fed(width: 5, height: 3, "abcde")
+    assert(vt.cursor() == at(x: 4, y: 0) && vt.pending_wrap())
+    feed(mut vt, "f")
+    assert(
+        vt.to_text() == "abcde\nf\n" && vt.cursor() == at(x: 1, y: 1) && !vt.pending_wrap(),
+    )
+    // A control cancels the pending wrap: CR returns on the same row.
+    vt = fed(width: 5, height: 3, "abcde^Mx")
+    assert(vt.to_text() == "xbcde\n\n")
+    // So does cursor motion, and erasure.
+    vt = fed(width: 5, height: 3, "abcde^[[Kx")
+    assert(vt.to_text() == "abcdx\n\n" && vt.pending_wrap())
+    vt = fed(width: 5, height: 3, "abcde^Hx")
+    assert(
+        vt.to_text() == "abcxe\n\n" && vt.cursor() == at(x: 4, y: 0),
+    )
+    // SGR keeps it.
+    vt = fed(width: 5, height: 3, "abcde^[[1mf")
+    assert(vt.to_text() == "abcde\nf\n")
+    // LF with a pending wrap moves down one row only.
+    vt = fed(width: 5, height: 3, "abcde^Jx")
+    assert(vt.to_text() == "abcde\n    x\n")
+}
+
+#[test]
+fn the_bottom_right_cell_scrolls_only_on_the_next_cluster() {
+    var vt = fed(width: 3, height: 2, "abcdef")
+    assert(
+        vt.to_text() == "abc\ndef" && vt.cursor() == at(x: 2, y: 1) && vt.pending_wrap(),
+    )
+    feed(mut vt, "g")
+    assert(vt.to_text() == "def\ng" && vt.cursor() == at(x: 1, y: 1))
+    vt = fed(width: 3, height: 2, "abc^M^Jdef^[[1;1Hx")
+    assert(vt.to_text() == "xbc\ndef")
+}
+
+#[test]
+fn scrolls() {
+    var vt = fed(width: 3, height: 3, "a^M^Jb^M^Jc^M^Jd")
+    assert(vt.to_text() == "b\nc\nd")
+    feed(mut vt, "^[[2S")
+    assert(vt.to_text() == "d\n\n" && vt.cursor() == at(x: 1, y: 2))
+    feed(mut vt, "^[[H^[[T")
+    assert(vt.to_text() == "\nd\n")
+    feed(mut vt, "^[M")
+    assert(vt.to_text() == "\n\nd")
+    feed(mut vt, "^[[3;1H^[D")
+    assert(vt.to_text() == "\nd\n" && vt.cursor() == at(x: 0, y: 2))
+    feed(mut vt, "x^[E")
+    assert(vt.to_text() == "d\nx\n" && vt.cursor() == at(x: 0, y: 2))
+    feed(mut vt, "^[[9S")
+    assert(vt.to_text() == "\n\n")
+}
+
+#[test]
+fn wide_clusters_take_two_cells() {
+    var vt = fed(width: 6, height: 2, "a中b")
+    assert(vt.to_text() == "a中b\n" && vt.cursor() == at(x: 4, y: 0))
+    assert(
+        vt.cell(at(x: 1, y: 0)).width == 2 && vt.cell(at(x: 1, y: 0)).symbol() == "中",
+    )
+    assert(
+        vt.cell(at(x: 2, y: 0)).width == 0 && vt.cell(at(x: 2, y: 0)).symbol().len() == 0,
+    )
+    // Writing over either half blanks the other.
+    feed(mut vt, "^[[1;3Hx")
+    assert(
+        vt.to_text() == "a xb\n" && vt.cell(at(x: 1, y: 0)).width == 1,
+    )
+    vt = fed(width: 6, height: 2, "a中b^[[1;2Hx")
+    assert(vt.to_text() == "ax b\n")
+    // A wide cluster over the right half of one and the left of another.
+    vt = fed(width: 6, height: 2, "中中^[[1;2H文")
+    assert(vt.to_text() == " 文\n" && consistent(vt))
+    // Erasing half of a wide cluster blanks it all.
+    vt = fed(width: 6, height: 2, "中中^[[1;2H^[[1X")
+    assert(vt.to_text() == "  中\n" && consistent(vt))
+    vt = fed(width: 6, height: 2, "中中^[[1;3H^[[1K")
+    assert(vt.to_text() == "\n" && consistent(vt))
+}
+
+#[test]
+fn wide_clusters_at_the_right_edge() {
+    // One that ends at the last column leaves a pending wrap.
+    var vt = fed(width: 4, height: 2, "ab中")
+    assert(vt.cursor() == at(x: 3, y: 0) && vt.pending_wrap())
+    feed(mut vt, "c")
+    assert(vt.to_text() == "ab中\nc")
+    // One that does not fit blanks the last column and wraps.
+    vt = fed(width: 4, height: 2, "abcd^[[1;4H中")
+    assert(vt.to_text() == "abc\n中" && vt.cursor() == at(x: 2, y: 1))
+    // At the bottom row, it scrolls.
+    vt = fed(width: 4, height: 2, "^[[2;4H中")
+    assert(vt.to_text() == "\n中")
+    // A width-1 terminal shows wide clusters in one cell.
+    vt = fed(width: 1, height: 2, "中")
+    assert(vt.to_text() == "中\n" && consistent(vt))
+}
+
+#[test]
+fn scalars_join_the_cluster_before() {
+    // A combining mark joins the cell before it.
+    var vt = fed(width: 5, height: 1, utf8([0x65, 0x301, 0x78]))
+    assert(
+        vt.cell(at(x: 0, y: 0)).symbol() == utf8([0x65, 0x301]).span()
+            && vt.cursor() == at(x: 2, y: 0),
+    )
+    // With no cell before the cursor on its row, it is dropped.
+    vt = fed(width: 5, height: 1, utf8([0x301, 0x61]))
+    assert(vt.to_text() == "a")
+    // After cursor motion it joins the cell left of the cursor, as in xterm.
+    vt = fed(width: 5, height: 1, "ab^[[1;2H")
+    feed(mut vt, utf8([0x301]))
+    assert(
+        vt.cell(at(x: 0, y: 0)).symbol() == utf8([0x61, 0x301]).span(),
+    )
+    // And with a pending wrap, the cell under the cursor.
+    vt = fed(width: 2, height: 1, "ab")
+    feed(mut vt, utf8([0x301]))
+    assert(
+        vt.cell(at(x: 1, y: 0)).symbol() == utf8([0x62, 0x301]).span(),
+    )
+}
+
+#[test]
+fn joining_scalars_widen_a_cluster() {
+    // VS16 makes a heart an emoji: two cells.
+    var vt = fed(width: 5, height: 1, utf8([0x2764, 0xfe0f, 0x61]))
+    assert(
+        vt.cell(at(x: 0, y: 0)).width == 2
+            && vt.cell(at(x: 0, y: 0)).symbol() == utf8([0x2764, 0xfe0f]).span(),
+    )
+    assert(vt.cell(at(x: 2, y: 0)).symbol() == "a")
+    // Regional indicators pair up into flags.
+    vt = fed(width: 5, height: 1, utf8([0x1f1fa, 0x1f1f8, 0x1f1eb]))
+    assert(
+        vt.cell(at(x: 0, y: 0)).width == 2 && vt.cell(at(x: 2, y: 0)).width == 1,
+    )
+    assert(vt.cursor() == at(x: 3, y: 0))
+    // A family is one wide cell.
+    vt = fed(
+        width: 5,
+        height: 1,
+        utf8([0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467]),
+    )
+    assert(
+        vt.cell(at(x: 0, y: 0)).width == 2 && vt.cursor() == at(x: 2, y: 0),
+    )
+    // A heart in the last column wraps when VS16 widens it.
+    vt = fed(width: 3, height: 2, "ab")
+    feed(mut vt, utf8([0x2764, 0xfe0f]))
+    var expected = format!("ab\n")
+    expected.extend_from(utf8([0x2764, 0xfe0f]).span())
+    assert(vt.to_text() == expected)
+    assert(
+        vt.cell(at(x: 2, y: 0)).symbol() == " " && vt.cell(at(x: 0, y: 1)).width == 2,
+    )
+    assert(vt.cursor() == at(x: 2, y: 1))
+}
+
+#[test]
+fn invalid_utf8_shows_replacement_characters() {
+    var input = MemBuffer::empty()
+    input.push(0x61)
+    input.push(0xff)
+    input.push(0xe2)
+    input.push(0x82)
+    input.push(0x62)
+    input.push(0xc3)
+    var vt = Vt::new(Size { width: 6, height: 1 })
+    vt.feed(input.span())
+    assert(vt.to_text() == utf8([0x61, 0xfffd, 0xfffd, 0x62]))
+    // A truncated sequence before ESC is one replacement, and the escape
+    // still runs.
+    feed(mut vt, "^[[31mc")
+    assert(
+        vt.to_text() == utf8([0x61, 0xfffd, 0xfffd, 0x62, 0xfffd, 0x63]),
+    )
+    assert(vt.cell(at(x: 5, y: 0)).fg == Color::RED)
+    // Encoded C1 controls are ignored.
+    vt = fed(width: 4, height: 1, utf8([0x61, 0x9b, 0x62]))
+    assert(vt.to_text() == "ab")
+}
+
+#[test]
+fn the_alternate_screen_keeps_the_primary() {
+    var vt = fed(width: 6, height: 2, "main^[[1;3H")
+    feed(mut vt, "^[[?1049h")
+    assert(
+        vt.alternate_screen() && vt.to_text() == "\n" && vt.cursor() == at(x: 2, y: 0),
+    )
+    feed(mut vt, "^[[2;1Halt")
+    assert(vt.to_text() == "\nalt")
+    feed(mut vt, "^[[?1049l")
+    assert(
+        !vt.alternate_screen() && vt.to_text() == "main\n" && vt.cursor() == at(x: 2, y: 0),
+    )
+    // Entering again shows a cleared alternate screen; a repeated set does
+    // nothing.
+    feed(mut vt, "^[[?1049hx^[[?1049h")
+    assert(vt.to_text() == "  x\n")
+    feed(mut vt, "^[[?1049l^[[?1049l")
+    assert(vt.to_text() == "main\n" && vt.cursor() == at(x: 2, y: 0))
+}
+
+#[test]
+fn tracks_private_modes() {
+    var vt = Vt::new(Size { width: 4, height: 1 })
+    assert(vt.cursor_visible() && !vt.mode(1000) && !vt.mode(7))
+    feed(
+        mut vt,
+        "^[[?25l^[[?1000;1002;1003;1006h^[[?2004h^[[?1004h^[[?2026h^[[?7l",
+    )
+    assert(!vt.cursor_visible())
+    for mode in [1000, 1002, 1003, 1006, 2004, 1004, 2026] {
+        assert(vt.mode(mode))
+    }
+    feed(mut vt, "^[[?1000;1002;1003;1006;2004;1004;2026l^[[?25h")
+    assert(vt.cursor_visible())
+    for mode in [1000, 1002, 1003, 1006, 2004, 1004, 2026] {
+        assert(!vt.mode(mode))
+    }
+    // Modes without `?` are other modes.
+    feed(mut vt, "^[[25l^[[1000h")
+    assert(vt.cursor_visible() && !vt.mode(1000))
+}
+
+#[test]
+fn tracks_the_kitty_keyboard_stack() {
+    var vt = Vt::new(Size { width: 4, height: 1 })
+    assert(vt.keyboard_depth() == 0 && vt.keyboard_flags() == 0)
+    feed(mut vt, "^[[>1u^[[>3u")
+    assert(vt.keyboard_depth() == 2 && vt.keyboard_flags() == 3)
+    feed(mut vt, "^[[=4;2u")
+    assert(vt.keyboard_flags() == 7)
+    feed(mut vt, "^[[=1;3u")
+    assert(vt.keyboard_flags() == 6)
+    feed(mut vt, "^[[=8u")
+    assert(vt.keyboard_flags() == 8)
+    feed(mut vt, "^[[<u")
+    assert(vt.keyboard_depth() == 1 && vt.keyboard_flags() == 1)
+    // The alternate screen has its own stack.
+    feed(mut vt, "^[[?1049h")
+    assert(vt.keyboard_depth() == 0)
+    feed(mut vt, "^[[>5u^[[?1049l")
+    assert(vt.keyboard_depth() == 1 && vt.keyboard_flags() == 1)
+    // Popping more than was pushed empties the stack and clears the flags.
+    feed(mut vt, "^[[=9u^[[<5u")
+    assert(vt.keyboard_depth() == 0 && vt.keyboard_flags() == 0)
+    // A query changes nothing.
+    feed(mut vt, "^[[?u")
+    assert(vt.keyboard_depth() == 0 && vt.to_text() == "")
+}
+
+#[test]
+fn saves_and_restores_the_cursor() {
+    var vt = fed(width: 6, height: 3, "^[[2;3H^[[31m^[7^[[H^[[0m^[8x")
+    assert(
+        vt.cursor() == at(x: 3, y: 1) && vt.cell(at(x: 2, y: 1)).fg == Color::RED,
+    )
+    vt = fed(width: 6, height: 3, "^[[3;2H^[[s^[[H^[[uy")
+    assert(vt.cell(at(x: 1, y: 2)).symbol() == "y")
+    // The pending wrap is saved too.
+    vt = fed(width: 3, height: 2, "abc^[7^[[2;1H^[8d")
+    assert(vt.to_text() == "abc\nd")
+    // Restoring with nothing saved goes home with default colors.
+    vt = fed(width: 3, height: 2, "^[[2;2H^[[32m^[8z")
+    assert(
+        vt.cell(at(x: 0, y: 0)).symbol() == "z" && vt.cell(at(x: 0, y: 0)).fg == Color::RESET,
+    )
+}
+
+#[test]
+fn skips_strings_and_unknown_sequences() {
+    var vt = fed(
+        width: 20,
+        height: 1,
+        "a^[]0;title^Gb^[]8;;http://x^[\\c^[Pq#0;1^[\\d",
+    )
+    assert(vt.to_text() == "abcd")
+    vt = fed(width: 20, height: 1, "a^[_apc^[\\b^[^pm^[\\c^[Xsos^[\\d")
+    assert(vt.to_text() == "abcd")
+    // Unknown CSI and escape sequences, and malformed ones.
+    vt = fed(
+        width: 20,
+        height: 1,
+        "a^[[?1;2$pb^[[>4;2mc^[(Bd^[#8e^[[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18mf^[[1?2hg",
+    )
+    assert(vt.to_text() == "abcdefg")
+    // An ESC in a string ends it and starts a sequence.
+    vt = fed(width: 20, height: 1, "a^[]0;t^[[31mb")
+    assert(
+        vt.to_text() == "ab" && vt.cell(at(x: 1, y: 0)).fg == Color::RED,
+    )
+    // CAN cancels a sequence; controls inside one run.
+    vt = fed(width: 20, height: 1, "a^[[3^X1mb^[[^M2Cc")
+    assert(vt.to_text() == "a1cb")
+}
+
+#[test]
+fn resets() {
+    var vt = fed(width: 4, height: 2, "ab^[[?25l^[[?1049h^[[>1u^[[31mcd^[c")
+    assert(
+        vt.to_text() == "\n" && vt.cursor_visible() && !vt.alternate_screen(),
+    )
+    assert(vt.keyboard_depth() == 0 && vt.cursor() == at(x: 0, y: 0))
+    feed(mut vt, "x")
+    assert(vt.cell(at(x: 0, y: 0)).fg == Color::RESET)
+}
+
+#[test]
+fn empty_terminals_read_anything() {
+    var vt = fed(
+        width: 0,
+        height: 0,
+        "abc^[[2J^[[5;5H中^M^J^[[S^[[T^[M^[[?1049h^[[K^[[X",
+    )
+    assert(vt.to_text() == "" && vt.cursor() == at(x: 0, y: 0))
+    vt = fed(width: 0, height: 3, "abc^M^J^J^J^J^[[S")
+    assert(vt.to_text() == "\n\n")
+    vt = fed(width: 3, height: 0, "abc^M^J^J^J^J^[[S")
+    assert(vt.to_text() == "")
+}
+
+// Inputs that cover the parser's states, each fed whole and split in two
+// at every byte.
+fn split_inputs() -> MemBuffer {
+    var all = MemBuffer::empty()
+    all.extend_from(
+        bytes(
+            format!(
+                "ab^[[1;31;48;2;1;2;3mcd^[[2;3H^[[K^[]0;t^G^[[38:2::9:8:7mxyz^[7^[[?1049h",
+            )
+                .span(),
+        )
+            .span(),
+    )
+    all.extend_from(
+        utf8(
+            [0x2764, 0xfe0f, 0x65, 0x301, 0x1f1fa, 0x1f1f8, 0x4e2d, 0x1f468, 0x200d, 0x1f469],
+        )
+            .span(),
+    )
+    all.extend_from(
+        bytes(
+            format!("^[8^[[?1049l^[P1$r^[\\^[[>1u^[[=3;2u^[(0q^[[5X^[[3S").span(),
+        ).span(),
+    )
+    all.push(0xe2)
+    all.push(0x82)
+    all.push(0x41)
+    all
+}
+
+#[test]
+fn split_feeds_read_as_one() {
+    let input = split_inputs()
+    let size = Size { width: 7, height: 4 }
+    var whole = Vt::new(size)
+    whole.feed(input.span())
+    var cut: usize = 0
+    while cut <= input.len() {
+        var split = Vt::new(size)
+        split.feed(input.span().slice(offset: 0, len: cut))
+        split.feed(input.span().slice(offset: cut, len: input.len() - cut))
+        assert(same(whole, split))
+        cut += 1
+    }
+    // A byte at a time.
+    var bytewise = Vt::new(size)
+    for byte in input.span() {
+        var one = MemBuffer::empty()
+        one.push(byte)
+        bytewise.feed(one.span())
+    }
+    assert(same(whole, bytewise))
+}
+
+fn random(_ state: mut u64) -> u64 {
+    state ^= state << 13
+    state ^= state >> 7
+    state ^= state << 17
+    state
+}
+
+#[test]
+fn reads_random_bytes_without_breaking() {
+    // Bytes weighted toward the ones sequences are made of.
+    let alphabet = bytes(
+        format!(
+            "^[^[^[[[[;;:?>=<0123456789mHJKXSTuhlABCDdGf]P^G^\\\\^M^J^H^I^X a中",
+        ).span(),
+    )
+    var state: u64 = 0x2545f4914f6cdd1d
+    var round: usize = 0
+    while round < 200 {
+        let width: u16 = (random(mut state) % 9).downcast_truncate()
+        let height: u16 = (random(mut state) % 5).downcast_truncate()
+        var vt = Vt::new(Size { width, height })
+        var input = MemBuffer::empty()
+        var i: usize = 0
+        while i < 300 {
+            let pick = random(mut state)
+            if pick % 8 == 0 {
+                input.push((pick >> 8).downcast_truncate())
+            } else {
+                let r: usize = (pick >> 8).downcast_truncate()
+                input.push(alphabet[r % alphabet.len()])
+            }
+            i += 1
+        }
+        vt.feed(input.span())
+        assert(consistent(vt))
+        round += 1
+    }
+}

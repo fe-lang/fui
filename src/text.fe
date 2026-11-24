@@ -315,31 +315,68 @@ pub fn next_cluster(_ text: MemSpan, _ offset: usize) -> Cluster {
     if first.value < 0x80 && first.value != 0x0d && (end == len || text[end] < 0x80) {
         return Cluster { len: 1, width: scalar_width(first.value) }
     }
-    var properties = lookup(first.value)
-    var kind = grapheme_break(first.value, properties)
-    var width = properties & 3
-    var context = Context { pictographic: 0, regional: 0, conjunct: 0 }.after(kind, properties)
+    var cluster = Grapheme::new(first.value)
     while end < len {
         let scalar = decode(text, end)
-        let next = lookup(scalar.value)
-        let next_kind = grapheme_break(scalar.value, next)
-        if !context.joins(kind, next_kind, next) {
+        if !cluster.extend(scalar.value) {
             break
         }
-        if width == 0 {
-            width = next & 3
-        }
-        let emoji = (scalar.value == VS16 && properties & VARIATION_BASE != 0)
-            || (is_emoji_modifier(scalar.value) && context.pictographic == 1)
-            || (context.pictographic == 2 && next & PICTOGRAPHIC != 0)
-            || next_kind == GB_REGIONAL_INDICATOR
-        if emoji { width = 2 }
-        context = context.after(next_kind, next)
-        properties = next
-        kind = next_kind
         end += scalar.len
     }
-    Cluster { len: end - offset, width: width.downcast_truncate() }
+    Cluster { len: end - offset, width: cluster.width() }
+}
+
+/// A cluster read a scalar at a time, as a terminal reads it: whether the
+/// next scalar joins it, and its width so far.
+pub(ingot) struct Grapheme {
+    // The properties and grapheme break of its last scalar.
+    properties: u32,
+    kind: u32,
+    width: u32,
+    context: Context,
+}
+
+impl Copy for Grapheme {}
+
+impl Grapheme {
+    /// The cluster that starts with `value`.
+    pub(ingot) fn new(_ value: u32) -> Self {
+        let properties = lookup(value)
+        let kind = grapheme_break(value, properties)
+        Grapheme {
+            properties,
+            kind,
+            width: properties & 3,
+            context: Context { pictographic: 0, regional: 0, conjunct: 0 }.after(kind, properties),
+        }
+    }
+
+    /// Whether `value` continues the cluster; if it does, the cluster takes
+    /// it.
+    pub(ingot) fn extend(mut self, _ value: u32) -> bool {
+        let next = lookup(value)
+        let next_kind = grapheme_break(value, next)
+        if !self.context.joins(self.kind, next_kind, next) {
+            return false
+        }
+        if self.width == 0 {
+            self.width = next & 3
+        }
+        let emoji = (value == VS16 && self.properties & VARIATION_BASE != 0)
+            || (is_emoji_modifier(value) && self.context.pictographic == 1)
+            || (self.context.pictographic == 2 && next & PICTOGRAPHIC != 0)
+            || next_kind == GB_REGIONAL_INDICATOR
+        if emoji { self.width = 2 }
+        self.context = self.context.after(next_kind, next)
+        self.properties = next
+        self.kind = next_kind
+        true
+    }
+
+    /// The columns it takes: 0, 1 or 2.
+    pub(ingot) fn width(self) -> u8 {
+        self.width.downcast_truncate()
+    }
 }
 
 /// The columns `text` takes.
