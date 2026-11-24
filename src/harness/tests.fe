@@ -1,6 +1,6 @@
 use core::MemBuffer
 use ingot::app::{App, Flow, Options}
-use ingot::event::{Event, Key, KeyCode, Modifiers}
+use ingot::event::{Event, Key, KeyCode, Modifiers, MouseKind}
 use ingot::frame::{Frame, print}
 use ingot::geom::{Pos, Rect, Size}
 use ingot::style::Style
@@ -61,6 +61,19 @@ fn a_harness_draws_the_first_frame() {
     let harness = Harness::new(notes(), size(width: 12, height: 2))
     assert(harness.screen() == "\nnone")
     assert(!harness.quit_requested())
+}
+
+#[test]
+fn a_harness_sends_clicks_and_the_wheel() {
+    var log = Log { lines: MemBuffer::empty() }
+    var harness = Harness::new(notes(), size(width: 30, height: 2))
+    with (log) {
+        harness.click(Pos::new(x: 2, y: 1))
+        harness.mouse(MouseKind::ScrollDown, Pos::new(x: 0, y: 0))
+    }
+    assert(
+        log.lines == "Mouse(Down(Left) at 2,1);Mouse(Up(Left) at 2,1);Mouse(ScrollDown at 0,0);",
+    )
 }
 
 #[test]
