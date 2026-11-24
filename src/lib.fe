@@ -5,3 +5,4 @@ pub use geom
 pub use style
 pub use text
 pub use event
+pub use input
