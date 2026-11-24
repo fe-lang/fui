@@ -1,0 +1,1242 @@
+use core::{MemBuffer, MemSpan, MemVec}
+use std::io::Display
+use ingot::event::{
+    Event,
+    Key,
+    KeyCode,
+    KeyKind,
+    KeyboardFlags,
+    ModeSetting,
+    Modifiers,
+    Mouse,
+    MouseButton,
+    MouseKind,
+    Reply,
+}
+use ingot::geom::Pos
+use super::{
+    MAX_PASTE,
+    MAX_STRING,
+    MouseTracking,
+    Parser,
+    disable_bracketed_paste,
+    disable_focus_events,
+    disable_mouse,
+    enable_bracketed_paste,
+    enable_focus_events,
+    enable_mouse,
+    pop_keyboard_flags,
+    push_keyboard_flags,
+    request_colors,
+    request_device_attributes,
+    request_keyboard_flags,
+    request_mode,
+}
+
+// The bytes of `text`, with `^X` for the control byte `X ^ 0x40` for `X` in
+// `@` to `_` (`^[` is ESC) and `^?` for DEL.
+fn bytes<T: Display>(_ text: T) -> MemBuffer {
+    let source = format!(text)
+    var out = MemBuffer::empty()
+    var i: usize = 0
+    while i < source.len() {
+        let b = source[i]
+        if b == b'^' && i + 1 < source.len() {
+            let next = source[i + 1]
+            if next == b'?' {
+                out.push(0x7f)
+                i += 2
+                continue
+            }
+            if next >= b'@' && next <= b'_' {
+                out.push(next ^ 0x40)
+                i += 2
+                continue
+            }
+        }
+        out.push(b)
+        i += 1
+    }
+    out
+}
+
+// The events `input` makes fed in pieces of `size` bytes, then flushed.
+fn parse_in(_ input: MemSpan, size: usize) -> MemVec<Event> {
+    var parser = Parser::new()
+    var events: MemVec<Event> = MemVec::new()
+    var pos: usize = 0
+    while pos < input.len() {
+        let len = if input.len() - pos < size {
+            input.len() - pos
+        } else {
+            size
+        }
+        parser.feed(input.slice(offset: pos, len), mut events)
+        pos += len
+    }
+    parser.flush(mut events)
+    assert(!parser.is_pending())
+    events
+}
+
+fn same(_ a: MemVec<Event>, _ b: MemVec<Event>) -> bool {
+    a.as_slice() == b.as_slice()
+}
+
+// Whether `text` makes exactly `expected`, fed at once, a byte at a time
+// and three bytes at a time.
+fn parses<T: Display>(_ text: T, _ expected: MemVec<Event>) -> bool {
+    let input = bytes(text)
+    let whole = parse_in(input.span(), size: input.len() + 1)
+    same(whole, expected)
+        && same(parse_in(input.span(), size: 1), expected)
+        && same(parse_in(input.span(), size: 3), expected)
+}
+
+fn none() -> MemVec<Event> {
+    MemVec::new()
+}
+
+fn one(_ a: own Event) -> MemVec<Event> {
+    var v: MemVec<Event> = MemVec::new()
+    v.push(a)
+    v
+}
+
+fn two(_ a: own Event, _ b: own Event) -> MemVec<Event> {
+    var v = one(a)
+    v.push(b)
+    v
+}
+
+fn three(_ a: own Event, _ b: own Event, _ c: own Event) -> MemVec<Event> {
+    var v = two(a, b)
+    v.push(c)
+    v
+}
+
+fn key(_ code: KeyCode, _ mods: Modifiers) -> Event {
+    Event::Key(Key::new(code, mods))
+}
+
+fn key_of(_ code: KeyCode, _ mods: Modifiers, _ kind: KeyKind) -> Event {
+    Event::Key(Key::new(code, mods).with_kind(kind))
+}
+
+fn plain(_ code: KeyCode) -> Event {
+    key(code, Modifiers::NONE)
+}
+
+fn ch(_ c: u8) -> Event {
+    plain(KeyCode::Char(c))
+}
+
+fn ctrl(_ c: u8) -> Event {
+    key(KeyCode::Char(c), Modifiers::CTRL)
+}
+
+fn alt(_ c: u8) -> Event {
+    key(KeyCode::Char(c), Modifiers::ALT)
+}
+
+fn unicode(_ c: u32) -> Event {
+    plain(KeyCode::Unicode(c))
+}
+
+// Whether `text` is the one key `code` with `mods`.
+fn is_key<T: Display>(_ text: T, _ code: KeyCode, _ mods: Modifiers) -> bool {
+    parses(text, one(key(code, mods)))
+}
+
+fn mouse(_ kind: MouseKind, x: u16, y: u16, _ mods: Modifiers) -> Event {
+    Event::Mouse(Mouse::new(kind, Pos::new(x, y), mods))
+}
+
+fn reply(_ reply: Reply) -> Event {
+    Event::Reply(reply)
+}
+
+fn paste<T: Display>(_ text: T) -> Event {
+    Event::Paste(bytes(text))
+}
+
+const SHIFT: Modifiers = Modifiers::SHIFT
+const ALT: Modifiers = Modifiers::ALT
+const CTRL: Modifiers = Modifiers::CTRL
+const NONE: Modifiers = Modifiers::NONE
+
+#[test]
+fn text_is_keys() {
+    assert(parses("", none()))
+    assert(parses("ab", two(ch(b'a'), ch(b'b'))))
+    assert(parses("A ~", three(ch(b'A'), ch(b' '), ch(b'~'))))
+    assert(
+        parses(
+            "é€😀",
+            three(unicode(0xe9), unicode(0x20ac), unicode(0x1f600)),
+        ),
+    )
+    assert(parses("中", one(unicode(0x4e2d))))
+}
+
+#[test]
+fn invalid_utf8_is_replaced_and_reading_goes_on() {
+    let fffd = 0xfffd
+    var input = MemBuffer::empty()
+    input.push(0xff)
+    input.push(b'a')
+    assert(
+        same(
+            parse_in(input.span(), size: 1),
+            two(unicode(fffd), ch(b'a')),
+        ),
+    )
+    // A lead byte whose scalar ends early: the next byte is read afresh.
+    var early = MemBuffer::empty()
+    early.push(0xc3)
+    early.push(b'(')
+    assert(
+        same(
+            parse_in(early.span(), size: 1),
+            two(unicode(fffd), ch(b'(')),
+        ),
+    )
+    // An overlong form and a surrogate: one U+FFFD for each byte.
+    var overlong = MemBuffer::empty()
+    overlong.push(0xc0)
+    overlong.push(0xaf)
+    assert(
+        same(
+            parse_in(overlong.span(), size: 1),
+            two(unicode(fffd), unicode(fffd)),
+        ),
+    )
+    var surrogate = MemBuffer::empty()
+    surrogate.push(0xed)
+    surrogate.push(0xa0)
+    surrogate.push(0x80)
+    assert(
+        same(
+            parse_in(surrogate.span(), size: 2),
+            three(unicode(fffd), unicode(fffd), unicode(fffd)),
+        ),
+    )
+    // Above U+10FFFF.
+    var high = MemBuffer::empty()
+    high.push(0xf4)
+    high.push(0x90)
+    assert(
+        same(
+            parse_in(high.span(), size: 5),
+            two(unicode(fffd), unicode(fffd)),
+        ),
+    )
+    // An incomplete scalar at `flush`, then an ESC inside one.
+    var cut = MemBuffer::empty()
+    cut.push(0xe2)
+    cut.push(0x82)
+    assert(same(parse_in(cut.span(), size: 1), one(unicode(fffd))))
+    cut.push(0x1b)
+    cut.push(b'x')
+    assert(
+        same(
+            parse_in(cut.span(), size: 1),
+            two(unicode(fffd), alt(b'x')),
+        ),
+    )
+}
+
+#[test]
+fn utf8_split_across_feeds() {
+    let input = bytes("😀é")
+    var parser = Parser::new()
+    var events: MemVec<Event> = MemVec::new()
+    parser.feed(input.slice(offset: 0, len: 2), mut events)
+    assert(events.len() == 0 && parser.is_pending())
+    parser.feed(input.slice(offset: 2, len: 3), mut events)
+    assert(events.len() == 1 && parser.is_pending())
+    parser.feed(input.slice(offset: 5, len: 1), mut events)
+    assert(same(events, two(unicode(0x1f600), unicode(0xe9))))
+    assert(!parser.is_pending())
+}
+
+#[test]
+fn control_bytes_are_keys() {
+    assert(is_key("^A", KeyCode::Char(b'a'), CTRL))
+    assert(is_key("^C", KeyCode::Char(b'c'), CTRL))
+    assert(is_key("^Z", KeyCode::Char(b'z'), CTRL))
+    assert(is_key("^@", KeyCode::Char(b' '), CTRL))
+    assert(is_key("^I", KeyCode::Tab, NONE))
+    assert(is_key("^M", KeyCode::Enter, NONE))
+    assert(is_key("^J", KeyCode::Enter, NONE))
+    assert(is_key("^?", KeyCode::Backspace, NONE))
+    assert(is_key("^H", KeyCode::Backspace, NONE))
+    assert(is_key("^\\", KeyCode::Char(b'\\'), CTRL))
+    assert(is_key("^]", KeyCode::Char(b']'), CTRL))
+    assert(is_key("^^", KeyCode::Char(b'^'), CTRL))
+    assert(is_key("^_", KeyCode::Char(b'_'), CTRL))
+    assert(is_key("^K", KeyCode::Char(b'k'), CTRL))
+}
+
+#[test]
+fn escape_waits_for_flush() {
+    var parser = Parser::new()
+    var events: MemVec<Event> = MemVec::new()
+    assert(!parser.is_pending())
+    parser.feed(bytes("^[").span(), mut events)
+    assert(events.len() == 0 && parser.is_pending())
+    parser.flush(mut events)
+    assert(
+        same(events, one(plain(KeyCode::Esc))) && !parser.is_pending(),
+    )
+    // A key after the flush is no longer Alt.
+    parser.feed(bytes("x").span(), mut events)
+    assert(same(events, two(plain(KeyCode::Esc), ch(b'x'))))
+    // Before a flush, an `ESC` and the next feed's key are Alt and the key.
+    var later: MemVec<Event> = MemVec::new()
+    parser.feed(bytes("^[").span(), mut later)
+    parser.feed(bytes("x").span(), mut later)
+    assert(same(later, one(alt(b'x'))))
+    // A flush with nothing pending does nothing.
+    parser.flush(mut later)
+    assert(later.len() == 1)
+}
+
+#[test]
+fn escape_prefixes_alt() {
+    assert(is_key("^[x", KeyCode::Char(b'x'), ALT))
+    assert(is_key("^[X", KeyCode::Char(b'X'), ALT))
+    assert(is_key("^[^A", KeyCode::Char(b'a'), CTRL | ALT))
+    assert(is_key("^[^?", KeyCode::Backspace, ALT))
+    assert(is_key("^[^M", KeyCode::Enter, ALT))
+    assert(is_key("^[^I", KeyCode::Tab, ALT))
+    assert(is_key("^[ ", KeyCode::Char(b' '), ALT))
+    assert(is_key("^[é", KeyCode::Unicode(0xe9), ALT))
+    assert(is_key("^[😀", KeyCode::Unicode(0x1f600), ALT))
+    assert(is_key("^[^[", KeyCode::Esc, ALT))
+    // Alt with a key sequence, as tmux and macOS terminals send it.
+    assert(is_key("^[^[[A", KeyCode::Up, ALT))
+    assert(is_key("^[^[OB", KeyCode::Down, ALT))
+    assert(is_key("^[^[[1;5C", KeyCode::Right, CTRL | ALT))
+    assert(is_key("^[^[[3~", KeyCode::Delete, ALT))
+    // Introducers with nothing after them, at `flush`.
+    assert(is_key("^[[", KeyCode::Char(b'['), ALT))
+    assert(is_key("^[O", KeyCode::Char(b'O'), ALT))
+    assert(is_key("^[]", KeyCode::Char(b']'), ALT))
+    assert(is_key("^[P", KeyCode::Char(b'P'), ALT))
+    assert(is_key("^[_", KeyCode::Char(b'_'), ALT))
+    assert(is_key("^[^[[", KeyCode::Char(b'['), ALT))
+    assert(
+        parses(
+            "^[^[^[",
+            two(key(KeyCode::Esc, ALT), plain(KeyCode::Esc)),
+        ),
+    )
+    assert(parses("^[]^[", two(alt(b']'), plain(KeyCode::Esc))))
+    assert(
+        parses("^[]^[]^[x", three(alt(b']'), alt(b']'), alt(b'x'))),
+    )
+    assert(parses("^[P^[_", two(alt(b'P'), alt(b'_'))))
+    assert(parses("^[xy", two(alt(b'x'), ch(b'y'))))
+}
+
+#[test]
+fn cursor_and_editing_keys() {
+    assert(is_key("^[[A", KeyCode::Up, NONE))
+    assert(is_key("^[[B", KeyCode::Down, NONE))
+    assert(is_key("^[[C", KeyCode::Right, NONE))
+    assert(is_key("^[[D", KeyCode::Left, NONE))
+    assert(is_key("^[OA", KeyCode::Up, NONE))
+    assert(is_key("^[OD", KeyCode::Left, NONE))
+    assert(is_key("^[[H", KeyCode::Home, NONE))
+    assert(is_key("^[[F", KeyCode::End, NONE))
+    assert(is_key("^[OH", KeyCode::Home, NONE))
+    assert(is_key("^[OF", KeyCode::End, NONE))
+    assert(is_key("^[[1~", KeyCode::Home, NONE))
+    assert(is_key("^[[4~", KeyCode::End, NONE))
+    assert(is_key("^[[7~", KeyCode::Home, NONE))
+    assert(is_key("^[[8~", KeyCode::End, NONE))
+    assert(is_key("^[[2~", KeyCode::Insert, NONE))
+    assert(is_key("^[[3~", KeyCode::Delete, NONE))
+    assert(is_key("^[[5~", KeyCode::PageUp, NONE))
+    assert(is_key("^[[6~", KeyCode::PageDown, NONE))
+    assert(is_key("^[[E", KeyCode::KeypadBegin, NONE))
+    assert(is_key("^[[Z", KeyCode::BackTab, NONE))
+    assert(is_key("^[[1;6Z", KeyCode::BackTab, CTRL))
+}
+
+#[test]
+fn modifier_parameters() {
+    assert(is_key("^[[1;2A", KeyCode::Up, SHIFT))
+    assert(is_key("^[[1;3D", KeyCode::Left, ALT))
+    assert(is_key("^[[1;5A", KeyCode::Up, CTRL))
+    assert(is_key("^[[1;6C", KeyCode::Right, CTRL | SHIFT))
+    assert(is_key("^[[1;8B", KeyCode::Down, CTRL | ALT | SHIFT))
+    assert(is_key("^[[1;9A", KeyCode::Up, Modifiers::SUPER))
+    assert(is_key("^[[1;5H", KeyCode::Home, CTRL))
+    assert(is_key("^[[3;5~", KeyCode::Delete, CTRL))
+    assert(is_key("^[[5;3~", KeyCode::PageUp, ALT))
+    assert(is_key("^[[1;1A", KeyCode::Up, NONE))
+    // Lock bits (64 Caps Lock, 128 Num Lock) are dropped.
+    assert(is_key("^[[1;69A", KeyCode::Up, CTRL))
+}
+
+#[test]
+fn function_keys() {
+    assert(is_key("^[OP", KeyCode::F(1), NONE))
+    assert(is_key("^[OQ", KeyCode::F(2), NONE))
+    assert(is_key("^[OR", KeyCode::F(3), NONE))
+    assert(is_key("^[OS", KeyCode::F(4), NONE))
+    assert(is_key("^[[11~", KeyCode::F(1), NONE))
+    assert(is_key("^[[12~", KeyCode::F(2), NONE))
+    assert(is_key("^[[13~", KeyCode::F(3), NONE))
+    assert(is_key("^[[14~", KeyCode::F(4), NONE))
+    assert(is_key("^[[15~", KeyCode::F(5), NONE))
+    assert(is_key("^[[17~", KeyCode::F(6), NONE))
+    assert(is_key("^[[18~", KeyCode::F(7), NONE))
+    assert(is_key("^[[19~", KeyCode::F(8), NONE))
+    assert(is_key("^[[20~", KeyCode::F(9), NONE))
+    assert(is_key("^[[21~", KeyCode::F(10), NONE))
+    assert(is_key("^[[23~", KeyCode::F(11), NONE))
+    assert(is_key("^[[24~", KeyCode::F(12), NONE))
+    assert(is_key("^[[25~", KeyCode::F(13), NONE))
+    assert(is_key("^[[34~", KeyCode::F(20), NONE))
+    assert(is_key("^[[29~", KeyCode::Menu, NONE))
+    assert(is_key("^[[1;2P", KeyCode::F(1), SHIFT))
+    assert(is_key("^[[1;5Q", KeyCode::F(2), CTRL))
+    assert(is_key("^[[1;2S", KeyCode::F(4), SHIFT))
+    assert(is_key("^[[15;2~", KeyCode::F(5), SHIFT))
+    assert(is_key("^[[24;5~", KeyCode::F(12), CTRL))
+    // Shift+F3 from xterm, VTE, Alacritty, WezTerm.
+    assert(is_key("^[[1;2R", KeyCode::F(3), SHIFT))
+    // Modifiers in SS3, from older terminals.
+    assert(is_key("^[O5P", KeyCode::F(1), CTRL))
+    assert(is_key("^[O1;2Q", KeyCode::F(2), SHIFT))
+    // The Linux console's F1 to F5.
+    assert(is_key("^[[[A", KeyCode::F(1), NONE))
+    assert(is_key("^[[[E", KeyCode::F(5), NONE))
+    assert(parses("^[[[x", one(ch(b'x'))))
+}
+
+#[test]
+fn keypad_in_application_mode() {
+    assert(is_key("^[OM", KeyCode::Enter, NONE))
+    assert(is_key("^[Op", KeyCode::Char(b'0'), NONE))
+    assert(is_key("^[Oy", KeyCode::Char(b'9'), NONE))
+    assert(is_key("^[Ok", KeyCode::Char(b'+'), NONE))
+    assert(is_key("^[Oj", KeyCode::Char(b'*'), NONE))
+    assert(is_key("^[Oo", KeyCode::Char(b'/'), NONE))
+    assert(is_key("^[OX", KeyCode::Char(b'='), NONE))
+    assert(is_key("^[OE", KeyCode::KeypadBegin, NONE))
+}
+
+#[test]
+fn sgr_mouse() {
+    let left = MouseButton::Left
+    assert(
+        parses(
+            "^[[<0;10;5M",
+            one(mouse(MouseKind::Down(left), x: 9, y: 4, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<0;10;5m",
+            one(mouse(MouseKind::Up(left), x: 9, y: 4, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<1;1;1M",
+            one(
+                mouse(MouseKind::Down(MouseButton::Middle), x: 0, y: 0, NONE),
+            ),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<2;3;4M",
+            one(
+                mouse(MouseKind::Down(MouseButton::Right), x: 2, y: 3, NONE),
+            ),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<2;3;4m",
+            one(
+                mouse(MouseKind::Up(MouseButton::Right), x: 2, y: 3, NONE),
+            ),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<32;3;4M",
+            one(mouse(MouseKind::Drag(left), x: 2, y: 3, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<34;3;4M",
+            one(
+                mouse(MouseKind::Drag(MouseButton::Right), x: 2, y: 3, NONE),
+            ),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<35;3;4M",
+            one(mouse(MouseKind::Moved, x: 2, y: 3, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<64;5;6M",
+            one(mouse(MouseKind::ScrollUp, x: 4, y: 5, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<65;5;6M",
+            one(mouse(MouseKind::ScrollDown, x: 4, y: 5, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<66;5;6M",
+            one(mouse(MouseKind::ScrollLeft, x: 4, y: 5, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<67;5;6M",
+            one(mouse(MouseKind::ScrollRight, x: 4, y: 5, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<128;1;1M",
+            one(
+                mouse(MouseKind::Down(MouseButton::Back), x: 0, y: 0, NONE),
+            ),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<129;1;1m",
+            one(
+                mouse(MouseKind::Up(MouseButton::Forward), x: 0, y: 0, NONE),
+            ),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<4;1;1M",
+            one(mouse(MouseKind::Down(left), x: 0, y: 0, SHIFT)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<8;1;1M",
+            one(mouse(MouseKind::Down(left), x: 0, y: 0, ALT)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<16;1;1M",
+            one(mouse(MouseKind::Down(left), x: 0, y: 0, CTRL)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<80;1;1M",
+            one(mouse(MouseKind::ScrollUp, x: 0, y: 0, CTRL)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<60;1;1M",
+            one(
+                mouse(MouseKind::Drag(left), x: 0, y: 0, SHIFT | ALT | CTRL),
+            ),
+        ),
+    )
+    // Coordinates past 223, at zero, and past the `u16` range.
+    assert(
+        parses(
+            "^[[<0;300;1000M",
+            one(mouse(MouseKind::Down(left), x: 299, y: 999, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<0;0;0M",
+            one(mouse(MouseKind::Down(left), x: 0, y: 0, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[<0;99999999;1M",
+            one(mouse(MouseKind::Down(left), x: 65535, y: 0, NONE)),
+        ),
+    )
+    // Malformed reports are dropped.
+    assert(parses("^[[<0;1M", none()))
+    assert(parses("^[[<0;1;1;1M", none()))
+    assert(parses("^[[<3;1;1M", none()))
+    assert(parses("^[[<64;1;1m", none()))
+    assert(parses("^[[<0;1;1Xa", one(ch(b'a'))))
+}
+
+#[test]
+fn legacy_mouse() {
+    let left = MouseButton::Left
+    // X10: `CSI M` and three bytes, each 32 more than its value.
+    assert(
+        parses(
+            "^[[M *%",
+            one(mouse(MouseKind::Down(left), x: 9, y: 4, NONE)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[M\"*%^[[M#*%",
+            two(
+                mouse(MouseKind::Down(MouseButton::Right), x: 9, y: 4, NONE),
+                mouse(MouseKind::Up(MouseButton::Right), x: 9, y: 4, NONE),
+            ),
+        ),
+    )
+    assert(
+        parses(
+            "^[[M`!!",
+            one(mouse(MouseKind::ScrollUp, x: 0, y: 0, NONE)),
+        ),
+    )
+    assert(
+        parses("^[[MC!!", one(mouse(MouseKind::Moved, x: 0, y: 0, NONE))),
+    )
+    var high = bytes("^[[M ")
+    high.push(0xff)
+    high.push(0x21)
+    assert(
+        same(
+            parse_in(high.span(), size: 1),
+            one(mouse(MouseKind::Down(left), x: 222, y: 0, NONE)),
+        ),
+    )
+    // urxvt's decimal form.
+    assert(
+        parses(
+            "^[[32;10;5M",
+            one(mouse(MouseKind::Down(left), x: 9, y: 4, NONE)),
+        ),
+    )
+    // An X10 report cut short by a control byte: the byte is read afresh.
+    assert(parses("^[[M ^M", one(plain(KeyCode::Enter))))
+}
+
+#[test]
+fn bracketed_paste() {
+    assert(parses("^[[200~hello^[[201~", one(paste("hello"))))
+    assert(parses("^[[200~^[[201~", one(paste(""))))
+    // No key interpretation inside.
+    assert(
+        parses(
+            "^[[200~^[[A^C^M\r\nx^[[201~y",
+            two(paste("^[[A^C^M\r\nx"), ch(b'y')),
+        ),
+    )
+    // A partial end marker stays in the content.
+    assert(
+        parses(
+            "^[[200~a^[[201x^[[20^[[201~",
+            one(paste("a^[[201x^[[20")),
+        ),
+    )
+    assert(parses("^[[200~a^[^[[201~", one(paste("a^["))))
+    assert(parses("^[[200~é😀^[[201~", one(paste("é😀"))))
+    assert(parses("^[[201~a", one(ch(b'a'))))
+    assert(parses("^[^[[200~a^[[201~b", two(paste("a"), ch(b'b'))))
+}
+
+#[test]
+fn paste_waits_for_its_end_across_flushes() {
+    var parser = Parser::new()
+    var events: MemVec<Event> = MemVec::new()
+    parser.feed(bytes("^[[200~ab^[[2").span(), mut events)
+    assert(events.len() == 0 && !parser.is_pending())
+    parser.flush(mut events)
+    assert(events.len() == 0)
+    parser.feed(bytes("0").span(), mut events)
+    parser.feed(bytes("1~c").span(), mut events)
+    assert(same(events, two(paste("ab"), ch(b'c'))))
+}
+
+#[test]
+fn long_pastes_arrive_in_pieces() {
+    var input = bytes("^[[200~")
+    var i: usize = 0
+    while i < MAX_PASTE - 1 {
+        input.push(b'a')
+        i += 1
+    }
+    // A scalar across the limit goes to the next piece whole.
+    input.extend_from(bytes("éb^[[201~").span())
+    var parser = Parser::new()
+    var events: MemVec<Event> = MemVec::new()
+    parser.feed(input.span(), mut events)
+    assert(events.len() == 2)
+    match events[0] {
+        Event::Paste(ref text) => assert(text.len() == MAX_PASTE - 1 && text[0] == b'a'),
+        _ => assert(false),
+    }
+    assert(events[1] == paste("éb"))
+    // An end marker begun across the limit, which turns out to be content.
+    var marker = bytes("^[[200~")
+    i = 0
+    while i < MAX_PASTE - 2 {
+        marker.push(b'a')
+        i += 1
+    }
+    marker.extend_from(bytes("^[[2x^[[201~").span())
+    var pieces: MemVec<Event> = MemVec::new()
+    parser.feed(marker.span(), mut pieces)
+    assert(pieces.len() == 2)
+    match pieces[0] {
+        Event::Paste(ref text) => assert(
+            text.len() == MAX_PASTE && text[MAX_PASTE - 2] == 0x1b && text[MAX_PASTE - 1] == b'[',
+        ),
+        _ => assert(false),
+    }
+    assert(pieces[1] == paste("2x"))
+}
+
+#[test]
+fn focus_reports() {
+    assert(parses("^[[I", one(Event::FocusGained)))
+    assert(parses("^[[O", one(Event::FocusLost)))
+    assert(
+        parses(
+            "^[[Ia^[[O",
+            three(Event::FocusGained, ch(b'a'), Event::FocusLost),
+        ),
+    )
+}
+
+#[test]
+fn kitty_keys() {
+    assert(is_key("^[[97u", KeyCode::Char(b'a'), NONE))
+    assert(is_key("^[[97;5u", KeyCode::Char(b'a'), CTRL))
+    assert(is_key("^[[99;6u", KeyCode::Char(b'c'), CTRL | SHIFT))
+    assert(is_key("^[[97;3u", KeyCode::Char(b'a'), ALT))
+    assert(is_key("^[[27u", KeyCode::Esc, NONE))
+    assert(is_key("^[[13u", KeyCode::Enter, NONE))
+    assert(is_key("^[[13;2u", KeyCode::Enter, SHIFT))
+    assert(is_key("^[[9u", KeyCode::Tab, NONE))
+    assert(is_key("^[[9;2u", KeyCode::BackTab, NONE))
+    assert(is_key("^[[9;6u", KeyCode::BackTab, CTRL))
+    assert(is_key("^[[127;5u", KeyCode::Backspace, CTRL))
+    assert(is_key("^[[32;5u", KeyCode::Char(b' '), CTRL))
+    assert(is_key("^[[233u", KeyCode::Unicode(0xe9), NONE))
+    assert(is_key("^[[97;9u", KeyCode::Char(b'a'), Modifiers::SUPER))
+    assert(is_key("^[[97;17u", KeyCode::Char(b'a'), Modifiers::HYPER))
+    assert(is_key("^[[97;33u", KeyCode::Char(b'a'), Modifiers::META))
+    // Caps Lock and Num Lock are dropped.
+    assert(is_key("^[[97;65u", KeyCode::Char(b'a'), NONE))
+    assert(is_key("^[[97;133u", KeyCode::Char(b'a'), CTRL))
+    // Alternate keys and text are ignored.
+    assert(is_key("^[[97:65;2u", KeyCode::Char(b'a'), SHIFT))
+    assert(is_key("^[[97:65:97;2;65u", KeyCode::Char(b'a'), SHIFT))
+    assert(is_key("^[[97::113;5u", KeyCode::Char(b'a'), CTRL))
+    assert(is_key("^[[97;;97u", KeyCode::Char(b'a'), NONE))
+    // Functional keys.
+    assert(is_key("^[[57358u", KeyCode::CapsLock, NONE))
+    assert(is_key("^[[57359u", KeyCode::ScrollLock, NONE))
+    assert(is_key("^[[57360u", KeyCode::NumLock, NONE))
+    assert(is_key("^[[57361u", KeyCode::PrintScreen, NONE))
+    assert(is_key("^[[57362u", KeyCode::Pause, NONE))
+    assert(is_key("^[[57363u", KeyCode::Menu, NONE))
+    assert(is_key("^[[57376u", KeyCode::F(13), NONE))
+    assert(is_key("^[[57398;2u", KeyCode::F(35), SHIFT))
+    assert(is_key("^[[57399u", KeyCode::Char(b'0'), NONE))
+    assert(is_key("^[[57408u", KeyCode::Char(b'9'), NONE))
+    assert(is_key("^[[57409u", KeyCode::Char(b'.'), NONE))
+    assert(is_key("^[[57413u", KeyCode::Char(b'+'), NONE))
+    assert(is_key("^[[57414u", KeyCode::Enter, NONE))
+    assert(is_key("^[[57417u", KeyCode::Left, NONE))
+    assert(is_key("^[[57426u", KeyCode::Delete, NONE))
+    assert(is_key("^[[57427u", KeyCode::KeypadBegin, NONE))
+    assert(is_key("^[[57427~", KeyCode::KeypadBegin, NONE))
+    assert(is_key("^[[57441;2u", KeyCode::Modifier(SHIFT), SHIFT))
+    assert(is_key("^[[57448;5u", KeyCode::Modifier(CTRL), CTRL))
+    assert(
+        is_key("^[[57452u", KeyCode::Modifier(Modifiers::META), NONE),
+    )
+    // Media keys, the ISO level shifts, unassigned codes and code 0 are
+    // dropped.
+    assert(
+        parses("^[[57428u^[[57453u^[[57370u^[[0u^[[u^[[55296u", none()),
+    )
+    assert(parses("^[[1114112u^[[5u", none()))
+}
+
+#[test]
+fn kitty_event_types() {
+    let release = KeyKind::Release
+    assert(
+        parses(
+            "^[[97;1:3u",
+            one(key_of(KeyCode::Char(b'a'), NONE, release)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[97;5:2u",
+            one(key_of(KeyCode::Char(b'a'), CTRL, KeyKind::Repeat)),
+        ),
+    )
+    assert(parses("^[[97;1:1u", one(ch(b'a'))))
+    assert(
+        parses("^[[1;5:3A", one(key_of(KeyCode::Up, CTRL, release))),
+    )
+    assert(
+        parses(
+            "^[[1;1:2B",
+            one(key_of(KeyCode::Down, NONE, KeyKind::Repeat)),
+        ),
+    )
+    assert(
+        parses("^[[3;1:3~", one(key_of(KeyCode::Delete, NONE, release))),
+    )
+    assert(parses("^[[13~", one(plain(KeyCode::F(3)))))
+    assert(
+        parses("^[[1;2:3P", one(key_of(KeyCode::F(1), SHIFT, release))),
+    )
+    assert(
+        parses(
+            "^[[57442;5:3u",
+            one(key_of(KeyCode::Modifier(CTRL), CTRL, release)),
+        ),
+    )
+}
+
+#[test]
+fn xterm_modify_other_keys() {
+    assert(is_key("^[[27;5;9~", KeyCode::Tab, CTRL))
+    assert(is_key("^[[27;2;13~", KeyCode::Enter, SHIFT))
+    assert(is_key("^[[27;6;9~", KeyCode::BackTab, CTRL))
+    assert(is_key("^[[27;5;105~", KeyCode::Char(b'i'), CTRL))
+}
+
+#[test]
+fn replies() {
+    assert(
+        parses(
+            "^[[?1u",
+            one(reply(Reply::KeyboardFlags(KeyboardFlags::DISAMBIGUATE))),
+        ),
+    )
+    assert(
+        parses(
+            "^[[?0u",
+            one(reply(Reply::KeyboardFlags(KeyboardFlags::NONE))),
+        ),
+    )
+    assert(
+        parses("^[[?62;22;52c", one(reply(Reply::DeviceAttributes))),
+    )
+    assert(
+        parses(
+            "^[[?64;1;2;6;9;15;16;17;18;21;22;28c",
+            one(reply(Reply::DeviceAttributes)),
+        ),
+    )
+    assert(
+        parses(
+            "^[[?2026;2$y",
+            one(reply(Reply::Mode(2026, ModeSetting::Reset))),
+        ),
+    )
+    assert(
+        parses(
+            "^[[?2004;1$y",
+            one(reply(Reply::Mode(2004, ModeSetting::Set))),
+        ),
+    )
+    assert(
+        parses(
+            "^[[?9999;0$y",
+            one(reply(Reply::Mode(9999, ModeSetting::NotRecognized))),
+        ),
+    )
+    assert(
+        parses(
+            "^[[12;40R",
+            one(reply(Reply::CursorPosition(Pos::new(x: 39, y: 11)))),
+        ),
+    )
+    assert(
+        parses(
+            "^[[1;1R",
+            one(reply(Reply::CursorPosition(Pos::new(x: 0, y: 0)))),
+        ),
+    )
+    assert(
+        parses(
+            "^[[?12;40R",
+            one(reply(Reply::CursorPosition(Pos::new(x: 39, y: 11)))),
+        ),
+    )
+    assert(
+        parses(
+            "^[[?1;5;1R",
+            one(reply(Reply::CursorPosition(Pos::new(x: 4, y: 0)))),
+        ),
+    )
+    // OSC 10 and 11, ended by BEL or ST, with 1 to 4 hex digits a component.
+    assert(
+        parses(
+            "^[]11;rgb:1e1e/2020/3030^G",
+            one(reply(Reply::Background(30, 32, 48))),
+        ),
+    )
+    assert(
+        parses(
+            "^[]10;rgb:ff/80/00^[\\",
+            one(reply(Reply::Foreground(255, 128, 0))),
+        ),
+    )
+    assert(
+        parses(
+            "^[]10;rgb:f/0/8^G",
+            one(reply(Reply::Foreground(255, 0, 136))),
+        ),
+    )
+    assert(
+        parses(
+            "^[]11;rgb:FFFF/8000/0000^G",
+            one(reply(Reply::Background(255, 128, 0))),
+        ),
+    )
+}
+
+#[test]
+fn replies_that_are_not_read_are_dropped() {
+    // Secondary device attributes, XTVERSION, a window report, an ANSI
+    // DECRPM, OSC 52, a kitty graphics reply, a malformed color.
+    assert(
+        parses(
+            "^[[>1;4000;29c^[P>|kitty(0.30)^[\\^[[8;24;80t^[[4;2$ya",
+            one(ch(b'a')),
+        ),
+    )
+    assert(parses("^[]52;c;aGVsbG8=^G^[_Gi=1;OK^[\\b", one(ch(b'b'))))
+    assert(
+        parses(
+            "^[]11;rgb:zz/00/00^G^[]11;rgb:00000/0/0^G^[]11;rgb:0/0^G",
+            none(),
+        ),
+    )
+    assert(
+        parses(
+            "^[]11;rgb:0/0/0/0^G^[]12;rgb:0/0/0^G^[]4;1;rgb:0/0/0^G",
+            none(),
+        ),
+    )
+    assert(
+        parses(
+            "^[[?2026$y^[[?u^[[?5n",
+            one(reply(Reply::KeyboardFlags(KeyboardFlags::NONE))),
+        ),
+    )
+    // CAN cancels a string; an ESC other than ST ends it and begins a key.
+    assert(parses("^[]11;rgb:0/0/0^Xa", one(ch(b'a'))))
+    assert(parses("^[]11;rgb:0/0/0^[[A", one(plain(KeyCode::Up))))
+}
+
+#[test]
+fn long_strings_keep_a_bounded_start() {
+    var input = bytes("^[]52;c;")
+    var i: usize = 0
+    while i < 100000 {
+        input.push(b'A')
+        i += 1
+    }
+    input.extend_from(bytes("^Gq").span())
+    var parser = Parser::new()
+    var events: MemVec<Event> = MemVec::new()
+    parser.feed(input.slice(offset: 0, len: 5000), mut events)
+    assert(parser.text.len() == MAX_STRING)
+    parser.feed(
+            input.slice(offset: 5000, len: input.len() - 5000),
+            mut events,
+        )
+    assert(same(events, one(ch(b'q'))))
+}
+
+#[test]
+fn cursor_position_requests_resolve_f3() {
+    // Without a request, `CSI 1 ; 5 R` is Ctrl+F3; with one, a report.
+    assert(is_key("^[[1;5R", KeyCode::F(3), CTRL))
+    var parser = Parser::new()
+    var out = MemBuffer::empty()
+    parser.request_cursor_position(mut out)
+    assert(out == bytes("^[[6n"))
+    var events: MemVec<Event> = MemVec::new()
+    parser.feed(bytes("^[[1;5R^[[1;5R").span(), mut events)
+    assert(
+        same(
+            events,
+            two(
+                reply(Reply::CursorPosition(Pos::new(x: 4, y: 0))),
+                key(KeyCode::F(3), CTRL),
+            ),
+        ),
+    )
+}
+
+#[test]
+fn unknown_and_broken_sequences_resynchronize() {
+    // Unknown finals, markers and intermediates are dropped whole.
+    assert(parses("^[[1;5Xa", one(ch(b'a'))))
+    assert(parses("^[[>1ub", one(ch(b'b'))))
+    assert(parses("^[[=5uc", one(ch(b'c'))))
+    assert(parses("^[[1 qd", one(ch(b'd'))))
+    assert(parses("^[[1$Ae", one(ch(b'e'))))
+    assert(parses("^[[1?Af", one(ch(b'f'))))
+    assert(parses("^[[99~^[[0~^[[16~g", one(ch(b'g'))))
+    assert(parses("^[Oz^[O~h", one(ch(b'h'))))
+    // A control or non-ASCII byte inside a sequence is read afresh.
+    assert(parses("^[[1;^C", one(ctrl(b'c'))))
+    assert(parses("^[[1;é", one(unicode(0xe9))))
+    assert(parses("^[[1;^[[B", one(plain(KeyCode::Down))))
+    assert(parses("^[O^M", one(plain(KeyCode::Enter))))
+    assert(parses("^[O1^[OA", one(plain(KeyCode::Up))))
+    // An incomplete sequence is dropped at `flush`.
+    assert(parses("^[[1;5", none()))
+    assert(parses("^[[<0;1", none()))
+    assert(parses("^[[M ", none()))
+    assert(parses("^[[[", none()))
+    assert(parses("^[]11;rgb:", none()))
+    // Huge and many parameters.
+    var digits = bytes("^[[")
+    var i: usize = 0
+    while i < 10000 {
+        digits.push(b'9')
+        digits.push(
+                if i % 3 == 0 {
+                    b';'
+                } else if i % 3 == 1 { b':' } else { b'1' },
+            )
+        i += 1
+    }
+    digits.extend_from(bytes("Xz").span())
+    assert(same(parse_in(digits.span(), size: 7), one(ch(b'z'))))
+}
+
+#[test]
+fn mode_sequences() {
+    var out = MemBuffer::empty()
+    enable_mouse(mut out, MouseTracking::Clicks)
+    assert(out == bytes("^[[?1000h^[[?1006h"))
+    out.clear()
+    enable_mouse(mut out, MouseTracking::Drags)
+    assert(out == bytes("^[[?1002h^[[?1006h"))
+    out.clear()
+    enable_mouse(mut out, MouseTracking::Motion)
+    assert(out == bytes("^[[?1003h^[[?1006h"))
+    out.clear()
+    disable_mouse(mut out)
+    assert(out == bytes("^[[?1006l^[[?1003l^[[?1002l^[[?1000l"))
+    out.clear()
+    enable_bracketed_paste(mut out)
+    disable_bracketed_paste(mut out)
+    enable_focus_events(mut out)
+    disable_focus_events(mut out)
+    assert(out == bytes("^[[?2004h^[[?2004l^[[?1004h^[[?1004l"))
+    out.clear()
+    push_keyboard_flags(
+        mut out,
+        KeyboardFlags::DISAMBIGUATE | KeyboardFlags::REPORT_EVENT_TYPES,
+    )
+    pop_keyboard_flags(mut out)
+    assert(out == bytes("^[[>3u^[[<u"))
+    out.clear()
+    request_keyboard_flags(mut out)
+    request_device_attributes(mut out)
+    request_mode(mut out, 2026)
+    assert(out == bytes("^[[?u^[[c^[[?2026$p"))
+    out.clear()
+    request_colors(mut out)
+    assert(out == bytes("^[]10;?^[\\^[]11;?^[\\"))
+}
+
+// A deterministic generator of pseudo-random numbers (xorshift64).
+struct Random { state: u64 }
+
+impl Random {
+    fn new(_ seed: u64) -> Self {
+        Random { state: seed }
+    }
+
+    fn next(mut self) -> u64 {
+        var x = self.state
+        x = x ^ (x << 13)
+        x = x ^ (x >> 7)
+        x = x ^ (x << 17)
+        self.state = x
+        x
+    }
+
+    // A number below `n`, which is not zero.
+    fn below(mut self, _ n: usize) -> usize {
+        let n: u64 = n.downcast_truncate()
+        (self.next() % n).downcast_truncate()
+    }
+
+    // A byte, mostly one that matters to the parser.
+    fn byte(mut self) -> u8 {
+        let roll = self.below(16)
+        if roll < 4 {
+            0x1b
+        } else if roll < 7 {
+            let special = bytes("[;:0123456789<?$~uMmRO]P_\\")
+            special[self.below(special.len())]
+        } else if roll < 8 {
+            0x07
+        } else {
+            self.next().downcast_truncate()
+        }
+    }
+}
+
+// Feeds `input` whole and in random pieces and checks both make the same
+// events, the parser's memory stays bounded, and it reads keys correctly
+// afterwards.
+fn check_robust(_ input: MemSpan, _ random: mut Random) -> bool {
+    let whole = parse_in(input, size: input.len() + 1)
+    var parser = Parser::new()
+    var events: MemVec<Event> = MemVec::new()
+    var pos: usize = 0
+    while pos < input.len() {
+        let rest = input.len() - pos
+        let len = random.below(if rest < 9 { rest } else { 9 }) + 1
+        parser.feed(input.slice(offset: pos, len), mut events)
+        if parser.text.len() > MAX_STRING || parser.paste.len() > MAX_PASTE + 6 {
+            return false
+        }
+        pos += len
+    }
+    parser.flush(mut events)
+    if !same(whole, events) {
+        return false
+    }
+    // End any paste the input began, then read keys.
+    var after: MemVec<Event> = MemVec::new()
+    parser.feed(bytes("^[[201~").span(), mut after)
+    parser.flush(mut after)
+    var keys: MemVec<Event> = MemVec::new()
+    parser.feed(bytes("q^[[1;5A").span(), mut keys)
+    same(keys, two(ch(b'q'), key(KeyCode::Up, CTRL)))
+}
+
+#[test]
+fn fuzz_random_bytes() {
+    var random = Random::new(0x9e3779b97f4a7c15)
+    var round: usize = 0
+    while round < 20000 {
+        var input = MemBuffer::empty()
+        let len = random.below(48)
+        var i: usize = 0
+        while i < len {
+            input.push(random.byte())
+            i += 1
+        }
+        assert(check_robust(input.span(), mut random))
+        round += 1
+    }
+}
+
+// Valid sequences of every kind, for mutation.
+fn corpus() -> MemVec<MemBuffer> {
+    var v: MemVec<MemBuffer> = MemVec::new()
+    v.push(bytes("^[[1;5A"))
+    v.push(bytes("^[OP"))
+    v.push(bytes("^[[15;2~"))
+    v.push(bytes("^[[<35;120;40M"))
+    v.push(bytes("^[[<0;1;1m"))
+    v.push(bytes("^[[M *%"))
+    v.push(bytes("^[[200~pasted ^[[A text^[[201~"))
+    v.push(bytes("^[[97:65;6:3;65u"))
+    v.push(bytes("^[[57441;2:1u"))
+    v.push(bytes("^[[27;5;9~"))
+    v.push(bytes("^[[?2026;2$y"))
+    v.push(bytes("^[[?62;22c"))
+    v.push(bytes("^[]11;rgb:1e1e/2020/3030^[\\"))
+    v.push(bytes("^[P>|xterm(390)^[\\"))
+    v.push(bytes("^[^[[B"))
+    v.push(bytes("é€😀a^C^?"))
+    v.push(bytes("^[[I^[[O"))
+    v.push(bytes("^[[[A"))
+    v
+}
+
+#[test]
+fn fuzz_mutated_sequences() {
+    let corpus = corpus()
+    var random = Random::new(0x2545f4914f6cdd1d)
+    var round: usize = 0
+    while round < 20000 {
+        var input = MemBuffer::empty()
+        let parts = random.below(4) + 1
+        var part: usize = 0
+        while part < parts {
+            input.extend_from(corpus[random.below(corpus.len())].span())
+            part += 1
+        }
+        // Replace, insert or delete bytes, or cut the input short.
+        let mutations = random.below(4)
+        var m: usize = 0
+        while m < mutations && input.len() > 0 {
+            let at = random.below(input.len())
+            let what = random.below(4)
+            if what == 0 {
+                input[at] = random.byte()
+            } else if what == 1 {
+                let tail = MemBuffer::from_span(input.slice(offset: at, len: input.len() - at))
+                input.truncate(at)
+                input.push(random.byte())
+                input.extend_from(tail.span())
+            } else if what == 2 {
+                let tail = MemBuffer::from_span(
+                    input.slice(offset: at + 1, len: input.len() - at - 1),
+                )
+                input.truncate(at)
+                input.extend_from(tail.span())
+            } else {
+                input.truncate(at)
+            }
+            m += 1
+        }
+        assert(check_robust(input.span(), mut random))
+        round += 1
+    }
+}
+
+#[test]
+fn every_sequence_split_anywhere_parses_alike() {
+    // The whole corpus, fed in pieces of every size up to 40.
+    let corpus = corpus()
+    var input = MemBuffer::empty()
+    for ref part in corpus {
+        input.extend_from(part.span())
+    }
+    let whole = parse_in(input.span(), size: input.len())
+    assert(whole.len() > 20)
+    var size: usize = 1
+    while size < 40 {
+        assert(same(parse_in(input.span(), size), whole))
+        size += 1
+    }
+}

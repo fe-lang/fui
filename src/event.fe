@@ -1,0 +1,1018 @@
+//! The events a program handles: keys, mouse actions, pastes, resizes and
+//! focus changes from the terminal (read by `tui::input::Parser`), and the
+//! ticks and signals the runtime adds. They are made to be matched, with
+//! byte literals for ASCII keys and predicates where a pattern cannot say
+//! it:
+//!
+//! ```fe
+//! match event {
+//!     Event::Key(Key { code: KeyCode::Char(b'q'), mods, .. }) => if mods.is_empty() { .. },
+//!     Event::Key(key) => if key.ctrl(b'c') { .. } else if key.is(KeyCode::Enter) { .. },
+//!     Event::Mouse(Mouse { kind: MouseKind::Down(MouseButton::Left), pos, .. }) => ..,
+//!     Event::Resize(size) => ..,
+//!     Event::Paste(ref text) => ..,
+//!     _ => {},
+//! }
+//! ```
+use core::MemBuffer
+use core::ops::{BitAnd, BitOr, Eq}
+use std::io::Display
+use ingot::geom::{Pos, Size}
+
+/// Something that happened: input from the terminal, or a tick or signal
+/// from the runtime.
+pub enum Event {
+    /// A key was pressed, repeated or released.
+    Key(Key),
+    /// The mouse was pressed, released, dragged, moved or scrolled.
+    Mouse(Mouse),
+    /// Text was pasted, as one event holding its bytes. Terminals usually
+    /// send line breaks in a paste as `\r`.
+    Paste(MemBuffer),
+    /// The terminal has a new size.
+    Resize(Size),
+    /// The terminal window gained the focus.
+    FocusGained,
+    /// The terminal window lost the focus.
+    FocusLost,
+    /// A timer the program asked for expired.
+    Tick,
+    /// The process was asked to end, by `SIGTERM`, `SIGHUP` or `SIGINT`
+    /// from outside.
+    Terminate,
+    /// The process continued after it was stopped.
+    Resume,
+    /// The terminal answered a query the program sent.
+    Reply(Reply),
+}
+
+impl Eq for Event {
+    fn eq(self, _ other: Self) -> bool {
+        match self {
+            Event::Key(a) => match other {
+                Event::Key(b) => a == b,
+                _ => false,
+            },
+            Event::Mouse(a) => match other {
+                Event::Mouse(b) => a == b,
+                _ => false,
+            },
+            Event::Paste(ref a) => match other {
+                Event::Paste(ref b) => a == b,
+                _ => false,
+            },
+            Event::Resize(a) => match other {
+                Event::Resize(b) => a == b,
+                _ => false,
+            },
+            Event::FocusGained => match other {
+                Event::FocusGained => true,
+                _ => false,
+            },
+            Event::FocusLost => match other {
+                Event::FocusLost => true,
+                _ => false,
+            },
+            Event::Tick => match other {
+                Event::Tick => true,
+                _ => false,
+            },
+            Event::Terminate => match other {
+                Event::Terminate => true,
+                _ => false,
+            },
+            Event::Resume => match other {
+                Event::Resume => true,
+                _ => false,
+            },
+            Event::Reply(a) => match other {
+                Event::Reply(b) => a == b,
+                _ => false,
+            },
+        }
+    }
+}
+
+/// Writes a short description, such as `Key(Ctrl+C)`, `Paste(12 bytes)` or
+/// `Mouse(Down(Left) at 3,4)`, for logs and tests.
+impl Display for Event {
+    fn fmt(self, _ out: mut MemBuffer) {
+        match self {
+            Event::Key(key) => write!(mut out, "Key(", key, ")"),
+            Event::Mouse(mouse) => write!(mut out, "Mouse(", mouse, ")"),
+            Event::Paste(ref text) => write!(mut out, "Paste(", text.len(), " bytes)"),
+            Event::Resize(size) => write!(mut out, "Resize(", size.width, "x", size.height, ")"),
+            Event::FocusGained => write!(mut out, "FocusGained"),
+            Event::FocusLost => write!(mut out, "FocusLost"),
+            Event::Tick => write!(mut out, "Tick"),
+            Event::Terminate => write!(mut out, "Terminate"),
+            Event::Resume => write!(mut out, "Resume"),
+            Event::Reply(reply) => write!(mut out, "Reply(", reply, ")"),
+        }
+    }
+}
+
+/// A set of modifier keys: `Modifiers::CTRL | Modifiers::SHIFT`. Lock
+/// states (Caps Lock, Num Lock) are not modifiers here.
+pub struct Modifiers { bits: u8 }
+
+impl Copy for Modifiers {}
+
+impl Eq for Modifiers {
+    fn eq(self, _ other: Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+impl BitOr for Modifiers {
+    fn bitor(own self, _ other: own Self) -> Self {
+        Modifiers { bits: self.bits | other.bits }
+    }
+}
+
+impl BitAnd for Modifiers {
+    fn bitand(own self, _ other: own Self) -> Self {
+        Modifiers { bits: self.bits & other.bits }
+    }
+}
+
+impl Modifiers {
+    /// No modifier.
+    pub const NONE: Modifiers = Modifiers { bits: 0 }
+    /// Shift.
+    pub const SHIFT: Modifiers = Modifiers { bits: 1 }
+    /// Alt, or Option on macOS. A terminal sends it as an `ESC` before the
+    /// key unless it speaks the kitty keyboard protocol.
+    pub const ALT: Modifiers = Modifiers { bits: 2 }
+    /// Control.
+    pub const CTRL: Modifiers = Modifiers { bits: 4 }
+    /// Super: the Windows, Command or Meta key, which xterm calls Meta.
+    pub const SUPER: Modifiers = Modifiers { bits: 8 }
+    /// Hyper, reported only by the kitty keyboard protocol.
+    pub const HYPER: Modifiers = Modifiers { bits: 16 }
+    /// Meta as X11 knows it, reported only by the kitty keyboard protocol.
+    pub const META: Modifiers = Modifiers { bits: 32 }
+    /// Every modifier.
+    pub const ALL: Modifiers = Modifiers { bits: 63 }
+
+    /// The set of the bits terminals use: 1 shift, 2 alt, 4 ctrl, 8 super,
+    /// 16 hyper, 32 meta. Other bits are dropped.
+    pub fn from_bits(_ bits: u8) -> Self {
+        Modifiers { bits: bits & 63 }
+    }
+
+    /// The set's bits, as `from_bits` takes them.
+    pub fn bits(self) -> u8 {
+        self.bits
+    }
+
+    /// Whether the set has no modifier.
+    pub fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    /// Whether every modifier of `other` is in this set.
+    pub fn contains(self, _ other: Modifiers) -> bool {
+        self.bits & other.bits == other.bits
+    }
+
+    /// This set without the modifiers of `other`.
+    pub fn without(self, _ other: Modifiers) -> Modifiers {
+        Modifiers { bits: self.bits & (other.bits ^ 63) }
+    }
+}
+
+/// Writes the modifiers as `Ctrl+Alt+Shift+Super+Hyper+Meta+`, each one
+/// present followed by a `+`.
+impl Display for Modifiers {
+    fn fmt(self, _ out: mut MemBuffer) {
+        if self.contains(Modifiers::CTRL) {
+            write!(mut out, "Ctrl+")
+        }
+        if self.contains(Modifiers::ALT) {
+            write!(mut out, "Alt+")
+        }
+        if self.contains(Modifiers::SHIFT) {
+            write!(mut out, "Shift+")
+        }
+        if self.contains(Modifiers::SUPER) {
+            write!(mut out, "Super+")
+        }
+        if self.contains(Modifiers::HYPER) {
+            write!(mut out, "Hyper+")
+        }
+        if self.contains(Modifiers::META) {
+            write!(mut out, "Meta+")
+        }
+    }
+}
+
+/// What a key event reports. Only the kitty keyboard protocol, with
+/// `KeyboardFlags::REPORT_EVENT_TYPES`, reports repeats and releases;
+/// otherwise every key is a press.
+pub enum KeyKind {
+    Press,
+    Repeat,
+    Release,
+}
+
+impl Copy for KeyKind {}
+
+impl Eq for KeyKind {
+    fn eq(self, _ other: Self) -> bool {
+        self.index() == other.index()
+    }
+}
+
+impl KeyKind {
+    fn index(self) -> u8 {
+        match self {
+            KeyKind::Press => 0,
+            KeyKind::Repeat => 1,
+            KeyKind::Release => 2,
+        }
+    }
+}
+
+/// A key. Keypad keys are reported as the keys they stand for: the keypad
+/// `5` as `Char(b'5')`, keypad Enter as `Enter`, keypad arrows as arrows.
+///
+/// A key that types a character is `Char` for printable ASCII, so that
+/// patterns can name it with a byte literal (`KeyCode::Char(b'q')`), and
+/// `Unicode` for any other character. Both hold the character as typed:
+/// Shift+A from a plain terminal is `Char(b'A')`, since only the kitty
+/// protocol reports Shift with a character key. A letter with Ctrl is
+/// lowercase, `Char(b'c')` with `Modifiers::CTRL` for Ctrl+C, and it holds
+/// `Modifiers::SHIFT` too only where the terminal reports Ctrl+Shift+C
+/// apart from Ctrl+C, which only the kitty protocol does.
+pub enum KeyCode {
+    /// A printable ASCII character, `b' '` to `b'~'`.
+    Char(u8),
+    /// A character outside ASCII: its Unicode scalar value.
+    Unicode(u32),
+    Enter,
+    Tab,
+    /// Shift+Tab. Its `Key` does not hold `Modifiers::SHIFT` for the shift
+    /// it already means.
+    BackTab,
+    Backspace,
+    Esc,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    /// A function key, `F(1)` to `F(35)`.
+    F(u8),
+    /// The keypad's middle key (`5`) with Num Lock off.
+    KeypadBegin,
+    CapsLock,
+    ScrollLock,
+    NumLock,
+    PrintScreen,
+    Pause,
+    Menu,
+    /// A modifier key itself, pressed or released: the modifier it holds.
+    /// Only the kitty protocol with `KeyboardFlags::REPORT_ALL_KEYS` reports
+    /// these.
+    Modifier(Modifiers),
+}
+
+impl Copy for KeyCode {}
+
+impl Eq for KeyCode {
+    fn eq(self, _ other: Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl KeyCode {
+    /// The key that types the Unicode scalar value `scalar`: `Char` for
+    /// printable ASCII, `Unicode` for anything else.
+    pub fn from_scalar(_ scalar: u32) -> Self {
+        if scalar >= 0x20 && scalar < 0x7f {
+            KeyCode::Char(scalar.downcast_truncate())
+        } else {
+            KeyCode::Unicode(scalar)
+        }
+    }
+
+    /// The character this key types, as a Unicode scalar value.
+    pub fn scalar(self) -> Option<u32> {
+        match self {
+            KeyCode::Char(c) => Option::Some(c as u32),
+            KeyCode::Unicode(c) => Option::Some(c),
+            _ => Option::None,
+        }
+    }
+
+    // A number for each code: an ASCII character's byte, another
+    // character's scalar above 2^24, other keys between.
+    fn id(self) -> u32 {
+        match self {
+            KeyCode::Char(c) => c as u32,
+            KeyCode::Unicode(c) => 0x1000000 | c,
+            KeyCode::F(n) => 0x400000 | n as u32,
+            KeyCode::Modifier(m) => 0x800000 | m.bits() as u32,
+            KeyCode::Enter => 0x200001,
+            KeyCode::Tab => 0x200002,
+            KeyCode::BackTab => 0x200003,
+            KeyCode::Backspace => 0x200004,
+            KeyCode::Esc => 0x200005,
+            KeyCode::Left => 0x200006,
+            KeyCode::Right => 0x200007,
+            KeyCode::Up => 0x200008,
+            KeyCode::Down => 0x200009,
+            KeyCode::Home => 0x20000a,
+            KeyCode::End => 0x20000b,
+            KeyCode::PageUp => 0x20000c,
+            KeyCode::PageDown => 0x20000d,
+            KeyCode::Insert => 0x20000e,
+            KeyCode::Delete => 0x20000f,
+            KeyCode::KeypadBegin => 0x200010,
+            KeyCode::CapsLock => 0x200011,
+            KeyCode::ScrollLock => 0x200012,
+            KeyCode::NumLock => 0x200013,
+            KeyCode::PrintScreen => 0x200014,
+            KeyCode::Pause => 0x200015,
+            KeyCode::Menu => 0x200016,
+        }
+    }
+}
+
+/// A key event: the key, the modifiers held with it, and whether it was
+/// pressed, repeated or released.
+pub struct Key { pub code: KeyCode, pub mods: Modifiers, pub kind: KeyKind }
+
+impl Copy for Key {}
+
+impl Eq for Key {
+    fn eq(self, _ other: Self) -> bool {
+        self.code == other.code && self.mods == other.mods && self.kind == other.kind
+    }
+}
+
+impl Key {
+    /// A press of `code` with `mods`.
+    pub fn new(_ code: KeyCode, _ mods: Modifiers) -> Self {
+        Key { code, mods, kind: KeyKind::Press }
+    }
+
+    /// This key with `kind`.
+    pub fn with_kind(own self, _ kind: KeyKind) -> Self {
+        Key { code: self.code, mods: self.mods, kind }
+    }
+
+    /// Whether this is a press or a repeat, as opposed to a release.
+    pub fn is_press(self) -> bool {
+        self.kind != KeyKind::Release
+    }
+
+    /// Whether this is a release.
+    pub fn is_release(self) -> bool {
+        self.kind == KeyKind::Release
+    }
+
+    /// Whether this is a press or repeat of `code` with no modifier.
+    pub fn is(self, _ code: KeyCode) -> bool {
+        self.pressed(code, Modifiers::NONE)
+    }
+
+    /// Whether this is a press or repeat of `code` with exactly `mods`.
+    pub fn pressed(self, _ code: KeyCode, _ mods: Modifiers) -> bool {
+        self.is_press() && self.code == code && self.mods == mods
+    }
+
+    /// Whether this is a press or repeat of the key that types the ASCII
+    /// character `c`, with no modifier: `key.is_char(b'q')`.
+    pub fn is_char(self, _ c: u8) -> bool {
+        self.pressed(KeyCode::Char(c), Modifiers::NONE)
+    }
+
+    /// Whether this is Ctrl and the ASCII character `c`, in either case:
+    /// `key.ctrl(b'c')` is Ctrl+C.
+    pub fn ctrl(self, _ c: u8) -> bool {
+        self.pressed(KeyCode::Char(ascii_lower(c)), Modifiers::CTRL)
+    }
+
+    /// Whether this is Alt and the ASCII character `c`, as typed: Alt+Shift+A
+    /// from a plain terminal is `alt(b'A')`.
+    pub fn alt(self, _ c: u8) -> bool {
+        self.pressed(KeyCode::Char(c), Modifiers::ALT)
+    }
+
+    /// The character this key types, as a Unicode scalar value, whatever
+    /// its modifiers.
+    pub fn scalar(self) -> Option<u32> {
+        self.code.scalar()
+    }
+
+    /// Appends the character this key types to `out` as UTF-8, if it types
+    /// one: whether it did. A text field calls this for a key press without
+    /// Ctrl, Alt or Super.
+    pub fn push_text(self, _ out: mut MemBuffer) -> bool {
+        match self.code.scalar() {
+            Option::Some(c) => {
+                push_utf8(mut out, c)
+                true
+            },
+            Option::None => false,
+        }
+    }
+}
+
+/// Writes the key as help screens show it: its modifiers, then the key, as
+/// in `Ctrl+Shift+A`, `Alt+x`, `F5`, `Esc`, `Space`. A letter with Ctrl is
+/// uppercase, as keyboards label it. A release adds ` (release)` and a
+/// repeat ` (repeat)`.
+impl Display for Key {
+    fn fmt(self, _ out: mut MemBuffer) {
+        write!(mut out, self.mods)
+        match self.code {
+            KeyCode::Char(c) => if c == b' ' {
+                write!(mut out, "Space")
+            } else if self.mods.contains(Modifiers::CTRL) && c >= b'a' && c <= b'z' {
+                out.push(c - 32)
+            } else {
+                out.push(c)
+            },
+            KeyCode::Unicode(c) => push_utf8(mut out, c),
+            KeyCode::F(n) => write!(mut out, "F", n),
+            KeyCode::Modifier(m) => {
+                // The modifiers' names without the last `+`.
+                var name = MemBuffer::empty()
+                write!(mut name, m)
+                out.extend_from(name.slice(offset: 0, len: name.len().saturating_sub(1)))
+            },
+            KeyCode::Enter => write!(mut out, "Enter"),
+            KeyCode::Tab => write!(mut out, "Tab"),
+            KeyCode::BackTab => write!(mut out, "BackTab"),
+            KeyCode::Backspace => write!(mut out, "Backspace"),
+            KeyCode::Esc => write!(mut out, "Esc"),
+            KeyCode::Left => write!(mut out, "Left"),
+            KeyCode::Right => write!(mut out, "Right"),
+            KeyCode::Up => write!(mut out, "Up"),
+            KeyCode::Down => write!(mut out, "Down"),
+            KeyCode::Home => write!(mut out, "Home"),
+            KeyCode::End => write!(mut out, "End"),
+            KeyCode::PageUp => write!(mut out, "PageUp"),
+            KeyCode::PageDown => write!(mut out, "PageDown"),
+            KeyCode::Insert => write!(mut out, "Insert"),
+            KeyCode::Delete => write!(mut out, "Delete"),
+            KeyCode::KeypadBegin => write!(mut out, "KeypadBegin"),
+            KeyCode::CapsLock => write!(mut out, "CapsLock"),
+            KeyCode::ScrollLock => write!(mut out, "ScrollLock"),
+            KeyCode::NumLock => write!(mut out, "NumLock"),
+            KeyCode::PrintScreen => write!(mut out, "PrintScreen"),
+            KeyCode::Pause => write!(mut out, "Pause"),
+            KeyCode::Menu => write!(mut out, "Menu"),
+        }
+        match self.kind {
+            KeyKind::Press => {},
+            KeyKind::Repeat => write!(mut out, " (repeat)"),
+            KeyKind::Release => write!(mut out, " (release)"),
+        }
+    }
+}
+
+fn ascii_lower(_ c: u8) -> u8 {
+    if c >= b'A' && c <= b'Z' { c + 32 } else { c }
+}
+
+/// Appends the UTF-8 encoding of the Unicode scalar value `scalar`, or of
+/// U+FFFD if it is a surrogate or above U+10FFFF.
+pub fn push_utf8(_ out: mut MemBuffer, _ scalar: u32) {
+    let c = if scalar > 0x10ffff || (scalar >= 0xd800 && scalar < 0xe000) {
+        0xfffd
+    } else {
+        scalar
+    }
+    if c < 0x80 {
+        out.push(c.downcast_truncate())
+    } else if c < 0x800 {
+        out.push((0xc0 | c >> 6).downcast_truncate())
+        out.push((0x80 | c & 0x3f).downcast_truncate())
+    } else if c < 0x10000 {
+        out.push((0xe0 | c >> 12).downcast_truncate())
+        out.push((0x80 | c >> 6 & 0x3f).downcast_truncate())
+        out.push((0x80 | c & 0x3f).downcast_truncate())
+    } else {
+        out.push((0xf0 | c >> 18).downcast_truncate())
+        out.push((0x80 | c >> 12 & 0x3f).downcast_truncate())
+        out.push((0x80 | c >> 6 & 0x3f).downcast_truncate())
+        out.push((0x80 | c & 0x3f).downcast_truncate())
+    }
+}
+
+/// A mouse button.
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    /// The side button that goes back (button 8).
+    Back,
+    /// The side button that goes forward (button 9).
+    Forward,
+}
+
+impl Copy for MouseButton {}
+
+impl Eq for MouseButton {
+    fn eq(self, _ other: Self) -> bool {
+        self.index() == other.index()
+    }
+}
+
+impl MouseButton {
+    fn index(self) -> u8 {
+        match self {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            MouseButton::Back => 3,
+            MouseButton::Forward => 4,
+        }
+    }
+}
+
+impl Display for MouseButton {
+    fn fmt(self, _ out: mut MemBuffer) {
+        match self {
+            MouseButton::Left => write!(mut out, "Left"),
+            MouseButton::Middle => write!(mut out, "Middle"),
+            MouseButton::Right => write!(mut out, "Right"),
+            MouseButton::Back => write!(mut out, "Back"),
+            MouseButton::Forward => write!(mut out, "Forward"),
+        }
+    }
+}
+
+/// What the mouse did. Which of these a terminal reports depends on the
+/// `MouseTracking` the program enabled.
+pub enum MouseKind {
+    Down(MouseButton),
+    Up(MouseButton),
+    /// The mouse moved with the button held.
+    Drag(MouseButton),
+    /// The mouse moved with no button held.
+    Moved,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
+impl Copy for MouseKind {}
+
+impl Eq for MouseKind {
+    fn eq(self, _ other: Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl MouseKind {
+    fn id(self) -> u8 {
+        match self {
+            MouseKind::Down(b) => b.index(),
+            MouseKind::Up(b) => 8 | b.index(),
+            MouseKind::Drag(b) => 16 | b.index(),
+            MouseKind::Moved => 24,
+            MouseKind::ScrollUp => 25,
+            MouseKind::ScrollDown => 26,
+            MouseKind::ScrollLeft => 27,
+            MouseKind::ScrollRight => 28,
+        }
+    }
+}
+
+/// A mouse event: what happened, at which cell, with which modifiers held.
+/// Terminals report Shift, Alt and Ctrl with the mouse, though many keep
+/// Shift+click for their own selection.
+pub struct Mouse { pub kind: MouseKind, pub pos: Pos, pub mods: Modifiers }
+
+impl Copy for Mouse {}
+
+impl Eq for Mouse {
+    fn eq(self, _ other: Self) -> bool {
+        self.kind == other.kind && self.pos == other.pos && self.mods == other.mods
+    }
+}
+
+impl Mouse {
+    /// The event `kind` at the cell `pos` with `mods` held.
+    pub fn new(_ kind: MouseKind, _ pos: Pos, _ mods: Modifiers) -> Self {
+        Mouse { kind, pos, mods }
+    }
+}
+
+/// Writes the event as `Ctrl+Down(Left) at 3,4`.
+impl Display for Mouse {
+    fn fmt(self, _ out: mut MemBuffer) {
+        write!(mut out, self.mods)
+        match self.kind {
+            MouseKind::Down(b) => write!(mut out, "Down(", b, ")"),
+            MouseKind::Up(b) => write!(mut out, "Up(", b, ")"),
+            MouseKind::Drag(b) => write!(mut out, "Drag(", b, ")"),
+            MouseKind::Moved => write!(mut out, "Moved"),
+            MouseKind::ScrollUp => write!(mut out, "ScrollUp"),
+            MouseKind::ScrollDown => write!(mut out, "ScrollDown"),
+            MouseKind::ScrollLeft => write!(mut out, "ScrollLeft"),
+            MouseKind::ScrollRight => write!(mut out, "ScrollRight"),
+        }
+        write!(mut out, " at ", self.pos.x, ",", self.pos.y)
+    }
+}
+
+/// A terminal's answer to one of the queries in `tui::input`.
+pub enum Reply {
+    /// The cursor's cell, answering `request_cursor_position`.
+    CursorPosition(Pos),
+    /// The kitty keyboard protocol flags in effect, answering
+    /// `request_keyboard_flags`. Terminals without the protocol do not
+    /// answer.
+    KeyboardFlags(KeyboardFlags),
+    /// The primary device attributes, answering `request_device_attributes`.
+    /// Every terminal answers, so a program sends this query after others
+    /// to learn that they went unanswered.
+    DeviceAttributes,
+    /// A private mode's setting, answering `request_mode`.
+    Mode(u16, ModeSetting),
+    /// The default foreground color as red, green and blue, answering
+    /// `request_colors`.
+    Foreground(u8, u8, u8),
+    /// The default background color as red, green and blue, answering
+    /// `request_colors`.
+    Background(u8, u8, u8),
+}
+
+impl Copy for Reply {}
+
+impl Eq for Reply {
+    fn eq(self, _ other: Self) -> bool {
+        match self {
+            Reply::CursorPosition(a) => match other {
+                Reply::CursorPosition(b) => a == b,
+                _ => false,
+            },
+            Reply::KeyboardFlags(a) => match other {
+                Reply::KeyboardFlags(b) => a == b,
+                _ => false,
+            },
+            Reply::DeviceAttributes => match other {
+                Reply::DeviceAttributes => true,
+                _ => false,
+            },
+            Reply::Mode(a, s) => match other {
+                Reply::Mode(b, t) => a == b && s == t,
+                _ => false,
+            },
+            Reply::Foreground(r, g, b) => match other {
+                Reply::Foreground(s, h, c) => r == s && g == h && b == c,
+                _ => false,
+            },
+            Reply::Background(r, g, b) => match other {
+                Reply::Background(s, h, c) => r == s && g == h && b == c,
+                _ => false,
+            },
+        }
+    }
+}
+
+impl Display for Reply {
+    fn fmt(self, _ out: mut MemBuffer) {
+        match self {
+            Reply::CursorPosition(pos) => write!(
+                mut out,
+                "CursorPosition(",
+                pos.x,
+                ",",
+                pos.y,
+                ")",
+            ),
+            Reply::KeyboardFlags(flags) => write!(mut out, "KeyboardFlags(", flags.bits(), ")"),
+            Reply::DeviceAttributes => write!(mut out, "DeviceAttributes"),
+            Reply::Mode(mode, setting) => write!(mut out, "Mode(", mode, ",", setting.value(), ")"),
+            Reply::Foreground(r, g, b) => write!(mut out, "Foreground(", r, ",", g, ",", b, ")"),
+            Reply::Background(r, g, b) => write!(mut out, "Background(", r, ",", g, ",", b, ")"),
+        }
+    }
+}
+
+/// The progressive enhancements of the kitty keyboard protocol, which
+/// `tui::input::push_keyboard_flags` asks for. The parser reads every form
+/// they produce, and ignores the alternate keys and the text they add.
+pub struct KeyboardFlags { bits: u8 }
+
+impl Copy for KeyboardFlags {}
+
+impl Eq for KeyboardFlags {
+    fn eq(self, _ other: Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+impl BitOr for KeyboardFlags {
+    fn bitor(own self, _ other: own Self) -> Self {
+        KeyboardFlags { bits: self.bits | other.bits }
+    }
+}
+
+impl KeyboardFlags {
+    /// The legacy encoding.
+    pub const NONE: KeyboardFlags = KeyboardFlags { bits: 0 }
+    /// Report Esc, keys with Ctrl or Alt, and keypad keys as unambiguous
+    /// `CSI u` sequences. Plain text, Enter, Tab and Backspace keep their
+    /// legacy bytes. A lone Esc then needs no timeout.
+    pub const DISAMBIGUATE: KeyboardFlags = KeyboardFlags { bits: 1 }
+    /// Report repeats and releases, of keys sent as sequences.
+    pub const REPORT_EVENT_TYPES: KeyboardFlags = KeyboardFlags { bits: 2 }
+    /// Add the shifted and base layout keys, which the parser ignores.
+    pub const REPORT_ALTERNATE_KEYS: KeyboardFlags = KeyboardFlags { bits: 4 }
+    /// Report every key as a sequence, text keys and modifier keys too. A
+    /// character key then holds its unshifted character with
+    /// `Modifiers::SHIFT`: Shift+A is `Char(b'a')` with Shift.
+    pub const REPORT_ALL_KEYS: KeyboardFlags = KeyboardFlags { bits: 8 }
+    /// Add the text a key types, which the parser ignores.
+    pub const REPORT_TEXT: KeyboardFlags = KeyboardFlags { bits: 16 }
+
+    /// The flags of the protocol's bits: 1, 2, 4, 8 and 16. Other bits
+    /// are dropped.
+    pub fn from_bits(_ bits: u8) -> Self {
+        KeyboardFlags { bits: bits & 31 }
+    }
+
+    /// The flags' bits, as `CSI > flags u` sends them.
+    pub fn bits(self) -> u8 {
+        self.bits
+    }
+
+    /// Whether every flag of `other` is in this set.
+    pub fn contains(self, _ other: KeyboardFlags) -> bool {
+        self.bits & other.bits == other.bits
+    }
+}
+
+/// How a terminal reports a mode it was asked about.
+pub enum ModeSetting {
+    /// The terminal does not know the mode.
+    NotRecognized,
+    Set,
+    Reset,
+    /// Set, and it cannot be reset.
+    PermanentlySet,
+    /// Reset, and it cannot be set.
+    PermanentlyReset,
+}
+
+impl Copy for ModeSetting {}
+
+impl Eq for ModeSetting {
+    fn eq(self, _ other: Self) -> bool {
+        self.value() == other.value()
+    }
+}
+
+impl ModeSetting {
+    /// The setting a DECRPM reply's value stands for: 1 set, 2 reset, 3
+    /// permanently set, 4 permanently reset, anything else not recognized.
+    pub fn from_value(_ value: u32) -> Self {
+        match value {
+            1 => ModeSetting::Set,
+            2 => ModeSetting::Reset,
+            3 => ModeSetting::PermanentlySet,
+            4 => ModeSetting::PermanentlyReset,
+            _ => ModeSetting::NotRecognized,
+        }
+    }
+
+    /// The DECRPM value: 0 to 4.
+    pub fn value(self) -> u8 {
+        match self {
+            ModeSetting::NotRecognized => 0,
+            ModeSetting::Set => 1,
+            ModeSetting::Reset => 2,
+            ModeSetting::PermanentlySet => 3,
+            ModeSetting::PermanentlyReset => 4,
+        }
+    }
+
+    /// Whether the mode is set, permanently or not.
+    pub fn is_set(self) -> bool {
+        self == ModeSetting::Set || self == ModeSetting::PermanentlySet
+    }
+
+    /// Whether the terminal knows the mode.
+    pub fn is_recognized(self) -> bool {
+        self != ModeSetting::NotRecognized
+    }
+}
+
+#[test]
+fn keys_display_as_help_screens_show_them() {
+    assert(
+        format!(
+                Key::new(KeyCode::Char(b'a'), Modifiers::CTRL | Modifiers::SHIFT),
+            )
+            == "Ctrl+Shift+A",
+    )
+    assert(
+        format!(Key::new(KeyCode::Char(b'x'), Modifiers::ALT)) == "Alt+x",
+    )
+    assert(
+        format!(Key::new(KeyCode::Char(b' '), Modifiers::CTRL)) == "Ctrl+Space",
+    )
+    assert(format!(Key::new(KeyCode::F(5), Modifiers::NONE)) == "F5")
+    assert(format!(Key::new(KeyCode::Esc, Modifiers::NONE)) == "Esc")
+    assert(
+        format!(Key::new(KeyCode::Up, Modifiers::ALL)) == "Ctrl+Alt+Shift+Super+Hyper+Meta+Up",
+    )
+    assert(
+        format!(
+                Key::new(KeyCode::Modifier(Modifiers::SHIFT), Modifiers::SHIFT),
+            ) == "Shift+Shift",
+    )
+    assert(
+        format!(
+                Key::new(KeyCode::Modifier(Modifiers::NONE), Modifiers::NONE),
+            ) == "",
+    )
+    assert(
+        format!(Key::new(KeyCode::Unicode(0xe9), Modifiers::NONE)) == "é",
+    )
+    assert(
+        format!(
+                Key::new(KeyCode::Enter, Modifiers::NONE).with_kind(KeyKind::Release),
+            )
+            == "Enter (release)",
+    )
+    assert(format!(Event::Paste(format!("abc"))) == "Paste(3 bytes)")
+    let mouse = Mouse::new(
+        MouseKind::Down(MouseButton::Left),
+        Pos::new(x: 3, y: 4),
+        Modifiers::CTRL,
+    )
+    assert(
+        format!(Event::Mouse(mouse)) == "Mouse(Ctrl+Down(Left) at 3,4)",
+    )
+}
+
+#[test]
+fn key_predicates_match_presses_with_exact_modifiers() {
+    let ctrl_c = Key::new(KeyCode::Char(b'c'), Modifiers::CTRL)
+    assert(ctrl_c.ctrl(b'c') && ctrl_c.ctrl(b'C'))
+    assert(!ctrl_c.is_char(b'c') && !ctrl_c.alt(b'c'))
+    assert(
+        !Key::new(KeyCode::Char(b'c'), Modifiers::CTRL | Modifiers::SHIFT).ctrl(b'c'),
+    )
+    assert(!ctrl_c.with_kind(KeyKind::Release).ctrl(b'c'))
+    assert(ctrl_c.with_kind(KeyKind::Repeat).ctrl(b'c'))
+    let q = Key::new(KeyCode::Char(b'q'), Modifiers::NONE)
+    assert(
+        q.is_char(b'q') && !q.is_char(b'Q') && q.scalar() == Option::Some(113),
+    )
+    assert(
+        Key::new(KeyCode::Enter, Modifiers::NONE).is(KeyCode::Enter),
+    )
+    assert(
+        !Key::new(KeyCode::Enter, Modifiers::SHIFT).is(KeyCode::Enter),
+    )
+    assert(
+        Key::new(KeyCode::Enter, Modifiers::SHIFT).pressed(KeyCode::Enter, Modifiers::SHIFT),
+    )
+    assert(Key::new(KeyCode::Up, Modifiers::NONE).scalar().is_none())
+    assert(
+        KeyCode::F(1) != KeyCode::F(2) && KeyCode::Char(65) != KeyCode::Unicode(65),
+    )
+}
+
+#[test]
+fn modifiers_form_a_set() {
+    let both = Modifiers::CTRL | Modifiers::ALT
+    assert(
+        both.contains(Modifiers::CTRL) && both.contains(Modifiers::ALT),
+    )
+    assert(!both.contains(Modifiers::SHIFT) && !both.is_empty())
+    assert(both.without(Modifiers::CTRL) == Modifiers::ALT)
+    assert(both & Modifiers::ALT == Modifiers::ALT)
+    assert(
+        Modifiers::from_bits(0xff) == Modifiers::ALL && Modifiers::NONE.is_empty(),
+    )
+}
+
+#[test]
+fn scalars_encode_as_utf8() {
+    var out = MemBuffer::empty()
+    push_utf8(mut out, 0x41)
+    push_utf8(mut out, 0xe9)
+    push_utf8(mut out, 0x20ac)
+    push_utf8(mut out, 0x1f600)
+    assert(out == "Aé€😀")
+    var bad = MemBuffer::empty()
+    push_utf8(mut bad, 0xd800)
+    push_utf8(mut bad, 0x110000)
+    assert(bad == "��")
+    assert(bad[0] == 0xef && bad[1] == 0xbf && bad[2] == 0xbd)
+}
+
+#[test]
+fn events_compare_by_value() {
+    assert(Event::Paste(format!("a")) == Event::Paste(format!("a")))
+    assert(Event::Paste(format!("a")) != Event::Paste(format!("b")))
+    assert(Event::Tick != Event::Resume)
+    assert(
+        Event::Resize(Size::new(width: 80, height: 24))
+            == Event::Resize(Size::new(width: 80, height: 24)),
+    )
+    assert(
+        Event::Reply(Reply::Mode(2026, ModeSetting::Set))
+            != Event::Reply(Reply::Mode(2026, ModeSetting::Reset)),
+    )
+    assert(
+        ModeSetting::from_value(3).is_set() && !ModeSetting::from_value(9).is_recognized(),
+    )
+}
+
+// What a program's `update` would do with `event`, matched as programs match.
+fn action(_ event: Event) -> u8 {
+    match event {
+        Event::Key(
+            Key { code: KeyCode::Char(b'q'), mods, kind: KeyKind::Press },
+        ) => if mods.is_empty() {
+            1
+        } else if mods == Modifiers::CTRL { 2 } else { 3 },
+        Event::Key(Key { code: KeyCode::Unicode(0xe9), .. }) => 4,
+        Event::Key(Key { code: KeyCode::F(5), mods, .. }) => if mods.contains(Modifiers::SHIFT) {
+            6
+        } else {
+            5
+        },
+        Event::Mouse(Mouse { kind: MouseKind::Down(MouseButton::Left), pos, .. }) => if pos.x == 2 {
+            7
+        } else {
+            0
+        },
+        Event::Paste(ref text) => text.len().downcast_truncate(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn events_match_with_byte_literal_patterns() {
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'q'), Modifiers::NONE))) == 1,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'q'), Modifiers::CTRL))) == 2,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'q'), Modifiers::ALT))) == 3,
+    )
+    assert(
+        action(
+                Event::Key(
+                    Key::new(KeyCode::Char(b'q'), Modifiers::NONE).with_kind(KeyKind::Release),
+                ),
+            )
+            == 0,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'Q'), Modifiers::NONE))) == 0,
+    )
+    assert(
+        action(
+                Event::Key(Key::new(KeyCode::from_scalar(0xe9), Modifiers::NONE)),
+            ) == 4,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::F(5), Modifiers::SHIFT))) == 6,
+    )
+    let click = Mouse::new(
+        MouseKind::Down(MouseButton::Left),
+        Pos::new(x: 2, y: 0),
+        Modifiers::NONE,
+    )
+    assert(action(Event::Mouse(click)) == 7)
+    assert(action(Event::Paste(format!("hello"))) == 5)
+    assert(KeyCode::from_scalar(0x41) == KeyCode::Char(b'A'))
+    assert(KeyCode::from_scalar(0x7f) == KeyCode::Unicode(0x7f))
+}
+
+#[test]
+fn keys_append_their_text() {
+    var text = MemBuffer::empty()
+    assert(
+        Key::new(KeyCode::Char(b'h'), Modifiers::NONE).push_text(mut text),
+    )
+    assert(
+        Key::new(KeyCode::Unicode(0x20ac), Modifiers::NONE).push_text(mut text),
+    )
+    assert(
+        !Key::new(KeyCode::Enter, Modifiers::NONE).push_text(mut text),
+    )
+    assert(text == "h€")
+}
