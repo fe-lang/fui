@@ -1,0 +1,543 @@
+use core::{MemBuffer, MemSpan}
+use ingot::style::{Color, Style}
+use super::{
+    Alignment,
+    Cluster,
+    Line,
+    REPLACEMENT_CHARACTER,
+    Text,
+    Wrap,
+    WrapMode,
+    WrappedLine,
+    column_offset,
+    decode,
+    encode,
+    is_valid,
+    next_cluster,
+    scalar_width,
+    truncate,
+    truncate_with_ellipsis,
+    valid_up_to,
+    width,
+}
+
+fn bytes<const N: usize>(_ values: [u8; N]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for b in values {
+        out.push(b)
+    }
+    out
+}
+
+fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for c in scalars {
+        encode(c, mut out)
+    }
+    out
+}
+
+fn decodes(_ text: MemBuffer, _ offset: usize, value: u32, len: usize) -> bool {
+    let scalar = decode(text.span(), offset)
+    scalar.value == value && scalar.len == len
+}
+
+fn cluster(_ text: MemBuffer) -> Cluster {
+    next_cluster(text.span(), 0)
+}
+
+// Whether `text` is one cluster of `width`.
+fn one_cluster(_ text: MemBuffer, _ width: u8) -> bool {
+    let c = cluster(text)
+    c.len == text.len() && c.width == width
+}
+
+#[test]
+fn decodes_valid_utf8() {
+    let text = format!("Aé中😀")
+    assert(decodes(text, 0, value: 0x41, len: 1))
+    assert(decodes(text, 1, value: 0xe9, len: 2))
+    assert(decodes(text, 3, value: 0x4e2d, len: 3))
+    assert(decodes(text, 6, value: 0x1f600, len: 4))
+    assert(is_valid(text.span()))
+}
+
+#[test]
+fn decodes_invalid_utf8_by_maximal_subparts() {
+    let r = REPLACEMENT_CHARACTER
+    // A lone continuation byte, bytes that never start a sequence.
+    assert(decodes(bytes([0x80]), 0, value: r, len: 1))
+    assert(decodes(bytes([0xc1, 0xbf]), 0, value: r, len: 1))
+    assert(decodes(bytes([0xf5, 0x80]), 0, value: r, len: 1))
+    assert(decodes(bytes([0xff]), 0, value: r, len: 1))
+    // Overlong forms, a surrogate and a value above U+10FFFF fail at the
+    // second byte.
+    assert(decodes(bytes([0xc0, 0x80]), 0, value: r, len: 1))
+    assert(decodes(bytes([0xe0, 0x80, 0x80]), 0, value: r, len: 1))
+    assert(
+        decodes(bytes([0xf0, 0x80, 0x80, 0x80]), 0, value: r, len: 1),
+    )
+    assert(decodes(bytes([0xed, 0xa0, 0x80]), 0, value: r, len: 1))
+    assert(
+        decodes(bytes([0xf4, 0x90, 0x80, 0x80]), 0, value: r, len: 1),
+    )
+    // A truncated sequence is one replacement, and the next byte starts
+    // afresh.
+    assert(decodes(bytes([0xe2, 0x82]), 0, value: r, len: 2))
+    let cut = bytes([0xf0, 0x9f, 0x98, 0x41])
+    assert(decodes(cut, 0, value: r, len: 3))
+    assert(decodes(cut, 3, value: 0x41, len: 1))
+    // The edges of the ranges are valid.
+    assert(
+        decodes(bytes([0xed, 0x9f, 0xbf]), 0, value: 0xd7ff, len: 3),
+    )
+    assert(
+        decodes(
+            bytes([0xf4, 0x8f, 0xbf, 0xbf]),
+            0,
+            value: 0x10ffff,
+            len: 4,
+        ),
+    )
+}
+
+#[test]
+fn validates_and_finds_the_first_error() {
+    assert(is_valid(MemBuffer::empty().span()))
+    assert(
+        valid_up_to(bytes([0x61, 0xc3, 0xa9, 0xff, 0x61]).span()) == 3,
+    )
+    assert(valid_up_to(bytes([0x61, 0xe2, 0x82]).span()) == 1)
+    // U+FFFD itself is valid.
+    assert(is_valid(utf8([0xfffd, 0x61]).span()))
+}
+
+#[test]
+fn encodes_and_decodes_back() {
+    let values = [0, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xfffd, 0xffff, 0x10000, 0x10ffff]
+    let lens = [1, 1, 2, 2, 3, 3, 3, 3, 3, 4, 4]
+    for (i, value) in values.enumerate() {
+        let text = utf8([value])
+        assert(text.len() == lens[i])
+        assert(decodes(text, 0, value, len: lens[i]))
+    }
+    // No scalar: U+FFFD.
+    assert(utf8([0xd800]) == utf8([0xfffd]))
+    assert(utf8([0x110000]) == utf8([0xfffd]))
+}
+
+#[test]
+fn scalar_widths() {
+    assert(scalar_width(0x41) == 1)
+    assert(scalar_width(0x09) == 0 && scalar_width(0x7f) == 0)
+    // C1 controls are controls.
+    assert(scalar_width(0x85) == 0 && scalar_width(0x9f) == 0)
+    assert(scalar_width(0xa0) == 1 && scalar_width(0xad) == 1)
+    assert(
+        scalar_width(0x301) == 0 && scalar_width(0x200d) == 0 && scalar_width(0xfe0f) == 0,
+    )
+    assert(
+        scalar_width(0x4e2d) == 2 && scalar_width(0xff01) == 2 && scalar_width(0x1f600) == 2,
+    )
+    assert(scalar_width(0x2764) == 1 && scalar_width(0x1f1e6) == 1)
+    assert(scalar_width(0x1161) == 0)
+    assert(scalar_width(0x20000) == 2 && scalar_width(0x3fffd) == 2)
+    assert(scalar_width(0xe0001) == 0 && scalar_width(0x10ffff) == 1)
+}
+
+#[test]
+fn every_scalar_takes_at_most_two_columns() {
+    // Also times the table: a lookup for each of the 1.1 million scalars.
+    var total: usize = 0
+    var c: u32 = 0
+    while c < 0x110000 {
+        let w = scalar_width(c)
+        assert(w <= 2)
+        total += w as usize
+        c += 1
+    }
+    assert(total > 0x110000)
+}
+
+#[test]
+fn clusters_of_letters_and_marks() {
+    assert(width(format!("hello").span()) == 5)
+    assert(width(MemBuffer::empty().span()) == 0)
+    // "é" precomposed and decomposed.
+    assert(one_cluster(utf8([0xe9]), 1))
+    assert(one_cluster(utf8([0x65, 0x301]), 1))
+    assert(width(utf8([0x65, 0x301, 0x65, 0x301, 0x302]).span()) == 2)
+    assert(width(format!("中文").span()) == 4)
+    assert(one_cluster(utf8([0x4e2d, 0x301]), 2))
+    // A spacing mark joins its base and adds no column.
+    assert(one_cluster(utf8([0x915, 0x93e]), 1))
+    // A conjunct: consonant, virama, consonant.
+    assert(one_cluster(utf8([0x915, 0x94d, 0x937]), 1))
+    // Hangul jamo L V T, and a syllable LV with a T.
+    assert(one_cluster(utf8([0x1100, 0x1161, 0x11a8]), 2))
+    assert(one_cluster(utf8([0xac00, 0x11a8]), 2))
+    assert(width(utf8([0xac00, 0xac01]).span()) == 4)
+}
+
+#[test]
+fn clusters_of_emoji() {
+    // A family: man ZWJ woman ZWJ girl ZWJ boy.
+    let family = utf8(
+        [0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467, 0x200d, 0x1f466],
+    )
+    assert(family.len() == 25 && one_cluster(family, 2))
+    // Thumbs up with a skin tone.
+    assert(one_cluster(utf8([0x1f44d, 0x1f3fd]), 2))
+    // A narrow emoji base with a modifier is wide.
+    assert(one_cluster(utf8([0x261d, 0x1f3fd]), 2))
+    // A heart: text presentation alone, emoji with VS16; VS15 keeps it narrow.
+    assert(one_cluster(utf8([0x2764]), 1))
+    assert(one_cluster(utf8([0x2764, 0xfe0f]), 2))
+    assert(one_cluster(utf8([0x2764, 0xfe0e]), 1))
+    // A heart on fire: heart VS16 ZWJ fire.
+    assert(one_cluster(utf8([0x2764, 0xfe0f, 0x200d, 0x1f525]), 2))
+    // A keycap: digit VS16 combining enclosing keycap.
+    assert(one_cluster(utf8([0x31, 0xfe0f, 0x20e3]), 2))
+    // VS16 after a letter with no emoji form changes nothing.
+    assert(one_cluster(utf8([0x61, 0xfe0f]), 1))
+}
+
+#[test]
+fn regional_indicators_pair_up() {
+    let us = utf8([0x1f1fa, 0x1f1f8])
+    assert(one_cluster(us, 2))
+    let four = utf8([0x1f1fa, 0x1f1f8, 0x1f1eb, 0x1f1f7])
+    assert(
+        cluster(four).len == 8 && next_cluster(four.span(), 8).len == 8,
+    )
+    assert(width(four.span()) == 4)
+    let three = utf8([0x1f1fa, 0x1f1f8, 0x1f1eb])
+    let last = next_cluster(three.span(), 8)
+    assert(last.len == 4 && last.width == 1)
+    assert(width(three.span()) == 3)
+}
+
+#[test]
+fn clusters_without_a_base() {
+    // A ZWJ alone, and a mark at the start of the text.
+    assert(one_cluster(utf8([0x200d]), 0))
+    let mark = utf8([0x301, 0x61])
+    let first = cluster(mark)
+    assert(first.len == 2 && first.width == 0)
+    assert(width(mark.span()) == 1)
+    // A ZWJ between letters joins the letter before it only.
+    let joined = utf8([0x61, 0x200d, 0x62])
+    assert(cluster(joined).len == 4 && width(joined.span()) == 2)
+}
+
+#[test]
+fn clusters_of_controls_and_invalid_bytes() {
+    let crlf = format!("\r\n")
+    assert(one_cluster(crlf, 0))
+    let cr = format!("\ra")
+    assert(cluster(cr).len == 1 && width(cr.span()) == 1)
+    // A control takes no mark after it.
+    let tab = utf8([0x09, 0x301])
+    assert(cluster(tab).len == 1 && cluster(tab).width == 0)
+    assert(one_cluster(utf8([0x85]), 0))
+    assert(width(utf8([0x61, 0x85, 0x9b, 0x62]).span()) == 2)
+    // Each invalid subpart is one column.
+    let garbage = bytes([0xff, 0xe2, 0x82, 0x61, 0x80])
+    assert(cluster(garbage).len == 1 && cluster(garbage).width == 1)
+    assert(next_cluster(garbage.span(), 1).len == 2)
+    assert(width(garbage.span()) == 4)
+}
+
+#[test]
+fn truncates_to_whole_clusters() {
+    let text = format!("abc中def")
+    assert(truncate(text.span(), 0) == 0)
+    assert(truncate(text.span(), 4) == 3)
+    assert(truncate(text.span(), 5) == 6)
+    assert(truncate(text.span(), 100) == text.len())
+    // Zero-width scalars at the cut stay with their base.
+    assert(truncate(utf8([0x65, 0x301, 0x65]).span(), 1) == 3)
+    assert(truncate(MemBuffer::empty().span(), 3) == 0)
+}
+
+#[test]
+fn finds_the_offset_of_a_column() {
+    let text = format!("ab中cd")
+    let (offset, column) = column_offset(text.span(), 3)
+    assert(offset == 2 && column == 2)
+    let (offset, column) = column_offset(text.span(), 4)
+    assert(offset == 5 && column == 4)
+    let (offset, column) = column_offset(text.span(), 9)
+    assert(offset == text.len() && column == 6)
+    let (offset, column) = column_offset(text.span(), 0)
+    assert(offset == 0 && column == 0)
+}
+
+#[test]
+fn truncates_with_an_ellipsis() {
+    let text = format!("hello world")
+    assert(truncate_with_ellipsis(text.span(), 11) == 11)
+    assert(truncate_with_ellipsis(text.span(), 8) == 7)
+    assert(truncate_with_ellipsis(text.span(), 1) == 0)
+    assert(truncate_with_ellipsis(text.span(), 0) == 0)
+    assert(truncate_with_ellipsis(format!("中中中").span(), 4) == 3)
+    assert(truncate_with_ellipsis(format!("中中").span(), 4) == 6)
+    assert(width(format!(super::ELLIPSIS).span()) == 1)
+}
+
+// The lines of `text` wrapped to `width`, as "start-end:width " each.
+fn wrapped(_ text: MemBuffer, _ width: usize, _ mode: WrapMode) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for line in text.span().by(Wrap::new(width, mode)) {
+        write!(mut out, line.start, "-", line.end, ":", line.width, " ")
+    }
+    out
+}
+
+// The lines of `text` wrapped to `width`, each followed by "|".
+fn lines(_ text: MemBuffer, _ width: usize, _ mode: WrapMode) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for line in text.span().by(Wrap::new(width, mode)) {
+        out.extend_from(
+            text.span().slice(offset: line.start, len: line.end - line.start),
+        )
+        out.push(b'|')
+    }
+    out
+}
+
+#[test]
+fn wraps_words() {
+    let word = WrapMode::Word
+    assert(lines(format!("hello world"), 7, word) == "hello|world|")
+    assert(
+        wrapped(format!("hello world"), 7, word) == "0-5:5 6-11:5 ",
+    )
+    assert(lines(format!("hello world"), 11, word) == "hello world|")
+    assert(lines(format!("a b c d e f"), 3, word) == "a b|c d|e f|")
+    assert(
+        lines(format!("one two   three"), 7, word) == "one two|three|",
+    )
+    assert(lines(format!("foo-bar baz"), 6, word) == "foo-|bar|baz|")
+    assert(lines(format!("--flag"), 3, word) == "--f|lag|")
+    assert(lines(format!("abcdefghij"), 4, word) == "abcd|efgh|ij|")
+    assert(
+        lines(format!("  indented text"), 10, word) == "  indented|text|",
+    )
+    assert(lines(format!("abc     \nxyz"), 4, word) == "abc|xyz|")
+    assert(lines(format!("trailing  "), 20, word) == "trailing  |")
+}
+
+#[test]
+fn wraps_characters() {
+    let char = WrapMode::Char
+    assert(lines(format!("hello world"), 7, char) == "hello w|orld|")
+    assert(lines(format!("abc  def"), 4, char) == "abc | def|")
+    assert(lines(format!("abcd中"), 5, char) == "abcd|中|")
+    assert(wrapped(format!("中中中"), 5, char) == "0-6:4 6-9:2 ")
+}
+
+#[test]
+fn wraps_at_line_breaks() {
+    let word = WrapMode::Word
+    assert(lines(MemBuffer::empty(), 5, word) == "")
+    assert(lines(format!("\n"), 5, word) == "|")
+    assert(lines(format!("a\n"), 5, word) == "a|")
+    assert(lines(format!("a\n\nb"), 5, word) == "a||b|")
+    assert(lines(format!("a\r\nb\r\n"), 5, WrapMode::Char) == "a|b|")
+    assert(lines(format!("ab cd\nef"), 3, word) == "ab|cd|ef|")
+}
+
+#[test]
+fn wraps_to_narrow_widths() {
+    // A line holds at least one cluster.
+    assert(lines(format!("ab"), 0, WrapMode::Word) == "a|b|")
+    assert(
+        wrapped(format!("中a"), 1, WrapMode::Char) == "0-3:2 3-4:1 ",
+    )
+    // Tabs take one column.
+    assert(wrapped(format!("a\tb"), 10, WrapMode::Word) == "0-3:3 ")
+    assert(lines(format!("a\tb"), 2, WrapMode::Word) == "a|b|")
+    // A space with a mark is no blank.
+    let marked = utf8([0x61, 0x20, 0x301, 0x62])
+    assert(wrapped(marked, 2, WrapMode::Word) == "0-4:2 4-5:1 ")
+}
+
+// A deterministic generator: xorshift64.
+fn random(_ state: mut u64) -> u64 {
+    state ^= state << 13
+    state ^= state >> 7
+    state ^= state << 17
+    state
+}
+
+// Random text of `pieces` pieces, likely to wrap in interesting places.
+fn random_text(_ state: mut u64, _ pieces: usize) -> MemBuffer {
+    var out = MemBuffer::empty()
+    var i: usize = 0
+    while i < pieces {
+        let pick = random(mut state) % 20
+        if pick < 6 {
+            out.push(b'a' + pick.downcast_truncate())
+        } else if pick < 9 {
+            out.push(b' ')
+        } else if pick == 9 {
+            out.push(b'\t')
+        } else if pick == 10 {
+            out.push(b'\n')
+        } else if pick == 11 {
+            out.push(b'-')
+        } else if pick == 12 {
+            encode(0x4e2d, mut out)
+        } else if pick == 13 {
+            encode(0x65, mut out)
+            encode(0x301, mut out)
+        } else if pick == 14 {
+            encode(0x1f44d, mut out)
+            encode(0x1f3fd, mut out)
+        } else if pick == 15 {
+            encode(0x1f1fa, mut out)
+        } else if pick == 16 {
+            out.push(b'\r')
+            out.push(b'\n')
+        } else if pick == 17 {
+            out.push(0xff)
+        } else if pick == 18 {
+            encode(0x200d, mut out)
+        } else {
+            encode(0x301, mut out)
+        }
+        i += 1
+    }
+    out
+}
+
+// Whether the bytes `from..to` of `text` may be dropped: line breaks, and
+// in `Word` spaces and tabs too.
+fn droppable(_ text: MemSpan, from: usize, to: usize, _ word: bool) -> bool {
+    var i = from
+    while i < to {
+        let b = text[i]
+        if b != b'\n' && b != b'\r' && !(word && (b == b' ' || b == b'\t')) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// Whether `line` is whole clusters of `text` whose width it gives.
+fn measures(_ text: MemSpan, _ line: WrappedLine) -> bool {
+    var offset = line.start
+    var columns: usize = 0
+    while offset < line.end {
+        let c = next_cluster(text, offset)
+        if text[offset] == b'\n' {
+            return false
+        }
+        columns += if text[offset] == b'\t' {
+            1
+        } else {
+            c.width as usize
+        }
+        offset += c.len
+    }
+    offset == line.end && columns == line.width
+}
+
+#[test]
+fn wrapping_keeps_every_byte_and_the_width() {
+    var state: u64 = 0x9e3779b97f4a7c15
+    var round: usize = 0
+    while round < 300 {
+        let pieces: usize = (random(mut state) % 40).downcast_truncate()
+        let text = random_text(mut state, pieces)
+        let span = text.span()
+        let width: usize = (random(mut state) % 12).downcast_truncate()
+        for mode in [WrapMode::Char, WrapMode::Word] {
+            let word = mode == WrapMode::Word
+            var covered: usize = 0
+            for line in span.by(Wrap::new(width, mode)) {
+                assert(line.start >= covered && line.end >= line.start)
+                assert(droppable(span, from: covered, to: line.start, word))
+                assert(measures(span, line))
+                assert(width < 2 || line.width <= width)
+                covered = line.end
+            }
+            assert(droppable(span, from: covered, to: span.len(), word))
+        }
+        round += 1
+    }
+}
+
+#[test]
+fn lines_merge_runs_of_one_style() {
+    let red = Style::new().fg(Color::RED)
+    var line = Line::new()
+    assert(
+        line.is_empty() && line.run_count() == 0 && line.width() == 0,
+    )
+    line.push("ab", red)
+    line.push("c", red)
+    line.push("", Style::NONE)
+    let number: u32 = 42
+    line.push(number, Style::NONE)
+    line.push("中", red)
+    assert(
+        line.text() == "abc42中" && line.len() == 8 && line.width() == 7,
+    )
+    assert(line.run_count() == 3)
+    var runs = MemBuffer::empty()
+    for run in line {
+        write!(
+            mut runs,
+            run.start,
+            "-",
+            run.end,
+            if run.style == red { "r " } else { "n " },
+        )
+    }
+    assert(runs == "0-3r 3-5n 5-8r ")
+    assert(format!(line) == "abc42中")
+    line.clear()
+    assert(line.is_empty() && line.run_count() == 0)
+    line.push("x", red)
+    assert(line.run(0).end == 1)
+}
+
+#[test]
+fn lines_from_values() {
+    let line = Line::from("plain")
+    assert(line.run_count() == 1 && line.run(0).style == Style::NONE)
+    assert(Line::from(MemBuffer::empty()).run_count() == 0)
+    let seven: u8 = 7
+    let bold = Line::styled(seven, Style::new().bold())
+    assert(
+        bold.text() == "7" && bold.run(0).style == Style::new().bold(),
+    )
+}
+
+#[test]
+fn texts_split_into_lines() {
+    let text = Text::from("a\nbc\r\n\n中文d")
+    assert(text.height() == 4 && text.width() == 5)
+    assert(
+        text.lines()[1].text() == "bc" && text.lines()[2].is_empty(),
+    )
+    assert(Text::from("").height() == 0)
+    assert(Text::from("a\n").height() == 1)
+    var built = Text::new()
+    built.push_line(Line::from("xyz"))
+    assert(built.height() == 1 && built.width() == 3)
+    built.clear()
+    assert(built.height() == 0 && built.width() == 0)
+}
+
+#[test]
+fn alignments_place_content() {
+    assert(Alignment::Left.offset(width: 3, available: 10) == 0)
+    assert(Alignment::Center.offset(width: 3, available: 10) == 3)
+    assert(Alignment::Right.offset(width: 3, available: 10) == 7)
+    assert(Alignment::Right.offset(width: 12, available: 10) == 0)
+    assert(Alignment::Center.offset(width: 0, available: 0) == 0)
+}

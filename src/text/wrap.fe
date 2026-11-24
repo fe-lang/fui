@@ -1,0 +1,189 @@
+//! Wrapping text to a width, as byte ranges of the text.
+use core::MemSpan
+use core::iter::Producer
+use core::ops::Eq
+use super::next_cluster
+
+/// Where `Wrap` breaks a line that is too wide.
+pub enum WrapMode {
+    /// After the last cluster that fits. Every byte other than the line
+    /// breaks belongs to a line.
+    Char,
+    /// At the last space or tab before the overflow, or after a hyphen
+    /// inside a word (after a cluster other than a space, tab or hyphen);
+    /// a word wider than the line breaks as in `Char`. The spaces and tabs at a break are dropped: the line ends
+    /// before them and the next one starts after them.
+    Word,
+}
+
+impl Copy for WrapMode {}
+
+impl Eq for WrapMode {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (WrapMode::Char, WrapMode::Char) => true,
+            (WrapMode::Word, WrapMode::Word) => true,
+            _ => false,
+        }
+    }
+}
+
+/// A line of wrapped text: the bytes `start..end` of the text, and the
+/// columns they take.
+pub struct WrappedLine { pub start: usize, pub end: usize, pub width: usize }
+
+impl Copy for WrappedLine {}
+
+impl Eq for WrappedLine {
+    fn eq(self, _ other: Self) -> bool {
+        self.start == other.start && self.end == other.end && self.width == other.width
+    }
+}
+
+/// The lines of a text wrapped to `width` columns, a producer over the
+/// text's bytes: `for line in text.by(Wrap::new(width: 20, mode:
+/// WrapMode::Word))`. The lines are ranges of the text, so wrapping
+/// allocates nothing.
+///
+/// Lines end at each LF and CR LF, which belong to no line, as
+/// `str::lines` reads them: an empty text has no lines and a final line
+/// break starts none. A line breaks before a cluster that would make it
+/// wider than `width`, so no line is wider unless one cluster is: a line
+/// holds at least one cluster, so a wide cluster at width 1 overflows it,
+/// and at width 0 each cluster takes a line. A cluster is never split.
+///
+/// A tab takes one column, as a space does, and breaks words as one; to
+/// expand tabs to stops, replace them before wrapping. Other controls take
+/// none.
+pub struct Wrap { width: usize, mode: WrapMode }
+
+impl Copy for Wrap {}
+
+impl Wrap {
+    pub fn new(width: usize, mode: WrapMode) -> Self {
+        Wrap { width, mode }
+    }
+
+    // The line from byte `from`, after spaces and tabs if `trim` (a line a
+    // word wrap continues), and where the next one starts.
+    fn layout(self, _ text: MemSpan, _ from: usize, _ trim: bool) -> WrapState {
+        let len = text.len()
+        var start = from
+        if trim {
+            while start < len && is_blank(text[start]) && next_cluster(text, start).len == 1 {
+                start += 1
+            }
+            // The dropped spaces end the line they would have ended.
+            if start < len && text[start] == b'\n' {
+                start += 1
+            } else if start + 1 < len && text[start] == b'\r' && text[start + 1] == b'\n' {
+                start += 2
+            }
+        }
+        if start >= len {
+            return WrapState {
+                line: WrappedLine { start, end: start, width: 0 },
+                next: start,
+                trim: false,
+                more: false,
+            }
+        }
+        let word = self.mode == WrapMode::Word
+        var offset = start
+        var columns: usize = 0
+        // The end and width of the line up to its last cluster other than
+        // a space or tab.
+        var content_end = start
+        var content_width: usize = 0
+        // The last word break: the line would end at `break_end`.
+        var break_end = start
+        var break_width: usize = 0
+        var after_letter = false
+        while offset < len {
+            let cluster = next_cluster(text, offset)
+            let byte = text[offset]
+            if byte == b'\n' || (byte == b'\r' && cluster.len == 2) {
+                return wrapped(
+                    start,
+                    offset,
+                    columns,
+                    next: offset + cluster.len,
+                    trim: false,
+                )
+            }
+            let blank = cluster.len == 1 && is_blank(byte)
+            let cluster_width: usize = if byte == b'\t' {
+                1
+            } else {
+                cluster.width as usize
+            }
+            if columns + cluster_width > self.width && offset > start {
+                if word && blank {
+                    return wrapped(
+                        start,
+                        content_end,
+                        content_width,
+                        next: offset,
+                        trim: true,
+                    )
+                }
+                if word && break_end > start {
+                    return wrapped(start, break_end, break_width, next: break_end, trim: true)
+                }
+                return wrapped(start, offset, columns, next: offset, trim: false)
+            }
+            offset += cluster.len
+            columns += cluster_width
+            if blank {
+                break_end = content_end
+                break_width = content_width
+                after_letter = false
+            } else {
+                if byte == b'-' && after_letter {
+                    break_end = offset
+                    break_width = columns
+                }
+                content_end = offset
+                content_width = columns
+                after_letter = byte != b'-'
+            }
+        }
+        wrapped(start, len, columns, next: len, trim: false)
+    }
+}
+
+// A space or a tab, which is a blank when no mark joins it.
+fn is_blank(_ byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+fn wrapped(_ start: usize, _ end: usize, _ width: usize, next: usize, trim: bool) -> WrapState {
+    WrapState { line: WrappedLine { start, end, width }, next, trim, more: true }
+}
+
+/// Where a `Wrap` is in a text: a line, and where the next one starts.
+pub struct WrapState { line: WrappedLine, next: usize, trim: bool, more: bool }
+
+impl Copy for WrapState {}
+
+impl Producer for Wrap {
+    type Base = MemSpan
+    type State = WrapState
+    type Out = WrappedLine
+
+    fn start(self, _ base: MemSpan) -> WrapState {
+        self.layout(base, 0, false)
+    }
+
+    fn has(self, _ base: MemSpan, _ s: WrapState) -> bool {
+        s.more
+    }
+
+    fn next(self, _ base: MemSpan, _ s: WrapState) -> WrapState {
+        self.layout(base, s.next, s.trim)
+    }
+
+    fn produce(mut self, _ base: MemSpan, _ s: WrapState) -> WrappedLine {
+        s.line
+    }
+}

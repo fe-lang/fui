@@ -1,6 +1,208 @@
 //! Text as terminals show it: UTF-8 scalars, grapheme clusters and the
-//! columns they take.
-use core::MemSpan
+//! columns they take, cutting and wrapping text to a width, and styled
+//! lines.
+//!
+//! Text is UTF-8 bytes, and offsets count bytes. Invalid UTF-8 never stops
+//! a reader: each maximal invalid subpart decodes as U+FFFD, one column
+//! wide, so garbage costs a replacement character and never the bytes
+//! after it.
+//!
+//! Widths and clusters follow the Unicode tables of `UNICODE_VERSION`.
+//! Clusters are the extended grapheme clusters of UAX #29. A cluster takes
+//! the columns of its first scalar that takes any, or 2 for an emoji
+//! sequence or a flag: never the sum of its scalars' widths.
+use core::{MemBuffer, MemSpan}
+use tables::PROPERTIES
+
+pub use styled::{Alignment, Line, Run, Text}
+pub use tables::UNICODE_VERSION
+pub use wrap::{Wrap, WrapMode, WrapState, WrappedLine}
+
+/// U+FFFD, which stands for invalid UTF-8.
+pub const REPLACEMENT_CHARACTER: u32 = 0xfffd
+
+/// "…", which `truncate_with_ellipsis` leaves a column for.
+pub const ELLIPSIS: String<3> = "…"
+
+const VS16: u32 = 0xfe0f
+
+/// A Unicode scalar decoded from UTF-8, and the bytes it took.
+pub struct Scalar {
+    pub value: u32,
+    /// Its bytes: 1 to 4.
+    pub len: usize,
+}
+
+impl Copy for Scalar {}
+
+/// The scalar of `text` at byte `offset`, which must be less than
+/// `text.len()`. An invalid or truncated sequence decodes as U+FFFD and
+/// takes its maximal subpart: the longest prefix of a valid sequence, or
+/// one byte. Overlong forms, surrogates and values above U+10FFFF are
+/// invalid.
+pub fn decode(_ text: MemSpan, _ offset: usize) -> Scalar {
+    let lead = text[offset] as u32
+    if lead < 0x80 {
+        return Scalar { value: lead, len: 1 }
+    }
+    if lead < 0xc2 || lead > 0xf4 {
+        return Scalar { value: REPLACEMENT_CHARACTER, len: 1 }
+    }
+    // The length, and the range of the second byte that keeps the form
+    // shortest and within the scalars (Unicode table 3-7).
+    let len: u32 = if lead < 0xe0 {
+        2
+    } else if lead < 0xf0 { 3 } else { 4 }
+    let low: u32 = if lead == 0xe0 {
+        0xa0
+    } else if lead == 0xf0 { 0x90 } else { 0x80 }
+    let high: u32 = if lead == 0xed {
+        0x9f
+    } else if lead == 0xf4 { 0x8f } else { 0xbf }
+    var value = lead & (0x7f >> len)
+    var i: usize = 1
+    while i < len as usize {
+        if offset + i >= text.len() {
+            return Scalar { value: REPLACEMENT_CHARACTER, len: i }
+        }
+        let byte = text[offset + i] as u32
+        let (min, max) = if i == 1 { (low, high) } else { (0x80, 0xbf) }
+        if byte < min || byte > max {
+            return Scalar { value: REPLACEMENT_CHARACTER, len: i }
+        }
+        value = value << 6 | byte & 0x3f
+        i += 1
+    }
+    Scalar { value, len: len as usize }
+}
+
+/// Whether `value` is a Unicode scalar: at most U+10FFFF and no surrogate.
+pub fn is_scalar(_ value: u32) -> bool {
+    value < 0xd800 || (value > 0xdfff && value <= 0x10ffff)
+}
+
+/// Appends the UTF-8 of the scalar `value` to `out`, or of U+FFFD if
+/// `value` is no scalar.
+pub fn encode(_ value: u32, _ out: mut MemBuffer) {
+    let c = if is_scalar(value) {
+        value
+    } else {
+        REPLACEMENT_CHARACTER
+    }
+    if c < 0x80 {
+        out.push(c.downcast_truncate())
+        return
+    }
+    let len: u32 = if c < 0x800 {
+        2
+    } else if c < 0x10000 { 3 } else { 4 }
+    // The lead byte: `len` high bits set, then the scalar's top bits.
+    var shift = 6 * (len - 1)
+    out.push(((0xff00 >> len) & 0xff | c >> shift).downcast_truncate())
+    while shift > 0 {
+        shift -= 6
+        out.push((0x80 | c >> shift & 0x3f).downcast_truncate())
+    }
+}
+
+/// The length of the longest prefix of `text` that is valid UTF-8: all of
+/// it when it is valid.
+pub fn valid_up_to(_ text: MemSpan) -> usize {
+    var offset: usize = 0
+    while offset < text.len() {
+        let scalar = decode(text, offset)
+        // U+FFFD itself is three bytes from EF; a replaced subpart starts
+        // with another byte or is shorter.
+        if scalar.value == REPLACEMENT_CHARACTER && (scalar.len != 3 || text[offset] != 0xef) {
+            return offset
+        }
+        offset += scalar.len
+    }
+    offset
+}
+
+/// Whether `text` is valid UTF-8.
+pub fn is_valid(_ text: MemSpan) -> bool {
+    valid_up_to(text) == text.len()
+}
+
+/// Whether `value` is a C0 or C1 control, or DEL.
+pub fn is_control(_ value: u32) -> bool {
+    value < 0x20 || (value >= 0x7f && value < 0xa0)
+}
+
+/// The columns the scalar `value` takes alone: 0 for controls, combining
+/// marks, format characters such as ZWJ and the variation selectors, and
+/// Hangul medial vowels and final consonants; 2 for East Asian Wide and
+/// Fullwidth scalars, which include the emoji of default emoji
+/// presentation; 1 for the rest, including U+FFFD and unassigned scalars
+/// outside the wide planes.
+pub fn scalar_width(_ value: u32) -> u8 {
+    if value < 0x7f {
+        return if value < 0x20 { 0 } else { 1 }
+    }
+    (lookup(value) & 3).downcast_truncate()
+}
+
+// The properties of a scalar, as `tables::PROPERTIES` packs them.
+fn lookup(_ value: u32) -> u32 {
+    // The number of entries that start at or before `value`.
+    var low: usize = 0
+    var high: usize = PROPERTIES.len()
+    while low < high {
+        let mid = (low + high) / 2
+        if PROPERTIES[mid] >> 40 <= value as u64 {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+    if low > 0 {
+        let entry = PROPERTIES[low - 1]
+        if (entry >> 16 & 0xffffff) >= value as u64 {
+            return (entry & 0xffff).downcast_truncate()
+        }
+    }
+    DEFAULT_PROPERTIES
+}
+
+const DEFAULT_PROPERTIES: u32 = 1
+const PICTOGRAPHIC: u32 = 0x40
+const VARIATION_BASE: u32 = 0x200
+
+// The grapheme break property values of UAX #29.
+const GB_CR: u32 = 1
+const GB_LF: u32 = 2
+const GB_CONTROL: u32 = 3
+const GB_EXTEND: u32 = 4
+const GB_ZWJ: u32 = 5
+const GB_REGIONAL_INDICATOR: u32 = 6
+const GB_PREPEND: u32 = 7
+const GB_SPACING_MARK: u32 = 8
+const GB_L: u32 = 9
+const GB_V: u32 = 10
+const GB_T: u32 = 11
+const GB_LV: u32 = 12
+const GB_LVT: u32 = 13
+
+// The Indic_Conjunct_Break values.
+const INCB_CONSONANT: u32 = 1
+const INCB_LINKER: u32 = 2
+const INCB_EXTEND: u32 = 3
+
+fn grapheme_break(_ value: u32, _ properties: u32) -> u32 {
+    let kind = properties >> 2 & 0xf
+    // The table gives all Hangul syllables LV; the LV ones are every 28th.
+    if kind == GB_LV && (value - 0xac00) % 28 != 0 {
+        GB_LVT
+    } else {
+        kind
+    }
+}
+
+fn is_emoji_modifier(_ value: u32) -> bool {
+    value >= 0x1f3fb && value <= 0x1f3ff
+}
 
 /// A grapheme cluster at the start of some text: what a terminal shows in
 /// one place, such as a letter with its combining marks or an emoji sequence.
@@ -13,20 +215,131 @@ pub struct Cluster {
 
 impl Copy for Cluster {}
 
+// What the rules of UAX #29 that look further back than one scalar know of
+// the cluster so far.
+struct Context {
+    // GB11: 1 after Extended_Pictographic Extend*, 2 after that and a ZWJ.
+    pictographic: u8,
+    // GB12 and GB13: the regional indicators just before.
+    regional: usize,
+    // GB9c: 1 after an InCB consonant and InCB extenders, 2 after one with
+    // a linker among them.
+    conjunct: u8,
+}
+
+impl Copy for Context {}
+
+impl Context {
+    fn after(self, _ kind: u32, _ properties: u32) -> Context {
+        let incb = properties >> 7 & 3
+        Context {
+            pictographic: if properties & PICTOGRAPHIC != 0 {
+                1
+            } else if self.pictographic == 1 && kind == GB_EXTEND {
+                1
+            } else if self.pictographic == 1 && kind == GB_ZWJ {
+                2
+            } else {
+                0
+            },
+            regional: if kind == GB_REGIONAL_INDICATOR {
+                self.regional + 1
+            } else {
+                0
+            },
+            conjunct: if incb == INCB_CONSONANT {
+                1
+            } else if self.conjunct != 0 && incb == INCB_LINKER {
+                2
+            } else if self.conjunct != 0 && incb == INCB_EXTEND {
+                self.conjunct
+            } else {
+                0
+            },
+        }
+    }
+
+    // Whether a scalar of `next` and `properties` continues a cluster whose
+    // last scalar is of `previous`.
+    fn joins(self, _ previous: u32, _ next: u32, _ properties: u32) -> bool {
+        if previous == GB_CR {
+            return next == GB_LF
+        }
+        if previous == GB_LF
+            || previous == GB_CONTROL
+            || next == GB_CR
+            || next == GB_LF
+            || next == GB_CONTROL {
+            return false
+        }
+        if previous == GB_L && (next == GB_L || next == GB_V || next == GB_LV || next == GB_LVT) {
+            return true
+        }
+        if (previous == GB_LV || previous == GB_V) && (next == GB_V || next == GB_T) {
+            return true
+        }
+        if (previous == GB_LVT || previous == GB_T) && next == GB_T {
+            return true
+        }
+        if next == GB_EXTEND
+            || next == GB_ZWJ
+            || next == GB_SPACING_MARK
+            || previous == GB_PREPEND {
+            return true
+        }
+        if self.conjunct == 2 && properties >> 7 & 3 == INCB_CONSONANT {
+            return true
+        }
+        if self.pictographic == 2 && properties & PICTOGRAPHIC != 0 {
+            return true
+        }
+        previous == GB_REGIONAL_INDICATOR && next == GB_REGIONAL_INDICATOR && self.regional % 2 == 1
+    }
+}
+
 /// The cluster of `text` that starts at byte `offset`, which must be less
-/// than `text.len()`. Invalid UTF-8 is one cluster per byte, of width 1.
+/// than `text.len()`: an extended grapheme cluster of UAX #29.
+///
+/// Its width is that of its first scalar that takes columns, so combining
+/// and spacing marks, joined emoji and conjuncts add none, except that it
+/// is 2 for a flag (a pair of regional indicators), for an emoji ZWJ
+/// sequence, for an emoji with a modifier, and for a narrow emoji with
+/// U+FE0F after it. A control, and a format character UAX #29 counts as
+/// one such as U+200B, is a cluster alone; so is CR LF.
 pub fn next_cluster(_ text: MemSpan, _ offset: usize) -> Cluster {
-    // Placeholder: one scalar per cluster, each of width 1.
-    let lead = text[offset]
-    let len: usize = if lead < 0x80 {
-        1
-    } else if lead >= 0xf0 {
-        4
-    } else if lead >= 0xe0 {
-        3
-    } else if lead >= 0xc0 { 2 } else { 1 }
-    let rest = text.len() - offset
-    Cluster { len: if len > rest { 1 } else { len }, width: 1 }
+    let len = text.len()
+    let first = decode(text, offset)
+    var end = offset + first.len
+    // ASCII before ASCII, other than CR: the common case, which joins
+    // nothing.
+    if first.value < 0x80 && first.value != 0x0d && (end == len || text[end] < 0x80) {
+        return Cluster { len: 1, width: scalar_width(first.value) }
+    }
+    var properties = lookup(first.value)
+    var kind = grapheme_break(first.value, properties)
+    var width = properties & 3
+    var context = Context { pictographic: 0, regional: 0, conjunct: 0 }.after(kind, properties)
+    while end < len {
+        let scalar = decode(text, end)
+        let next = lookup(scalar.value)
+        let next_kind = grapheme_break(scalar.value, next)
+        if !context.joins(kind, next_kind, next) {
+            break
+        }
+        if width == 0 {
+            width = next & 3
+        }
+        let emoji = (scalar.value == VS16 && properties & VARIATION_BASE != 0)
+            || (is_emoji_modifier(scalar.value) && context.pictographic == 1)
+            || (context.pictographic == 2 && next & PICTOGRAPHIC != 0)
+            || next_kind == GB_REGIONAL_INDICATOR
+        if emoji { width = 2 }
+        context = context.after(next_kind, next)
+        properties = next
+        kind = next_kind
+        end += scalar.len
+    }
+    Cluster { len: end - offset, width: width.downcast_truncate() }
 }
 
 /// The columns `text` takes.
@@ -41,7 +354,46 @@ pub fn width(_ text: MemSpan) -> usize {
     columns
 }
 
-#[test]
-fn ascii_takes_one_column_a_byte() {
-    assert(width(format!("hello").span()) == 5)
+/// The longest prefix of whole clusters of `text` that takes at most
+/// `column` columns, as its byte length and its width. Zero-width clusters
+/// at the cut belong to it. The width is `column` unless the text ends
+/// first, or `column - 1` when a wide cluster covers columns `column - 1`
+/// and `column`.
+///
+/// So the cluster under a column starts at the offset, which places a
+/// cursor, and the text from the offset starts at the returned column,
+/// which scrolls text horizontally: one less than asked means a wide
+/// cluster is cut in half.
+pub fn column_offset(_ text: MemSpan, _ column: usize) -> (usize, usize) {
+    var columns: usize = 0
+    var offset: usize = 0
+    while offset < text.len() {
+        let cluster = next_cluster(text, offset)
+        if columns + cluster.width as usize > column {
+            break
+        }
+        columns += cluster.width as usize
+        offset += cluster.len
+    }
+    (offset, columns)
+}
+
+/// The byte length of the longest prefix of whole clusters of `text` that
+/// fits in `max_width` columns.
+pub fn truncate(_ text: MemSpan, _ max_width: usize) -> usize {
+    let (len, _) = column_offset(text, max_width)
+    len
+}
+
+/// The byte length of the prefix of `text` to show in `max_width` columns:
+/// all of it if it fits, else the longest prefix of whole clusters that
+/// leaves a column for `ELLIPSIS` after it. A result shorter than
+/// `text.len()` asks for the ellipsis, except with no columns, where the
+/// result is 0 and nothing fits.
+pub fn truncate_with_ellipsis(_ text: MemSpan, _ max_width: usize) -> usize {
+    let len = truncate(text, max_width)
+    if len == text.len() || max_width == 0 {
+        return len
+    }
+    truncate(text, max_width - 1)
 }
