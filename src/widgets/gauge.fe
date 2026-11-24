@@ -1,0 +1,488 @@
+//! Progress as a bar.
+use std::io::Display
+use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::geom::{Pos, Rect, min}
+use ingot::style::{Color, Modifier, Style}
+use super::{Alignment, clamp_u16, drawn, drawn_text, measure}
+
+/// A bar that fills its area as far as `done` is of `total`, with a label
+/// in the middle:
+///
+/// ```fe
+/// fn view(_ area: Rect, _ copied: u64, _ size: u64) uses (frame: mut Frame) {
+///     Gauge::new().render(area, done: copied, total: size)
+/// }
+/// ```
+///
+/// The bar fills whole cells with `█` and the cell where it ends with one
+/// of `▏▎▍▌▋▊▉`, so it moves an eighth of a cell at a time. A `total` of 0
+/// fills nothing, and a `done` past `total` fills all. The label is the
+/// percent done unless given; its cells over the filled part, including
+/// the cell where it ends if at least half filled, show in reverse video.
+///
+/// The bar takes the theme's `accent` style, over every cell of the area,
+/// and the label the `text` style over the bar's. Styles set on the gauge
+/// apply over the theme's.
+pub struct Gauge { style: Style, label_style: Style }
+
+impl Copy for Gauge {}
+
+impl Gauge {
+    pub fn new() -> Self {
+        Gauge { style: Style::NONE, label_style: Style::NONE }
+    }
+
+    /// The style for the bar, over the theme's `accent` style.
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
+    }
+
+    /// The style for the label, over the theme's `text` style.
+    pub fn label_style(var own self, _ style: Style) -> Self {
+        self.label_style = style
+        self
+    }
+
+    /// Draws the gauge over `area` with the percent done as its label.
+    pub fn render(self, _ area: Rect, done: u64, total: u64) uses (frame: mut Frame) {
+        self.render_labeled(area, done, total, label: percent(done, total))
+    }
+
+    /// Draws the gauge over `area` with the `Display` text of `label` in the
+    /// middle; an empty one shows the bar alone.
+    pub fn render_labeled<T: Display>(self, _ area: Rect, done: u64, total: u64, label: T)
+    uses (frame: mut Frame)
+    {
+        if area.is_empty() { return }
+        let bar = theme().accent.patch(self.style)
+        let eighths = filled(area.width, done, total, parts: 8)
+        let full: u16 = (eighths / 8).downcast_truncate()
+        let (solid, rest) = area.split_left(full)
+        fill(solid, "█", bar)
+        let eighth: usize = (eighths % 8).downcast_truncate()
+        let (edge, rest) = rest.split_left((eighth > 0) as u16)
+        fill(edge, EIGHTHS[eighth], bar)
+        fill(rest, " ", bar)
+
+        var scratch = MemBuffer::empty()
+        let width = measure(label, mut scratch)
+        let x = area.x + clamp_u16(
+                Alignment::Center.offset(width, available: area.width as usize),
+            )
+        let y = area.y + (area.height - 1) / 2
+        let room = Rect { x, y, width: min(clamp_u16(width), area.right() - x), height: 1 }
+        print_in(room, scratch.span(), theme().text.patch(self.label_style))
+        let covered = full + (eighth >= 4) as u16
+        let (inverted, _) = room.split_left(covered.saturating_sub(x - area.x))
+        frame.set_style(inverted, Style::new().reversed())
+    }
+}
+
+/// A progress line on the top row of its area: a label, then a line of `━`
+/// whose part as far as `done` is of `total` is drawn in one style and the
+/// rest in another:
+///
+/// ```fe
+/// fn view(_ area: Rect, _ copied: u64, _ size: u64) uses (frame: mut Frame) {
+///     LineGauge::new().render(area, done: copied, total: size)
+/// }
+/// ```
+///
+/// The line takes whole cells. A `total` of 0 fills none of it, and a
+/// `done` past `total` fills all. The label is the percent done unless
+/// given, and a space stands between it and the line. The filled part
+/// takes the theme's `accent` style, the rest its `muted` style and the
+/// label its `text` style, each with the gauge's own style for it over it.
+pub struct LineGauge { filled_style: Style, unfilled_style: Style, label_style: Style }
+
+impl Copy for LineGauge {}
+
+impl LineGauge {
+    pub fn new() -> Self {
+        LineGauge {
+            filled_style: Style::NONE,
+            unfilled_style: Style::NONE,
+            label_style: Style::NONE,
+        }
+    }
+
+    /// The style for the filled part, over the theme's `accent` style.
+    pub fn filled_style(var own self, _ style: Style) -> Self {
+        self.filled_style = style
+        self
+    }
+
+    /// The style for the rest of the line, over the theme's `muted` style.
+    pub fn unfilled_style(var own self, _ style: Style) -> Self {
+        self.unfilled_style = style
+        self
+    }
+
+    /// The style for the label, over the theme's `text` style.
+    pub fn label_style(var own self, _ style: Style) -> Self {
+        self.label_style = style
+        self
+    }
+
+    /// Draws the line on the top row of `area`, after the percent done.
+    pub fn render(self, _ area: Rect, done: u64, total: u64) uses (frame: mut Frame) {
+        self.render_labeled(area, done, total, label: percent(done, total))
+    }
+
+    /// Draws the line on the top row of `area`, after the `Display` text of
+    /// `label`; an empty one leaves the whole row to the line.
+    pub fn render_labeled<T: Display>(self, _ area: Rect, done: u64, total: u64, label: T)
+    uses (frame: mut Frame)
+    {
+        let (row, _) = area.split_top(1)
+        var scratch = MemBuffer::empty()
+        let width = measure(label, mut scratch)
+        let (head, line) = row.split_left(clamp_u16(if width > 0 { width + 1 } else { 0 }))
+        print_in(head, scratch.span(), theme().text.patch(self.label_style))
+        let (filled_part, rest) = line
+            .split_left(
+                filled(line.width, done, total, parts: 1).downcast_truncate(),
+            )
+        fill(filled_part, "━", theme().accent.patch(self.filled_style))
+        fill(rest, "━", theme().muted.patch(self.unfilled_style))
+    }
+}
+
+// The eighths of a cell, from none to all.
+const EIGHTHS: [String<3>; 8] = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+
+// The parts of `cells` cells, each in `parts`, that `done` of `total` fill.
+fn filled(_ cells: u16, _ done: u64, _ total: u64, parts: u64) -> u64 {
+    let all = cells as u64 * parts
+    if done >= total {
+        return if total == 0 { 0 } else { all }
+    }
+    (all as u128 * done as u128 / total as u128).downcast_truncate()
+}
+
+// The percent `done` is of `total`, rounded down, at most 100.
+fn percent(_ done: u64, _ total: u64) -> Percent {
+    Percent { value: filled(1, done, total, parts: 100) }
+}
+
+// A percentage, shown as `42%`.
+struct Percent { value: u64 }
+
+impl Copy for Percent {}
+
+impl Display for Percent {
+    fn fmt(self, _ out: mut MemBuffer) {
+        self.value.fmt(mut out)
+        out.push(b'%')
+    }
+}
+
+#[test]
+fn bars_move_by_eighths() {
+    for (i, done) in [0 as u64, 1, 2, 3, 4, 5, 6, 7, 8].enumerate() {
+        assert(
+            drawn_text(
+                    width: 1,
+                    height: 1,
+                    |frame, area| {
+                        with (frame) {
+                            Gauge::new().render_labeled(area, done, total: 8, label: "")
+                        }
+                    },
+                )
+                == ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"][i],
+        )
+    }
+    let text = drawn_text(
+        width: 4,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render_labeled(area, done: 13, total: 32, label: "")
+            }
+        },
+    )
+    assert(text == "█▋\n█▋")
+    // Rounded down: 9.6 eighths fill one cell and an eighth.
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render_labeled(area, done: 3, total: 10, label: "")
+            }
+        },
+    )
+    assert(text == "█▏")
+}
+
+#[test]
+fn bars_fill_nothing_of_nothing_and_all_past_the_total() {
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render(area, done: 5, total: 0)
+            }
+        },
+    )
+    assert(text == " 0%")
+    let text = drawn_text(
+        width: 6,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render(area, done: 7, total: 5)
+            }
+        },
+    )
+    assert(text == "█100%█")
+    let text = drawn_text(
+        width: 3,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new()
+                    .render_labeled(
+                        area,
+                        done: 18446744073709551615,
+                        total: 18446744073709551614,
+                        label: "",
+                    )
+            }
+        },
+    )
+    assert(text == "███")
+    let text = drawn_text(
+        width: 3,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new()
+                    .render_labeled(
+                        area,
+                        done: 18446744073709551614,
+                        total: 18446744073709551615,
+                        label: "",
+                    )
+            }
+        },
+    )
+    assert(text == "██▉")
+}
+
+#[test]
+fn labels_center_and_invert_over_the_bar() {
+    let buffer = drawn(
+        width: 10,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render(area, done: 1, total: 2)
+            }
+        },
+    )
+    assert(buffer.to_text() == "█████\n███50%\n█████")
+    for x in [3, 4] {
+        let cell = buffer.get(Pos::new(x, y: 1)).unwrap()
+        assert(
+            cell.fg() == Color::CYAN && cell.modifier() == Modifier::REVERSED,
+        )
+    }
+    let after = buffer.get(Pos::new(x: 5, y: 1)).unwrap()
+    assert(after.fg() == Color::CYAN && after.modifier().is_empty())
+    assert(
+        buffer.get(Pos::new(x: 9, y: 2)).unwrap().fg() == Color::CYAN,
+    )
+    // The cell where the bar ends counts as filled from half of it.
+    let buffer = drawn(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render_labeled(area, done: 12, total: 32, label: "abcd")
+            }
+        },
+    )
+    assert(buffer.to_text() == "abcd")
+    assert(
+        buffer.get(Pos::new(x: 1, y: 0)).unwrap().modifier() == Modifier::REVERSED,
+    )
+    assert(
+        buffer.get(Pos::new(x: 2, y: 0)).unwrap().modifier().is_empty(),
+    )
+    let buffer = drawn(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render_labeled(area, done: 11, total: 32, label: "abcd")
+            }
+        },
+    )
+    assert(
+        buffer.get(Pos::new(x: 1, y: 0)).unwrap().modifier().is_empty(),
+    )
+    // A long label is cut at the edge.
+    let text = drawn_text(
+        width: 4,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Gauge::new().render_labeled(area, done: 0, total: 1, label: "progress")
+            }
+        },
+    )
+    assert(text == "prog\n")
+}
+
+#[test]
+fn styles_set_on_a_gauge_apply_over_the_theme() {
+    let buffer = drawn(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Gauge::new()
+                    .style(Style::new().fg(Color::RED).bg(Color::BLACK))
+                    .label_style(Style::new().bold())
+                    .render_labeled(area, done: 1, total: 4, label: "x")
+            }
+        },
+    )
+    let bar = buffer.get(Pos::new(x: 0, y: 0)).unwrap()
+    assert(bar.fg() == Color::RED && bar.bg() == Color::BLACK)
+    let label = buffer.get(Pos::new(x: 1, y: 0)).unwrap()
+    assert(
+        label.fg() == Color::RED && label.modifier() == Modifier::BOLD,
+    )
+    assert(
+        buffer.get(Pos::new(x: 3, y: 0)).unwrap().bg() == Color::BLACK,
+    )
+}
+
+#[test]
+fn gauges_draw_only_in_their_area() {
+    let text = drawn_text(
+        width: 6,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                Gauge::new().render(
+                        Rect::new(x: 1, y: 1, width: 4, height: 1),
+                        done: 1,
+                        total: 1,
+                    )
+                Gauge::new().render(
+                        Rect::new(x: 1, y: 0, width: 0, height: 3),
+                        done: 1,
+                        total: 1,
+                    )
+                Gauge::new().render(
+                        Rect::new(x: 1, y: 2, width: 3, height: 0),
+                        done: 1,
+                        total: 1,
+                    )
+                LineGauge::new()
+                    .render(
+                        Rect::new(x: 1, y: 2, width: 0, height: 1),
+                        done: 1,
+                        total: 1,
+                    )
+                LineGauge::new()
+                    .render(
+                        Rect::new(x: 1, y: 2, width: 3, height: 0),
+                        done: 1,
+                        total: 1,
+                    )
+                LineGauge::new()
+                    .render(
+                        Rect::new(x: 5, y: 2, width: 1, height: 1),
+                        done: 1,
+                        total: 1,
+                    )
+            }
+        },
+    )
+    assert(text == "......\n.100%.\n.....1")
+}
+
+#[test]
+fn line_gauges_fill_whole_cells() {
+    let buffer = drawn(
+        width: 10,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                LineGauge::new().render(area, done: 1, total: 2)
+            }
+        },
+    )
+    assert(buffer.to_text() == "50% ━━━━━━\n")
+    assert(
+        buffer.get(Pos::new(x: 0, y: 0)).unwrap().fg() == Color::RESET,
+    )
+    for x in [4, 5, 6] {
+        assert(buffer.get(Pos::new(x, y: 0)).unwrap().fg() == Color::CYAN)
+    }
+    for x in [7, 8, 9] {
+        assert(
+            buffer.get(Pos::new(x, y: 0)).unwrap().modifier() == Modifier::DIM,
+        )
+    }
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                LineGauge::new().render_labeled(area, done: 3, total: 4, label: "")
+            }
+        },
+    )
+    assert(text == "━━━━")
+    let buffer = drawn(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                LineGauge::new()
+                    .filled_style(Style::new().fg(Color::GREEN))
+                    .unfilled_style(Style::new().fg(Color::RED))
+                    .label_style(Style::new().italic())
+                    .render_labeled(area, done: 1, total: 2, label: "a")
+            }
+        },
+    )
+    assert(
+        buffer.get(Pos::new(x: 0, y: 0)).unwrap().modifier() == Modifier::ITALIC,
+    )
+    assert(
+        buffer.get(Pos::new(x: 2, y: 0)).unwrap().fg() == Color::GREEN,
+    )
+    assert(
+        buffer.get(Pos::new(x: 3, y: 0)).unwrap().fg() == Color::RED,
+    )
+    let text = drawn_text(
+        width: 6,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                LineGauge::new().render(area, done: 9, total: 0)
+            }
+        },
+    )
+    assert(text == "0% ━━━")
+    let text = drawn_text(
+        width: 3,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                LineGauge::new().render(area, done: 9, total: 3)
+            }
+        },
+    )
+    assert(text == "100")
+}

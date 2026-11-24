@@ -1,0 +1,549 @@
+//! A scrollbar: where a view is in content longer than it.
+use core::ops::Eq
+use ingot::frame::{Frame, fill, theme}
+use ingot::geom::{Pos, Rect}
+use ingot::style::{Color, Modifier, Style}
+use super::{drawn, drawn_text}
+
+/// Which way a `Scrollbar` runs.
+pub enum Orientation {
+    /// Down the right column of its area.
+    Vertical,
+    /// Along the bottom row of its area.
+    Horizontal,
+}
+
+impl Copy for Orientation {}
+
+impl Eq for Orientation {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (Orientation::Vertical, Orientation::Vertical) => true,
+            (Orientation::Horizontal, Orientation::Horizontal) => true,
+            _ => false,
+        }
+    }
+}
+
+/// A track with a thumb that shows which part of some content a view
+/// shows: `viewport_length` items, rows or columns of `content_length`,
+/// from `position`:
+///
+/// ```fe
+/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+///     let rows = area.height as usize
+///     Scrollbar::vertical().render(
+///         area,
+///         content_length: self.lines.len(),
+///         viewport_length: rows,
+///         position: self.top,
+///     )
+/// }
+/// ```
+///
+/// A vertical scrollbar takes the right column of its area and a
+/// horizontal one the bottom row, so it can share the area of what it
+/// scrolls, or of the block around it. Nothing is drawn when the content
+/// fits, unless the scrollbar is always shown, when the thumb fills the
+/// track.
+///
+/// The thumb's length is its share of the track that the viewport is of
+/// the content, rounded down, and at least a cell. It is at the start of
+/// the track only at the first position, 0, and at its end only at the
+/// last, `content_length - viewport_length`, when the track has room for
+/// it to be anywhere else; in between, it moves in proportion, rounded to
+/// the nearest cell. `position_at` maps a cell back to a position, to drag
+/// the thumb with the mouse.
+///
+/// The track takes the theme's `border` style and the thumb its `text`
+/// style, each with the scrollbar's own style for it over it.
+pub struct Scrollbar {
+    orientation: Orientation,
+    track: String<4>,
+    thumb: String<4>,
+    track_style: Style,
+    thumb_style: Style,
+    always_show: bool,
+}
+
+impl Copy for Scrollbar {}
+
+impl Scrollbar {
+    /// A scrollbar down the right column: a track of `│` and a thumb of `█`.
+    pub fn vertical() -> Self {
+        Scrollbar {
+            orientation: Orientation::Vertical,
+            track: "│",
+            thumb: "█",
+            track_style: Style::NONE,
+            thumb_style: Style::NONE,
+            always_show: false,
+        }
+    }
+
+    /// A scrollbar along the bottom row: a track of `─` and a thumb of `█`.
+    pub fn horizontal() -> Self {
+        var bar = Scrollbar::vertical()
+        bar.orientation = Orientation::Horizontal
+        bar.track = "─"
+        bar
+    }
+
+    /// The symbol of each cell of the track the thumb is not on.
+    pub fn track(var own self, _ symbol: String<4>) -> Self {
+        self.track = symbol
+        self
+    }
+
+    /// The symbol of each cell of the thumb.
+    pub fn thumb(var own self, _ symbol: String<4>) -> Self {
+        self.thumb = symbol
+        self
+    }
+
+    /// The style for the track, over the theme's `border` style.
+    pub fn track_style(var own self, _ style: Style) -> Self {
+        self.track_style = style
+        self
+    }
+
+    /// The style for the thumb, over the theme's `text` style.
+    pub fn thumb_style(var own self, _ style: Style) -> Self {
+        self.thumb_style = style
+        self
+    }
+
+    /// Draws the scrollbar when the content fits too.
+    pub fn always_show(var own self) -> Self {
+        self.always_show = true
+        self
+    }
+
+    /// Draws the scrollbar in `area` for a view of `viewport_length` of
+    /// `content_length` from `position`.
+    pub fn render(
+        self,
+        _ area: Rect,
+        content_length: usize,
+        viewport_length: usize,
+        position: usize,
+    )
+    uses (frame: mut Frame)
+    {
+        if content_length <= viewport_length && !self.always_show {
+            return
+        }
+        fill(
+            self.track_of(area),
+            self.track,
+            theme().border.patch(self.track_style),
+        )
+        fill(
+            self.thumb_area(area, content_length, viewport_length, position),
+            self.thumb,
+            theme().text.patch(self.thumb_style),
+        )
+    }
+
+    /// The cells of the thumb `render` draws, which are none when it draws
+    /// nothing.
+    pub fn thumb_area(
+        self,
+        _ area: Rect,
+        content_length: usize,
+        viewport_length: usize,
+        position: usize,
+    ) -> Rect {
+        let track = self.track_of(area)
+        if content_length <= viewport_length && !self.always_show {
+            return Rect { x: track.x, y: track.y, width: 0, height: 0 }
+        }
+        let (length, free) = thumb_length(self.length_of(track), content_length, viewport_length)
+        let last = content_length.saturating_sub(viewport_length)
+        let start: u16 = scale(position as u256, from: last as u256, to: free as u256)
+            .downcast_truncate()
+        match self.orientation {
+            Orientation::Vertical => Rect {
+                x: track.x,
+                y: track.y + start,
+                width: track.width,
+                height: length,
+            },
+            Orientation::Horizontal => Rect {
+                x: track.x + start,
+                y: track.y,
+                width: length,
+                height: track.height,
+            },
+        }
+    }
+
+    /// The position at which the thumb starts at the cell of the track
+    /// across from `pos`, or the nearest such position: 0 for the start of
+    /// the track and the last position for its end, or past them. To drag
+    /// the thumb, pass the cell where its start should be: the mouse less
+    /// the cells into the thumb where the drag began.
+    ///
+    /// For every position, `position_at` of the thumb's start gives it back
+    /// when the track has a cell for each position; for every cell the
+    /// thumb can start at, `thumb_area` of `position_at` starts there.
+    pub fn position_at(
+        self,
+        _ area: Rect,
+        content_length: usize,
+        viewport_length: usize,
+        _ pos: Pos,
+    ) -> usize {
+        let track = self.track_of(area)
+        let (_, free) = thumb_length(self.length_of(track), content_length, viewport_length)
+        let last = content_length.saturating_sub(viewport_length)
+        let cell = match self.orientation {
+            Orientation::Vertical => pos.y.saturating_sub(track.y),
+            Orientation::Horizontal => pos.x.saturating_sub(track.x),
+        }
+        scale(cell as u256, from: free as u256, to: last as u256).downcast_truncate()
+    }
+
+    // The cells of `area` the track takes.
+    fn track_of(self, _ area: Rect) -> Rect {
+        match self.orientation {
+            Orientation::Vertical => area.split_right(1).1,
+            Orientation::Horizontal => area.split_bottom(1).1,
+        }
+    }
+
+    fn length_of(self, _ track: Rect) -> u16 {
+        match self.orientation {
+            Orientation::Vertical => track.height,
+            Orientation::Horizontal => track.width,
+        }
+    }
+}
+
+// The length of the thumb on a track of `cells` cells, and the cells left
+// for it to move in.
+fn thumb_length(_ cells: u16, _ content: usize, _ viewport: usize) -> (u16, u16) {
+    if content <= viewport {
+        return (cells, 0)
+    }
+    let share: u16 = (cells as u256 * viewport as u256 / content as u256).downcast_truncate()
+    let length = if share == 0 && cells > 0 { 1 } else { share }
+    (length, cells - length)
+}
+
+// The point of `0..=to` that `value` is of `0..=from`, in proportion and
+// rounded to the nearest, halves up; but only 0 maps to 0, and only `from`
+// or more to `to`, when there is a point between them.
+fn scale(_ value: u256, from: u256, to: u256) -> u256 {
+    if value == 0 || from == 0 {
+        return 0
+    }
+    if value >= from { return to }
+    let point = (2 * value * to + from) / (2 * from)
+    if to < 2 {
+        point
+    } else if point < 1 {
+        1
+    } else if point > to - 1 { to - 1 } else { point }
+}
+
+// The first cell and the length of the thumb of a vertical scrollbar of
+// `cells` rows.
+fn thumb(_ cells: u16, content: usize, viewport: usize, position: usize) -> (u16, u16) {
+    let thumb = Scrollbar::vertical()
+        .thumb_area(
+            Rect::new(x: 0, y: 0, width: 1, height: cells),
+            content_length: content,
+            viewport_length: viewport,
+            position,
+        )
+    (thumb.y, thumb.height)
+}
+
+#[test]
+fn thumbs_take_their_share_of_the_track() {
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 0) == (0, 1),
+    )
+    assert(
+        thumb(10, content: 20, viewport: 10, position: 0) == (0, 5),
+    )
+    assert(
+        thumb(10, content: 19, viewport: 10, position: 0) == (0, 5),
+    )
+    assert(
+        thumb(10, content: 11, viewport: 10, position: 0) == (0, 9),
+    )
+    assert(
+        thumb(10, content: 1000000, viewport: 1, position: 0) == (0, 1),
+    )
+    assert(
+        thumb(1, content: 1000000, viewport: 1, position: 500) == (0, 1),
+    )
+}
+
+#[test]
+fn thumbs_reach_the_ends_only_at_the_first_and_last_positions() {
+    // 9 free cells for 90 positions.
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 0) == (0, 1),
+    )
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 1) == (1, 1),
+    )
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 44) == (4, 1),
+    )
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 45) == (5, 1),
+    )
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 89) == (8, 1),
+    )
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 90) == (9, 1),
+    )
+    assert(
+        thumb(10, content: 100, viewport: 10, position: 1000) == (9, 1),
+    )
+    // With one free cell, the thumb is at one end or the other.
+    assert(
+        thumb(10, content: 11, viewport: 10, position: 1) == (1, 9),
+    )
+    assert(
+        thumb(10, content: 12, viewport: 10, position: 1) == (1, 8),
+    )
+    assert(
+        thumb(
+                65535,
+                content: 18446744073709551615,
+                viewport: 1,
+                position: 18446744073709551613,
+            )
+            == (65533, 1),
+    )
+    assert(
+        thumb(
+                65535,
+                content: 18446744073709551615,
+                viewport: 1,
+                position: 1,
+            ) == (1, 1),
+    )
+}
+
+#[test]
+fn cells_map_back_to_positions() {
+    let bar = Scrollbar::vertical()
+    let area = Rect::new(x: 3, y: 2, width: 4, height: 10)
+    // More positions than cells: each cell the thumb can start at maps to a
+    // position whose thumb starts there.
+    for (content, viewport) in [(100 as usize, 10 as usize), (15, 10), (13, 10), (1000003, 7)] {
+        let (_, length) = thumb(10, content, viewport, position: 0)
+        for cell in 0 .. (11 - length) as usize {
+            let pos = Pos::new(x: 0, y: 2 + cell.downcast_truncate())
+            let position = bar
+                .position_at(
+                    area,
+                    content_length: content,
+                    viewport_length: viewport,
+                    pos,
+                )
+            assert(
+                bar.thumb_area(
+                        area,
+                        content_length: content,
+                        viewport_length: viewport,
+                        position,
+                    ).y
+                    == pos.y,
+            )
+        }
+    }
+    // Fewer positions than cells: each position maps to a cell and back.
+    for (content, viewport) in [(12 as usize, 10 as usize), (13, 10), (19, 17)] {
+        for position in 0 .. content - viewport + 1 {
+            let thumb = bar
+                .thumb_area(
+                    area,
+                    content_length: content,
+                    viewport_length: viewport,
+                    position,
+                )
+            assert(
+                bar.position_at(
+                        area,
+                        content_length: content,
+                        viewport_length: viewport,
+                        thumb.pos(),
+                    )
+                    == position,
+            )
+        }
+    }
+    // Past the ends of the track.
+    assert(
+        bar.position_at(
+                area,
+                content_length: 100,
+                viewport_length: 10,
+                Pos::new(x: 0, y: 0),
+            ) == 0,
+    )
+    assert(
+        bar.position_at(
+                area,
+                content_length: 100,
+                viewport_length: 10,
+                Pos::new(x: 0, y: 99),
+            )
+            == 90,
+    )
+    assert(
+        bar.position_at(
+                area,
+                content_length: 5,
+                viewport_length: 10,
+                Pos::new(x: 0, y: 7),
+            ) == 0,
+    )
+    let bar = Scrollbar::horizontal()
+    assert(
+        bar.position_at(
+                area,
+                content_length: 14,
+                viewport_length: 10,
+                Pos::new(x: 4, y: 0),
+            ) == 2,
+    )
+    assert(
+        bar.thumb_area(area, content_length: 14, viewport_length: 10, position: 2)
+            == Rect::new(x: 4, y: 11, width: 2, height: 1),
+    )
+}
+
+#[test]
+fn scrollbars_draw_along_an_edge() {
+    let text = drawn_text(
+        width: 3,
+        height: 4,
+        |frame, area| {
+            with (frame) {
+                Scrollbar::vertical()
+                    .render(area, content_length: 8, viewport_length: 4, position: 2)
+            }
+        },
+    )
+    assert(text == "  │\n  █\n  █\n  │")
+    let buffer = drawn(
+        width: 4,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Scrollbar::horizontal()
+                    .thumb("=")
+                    .track(".")
+                    .thumb_style(Style::new().fg(Color::RED))
+                    .render(area, content_length: 8, viewport_length: 4, position: 4)
+            }
+        },
+    )
+    assert(buffer.to_text() == "\n..==")
+    assert(
+        buffer.get(Pos::new(x: 3, y: 1)).unwrap().fg() == Color::RED,
+    )
+    assert(
+        buffer.get(Pos::new(x: 0, y: 1)).unwrap().modifier() == Modifier::DIM,
+    )
+}
+
+#[test]
+fn scrollbars_hide_when_the_content_fits() {
+    let text = drawn_text(
+        width: 2,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                Scrollbar::vertical()
+                    .render(area, content_length: 3, viewport_length: 3, position: 0)
+                Scrollbar::horizontal()
+                    .render(area, content_length: 0, viewport_length: 2, position: 0)
+            }
+        },
+    )
+    assert(text == "\n\n")
+    assert(
+        Scrollbar::vertical()
+            .thumb_area(
+                Rect::new(x: 0, y: 0, width: 2, height: 3),
+                content_length: 3,
+                viewport_length: 3,
+                position: 0,
+            )
+            .is_empty(),
+    )
+    let text = drawn_text(
+        width: 2,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                Scrollbar::vertical()
+                    .always_show()
+                    .render(area, content_length: 2, viewport_length: 3, position: 0)
+            }
+        },
+    )
+    assert(text == " █\n █\n █")
+}
+
+#[test]
+fn scrollbars_draw_only_in_their_area() {
+    let text = drawn_text(
+        width: 4,
+        height: 4,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                Scrollbar::vertical()
+                    .render(
+                        Rect::new(x: 1, y: 1, width: 2, height: 2),
+                        content_length: 9,
+                        viewport_length: 1,
+                        position: 9,
+                    )
+                Scrollbar::vertical()
+                    .render(
+                        Rect::new(x: 0, y: 0, width: 0, height: 4),
+                        content_length: 9,
+                        viewport_length: 1,
+                        position: 0,
+                    )
+                Scrollbar::horizontal()
+                    .render(
+                        Rect::new(x: 0, y: 3, width: 4, height: 0),
+                        content_length: 9,
+                        viewport_length: 1,
+                        position: 0,
+                    )
+                Scrollbar::horizontal()
+                    .render(
+                        Rect::new(x: 0, y: 3, width: 1, height: 1),
+                        content_length: 9,
+                        viewport_length: 1,
+                        position: 3,
+                    )
+            }
+        },
+    )
+    assert(text == "....\n..│.\n..█.\n█...")
+    assert(
+        Scrollbar::vertical()
+                .position_at(
+                    Rect::ZERO,
+                    content_length: 9,
+                    viewport_length: 1,
+                    Pos::new(x: 0, y: 0),
+                )
+            == 0,
+    )
+}

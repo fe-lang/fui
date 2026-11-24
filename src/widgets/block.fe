@@ -1,0 +1,730 @@
+//! Borders and titles around an area.
+use core::MemSpan
+use core::ops::{BitAnd, BitOr, Eq}
+use std::io::Display
+use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::geom::{Pos, Rect, min}
+use ingot::style::{Color, Modifier, Style}
+use super::{Alignment, clamp_u16, drawn, drawn_text, measure}
+
+/// A set of the sides of a `Block` that have a border:
+/// `Borders::TOP | Borders::BOTTOM`.
+pub struct Borders { bits: u8 }
+
+impl Copy for Borders {}
+
+impl Eq for Borders {
+    fn eq(self, _ other: Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+impl BitOr for Borders {
+    fn bitor(own self, _ other: own Self) -> Self {
+        Borders { bits: self.bits | other.bits }
+    }
+}
+
+impl BitAnd for Borders {
+    fn bitand(own self, _ other: own Self) -> Self {
+        Borders { bits: self.bits & other.bits }
+    }
+}
+
+impl Borders {
+    pub const NONE: Borders = Borders { bits: 0 }
+    pub const TOP: Borders = Borders { bits: 1 }
+    pub const RIGHT: Borders = Borders { bits: 2 }
+    pub const BOTTOM: Borders = Borders { bits: 4 }
+    pub const LEFT: Borders = Borders { bits: 8 }
+    pub const ALL: Borders = Borders { bits: 15 }
+
+    pub fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    /// Whether every side of `other` is in this set.
+    pub fn contains(self, _ other: Borders) -> bool {
+        self.bits & other.bits == other.bits
+    }
+}
+
+/// The lines a border is drawn with.
+pub enum BorderType {
+    /// `┌─┐`
+    Plain,
+    /// `╭─╮`
+    Rounded,
+    /// `╔═╗`
+    Double,
+    /// `┏━┓`
+    Thick,
+    /// `+-+`, for terminals without box drawing.
+    Ascii,
+}
+
+impl Copy for BorderType {}
+
+impl Eq for BorderType {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (BorderType::Plain, BorderType::Plain) => true,
+            (BorderType::Rounded, BorderType::Rounded) => true,
+            (BorderType::Double, BorderType::Double) => true,
+            (BorderType::Thick, BorderType::Thick) => true,
+            (BorderType::Ascii, BorderType::Ascii) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The symbols of a border: its two lines and four corners, each one cell.
+pub struct BorderSymbols {
+    pub horizontal: String<3>,
+    pub vertical: String<3>,
+    pub top_left: String<3>,
+    pub top_right: String<3>,
+    pub bottom_left: String<3>,
+    pub bottom_right: String<3>,
+}
+
+impl Copy for BorderSymbols {}
+
+impl BorderType {
+    pub fn symbols(self) -> BorderSymbols {
+        match self {
+            BorderType::Plain => BorderSymbols {
+                horizontal: "─",
+                vertical: "│",
+                top_left: "┌",
+                top_right: "┐",
+                bottom_left: "└",
+                bottom_right: "┘",
+            },
+            BorderType::Rounded => BorderSymbols {
+                horizontal: "─",
+                vertical: "│",
+                top_left: "╭",
+                top_right: "╮",
+                bottom_left: "╰",
+                bottom_right: "╯",
+            },
+            BorderType::Double => BorderSymbols {
+                horizontal: "═",
+                vertical: "║",
+                top_left: "╔",
+                top_right: "╗",
+                bottom_left: "╚",
+                bottom_right: "╝",
+            },
+            BorderType::Thick => BorderSymbols {
+                horizontal: "━",
+                vertical: "┃",
+                top_left: "┏",
+                top_right: "┓",
+                bottom_left: "┗",
+                bottom_right: "┛",
+            },
+            BorderType::Ascii => BorderSymbols {
+                horizontal: "-",
+                vertical: "|",
+                top_left: "+",
+                top_right: "+",
+                bottom_left: "+",
+                bottom_right: "+",
+            },
+        }
+    }
+}
+
+/// Empty cells between a block's borders and its inner area, on each side.
+pub struct Padding { pub top: u16, pub right: u16, pub bottom: u16, pub left: u16 }
+
+impl Copy for Padding {}
+
+impl Eq for Padding {
+    fn eq(self, _ other: Self) -> bool {
+        self.top == other.top
+            && self.right == other.right
+            && self.bottom == other.bottom
+            && self.left == other.left
+    }
+}
+
+impl Padding {
+    pub const ZERO: Padding = Padding { top: 0, right: 0, bottom: 0, left: 0 }
+
+    pub fn new(top: u16, right: u16, bottom: u16, left: u16) -> Self {
+        Padding { top, right, bottom, left }
+    }
+
+    /// `n` cells on every side.
+    pub fn uniform(_ n: u16) -> Self {
+        Padding { top: n, right: n, bottom: n, left: n }
+    }
+
+    /// `n` cells on the left and the right.
+    pub fn horizontal(_ n: u16) -> Self {
+        Padding { top: 0, right: n, bottom: 0, left: n }
+    }
+
+    /// `n` cells at the top and the bottom.
+    pub fn vertical(_ n: u16) -> Self {
+        Padding { top: n, right: 0, bottom: n, left: 0 }
+    }
+}
+
+/// Borders and titles around an area, which a render returns the inside of
+/// for the content:
+///
+/// ```fe
+/// fn view(_ area: Rect) uses (frame: mut Frame) {
+///     let inner = Block::bordered().rounded().render_titled(area, "Files")
+///     print_in(inner, "readme.md", Style::new())
+/// }
+/// ```
+///
+/// A border runs along each side in `borders`, with a corner where two
+/// meet. A title sits in its border between the corners, or, without that
+/// border, takes the row itself; it is cut at the corners if it does not
+/// fit. Borders take the theme's `border` style and titles its `title`
+/// style, each with the block's own style for them over it. The block's
+/// `style` applies first, to the whole area, such as a background color;
+/// the cells inside keep their symbols.
+pub struct Block {
+    borders: Borders,
+    border_type: BorderType,
+    border_style: Style,
+    title_style: Style,
+    style: Style,
+    padding: Padding,
+    title_alignment: Alignment,
+    bottom_title_alignment: Alignment,
+}
+
+impl Copy for Block {}
+
+impl Block {
+    /// A block without borders or padding, which only draws its titles and
+    /// style.
+    pub fn new() -> Self {
+        Block {
+            borders: Borders::NONE,
+            border_type: BorderType::Plain,
+            border_style: Style::NONE,
+            title_style: Style::NONE,
+            style: Style::NONE,
+            padding: Padding::ZERO,
+            title_alignment: Alignment::Left,
+            bottom_title_alignment: Alignment::Left,
+        }
+    }
+
+    /// A block with a plain border on every side.
+    pub fn bordered() -> Self {
+        Block::new().borders(Borders::ALL)
+    }
+
+    pub fn borders(var own self, _ borders: Borders) -> Self {
+        self.borders = borders
+        self
+    }
+
+    pub fn border_type(var own self, _ border_type: BorderType) -> Self {
+        self.border_type = border_type
+        self
+    }
+
+    /// This block with rounded corners.
+    pub fn rounded(own self) -> Self {
+        self.border_type(BorderType::Rounded)
+    }
+
+    /// The style for the borders, over the theme's `border` style.
+    pub fn border_style(var own self, _ style: Style) -> Self {
+        self.border_style = style
+        self
+    }
+
+    /// The style for the titles, over the theme's `title` style.
+    pub fn title_style(var own self, _ style: Style) -> Self {
+        self.title_style = style
+        self
+    }
+
+    /// The style for the whole area, applied before the borders.
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
+    }
+
+    pub fn padding(var own self, _ padding: Padding) -> Self {
+        self.padding = padding
+        self
+    }
+
+    /// Where the top title sits: on the left unless set.
+    pub fn title_alignment(var own self, _ alignment: Alignment) -> Self {
+        self.title_alignment = alignment
+        self
+    }
+
+    /// Where the bottom title sits: on the left unless set.
+    pub fn bottom_title_alignment(var own self, _ alignment: Alignment) -> Self {
+        self.bottom_title_alignment = alignment
+        self
+    }
+
+    /// The area inside the borders and the padding, which `render` returns,
+    /// without drawing.
+    pub fn inner(self, _ area: Rect) -> Rect {
+        self.inner_of(area, top_row: false, bottom_row: false)
+    }
+
+    /// Draws the block over `area` and returns the area inside its borders
+    /// and padding.
+    pub fn render(self, _ area: Rect) -> Rect uses (frame: mut Frame) {
+        self.render_titles(area, top: "", bottom: "")
+    }
+
+    /// Draws the block with the `Display` text of `title` at the top, and
+    /// returns the area inside.
+    pub fn render_titled<T: Display>(self, _ area: Rect, _ title: T) -> Rect
+    uses (frame: mut Frame)
+    {
+        self.render_titles(area, top: title, bottom: "")
+    }
+
+    /// Draws the block with a title at the top and one at the bottom, and
+    /// returns the area inside. A title of no columns is none, so
+    /// `top: ""` leaves only the bottom one.
+    pub fn render_titles<T: Display, U: Display>(self, _ area: Rect, top: T, bottom: U) -> Rect
+    uses (frame: mut Frame)
+    {
+        if area.is_empty() {
+            return self.inner(area)
+        }
+        frame.set_style(area, self.style)
+        let symbols = self.border_type.symbols()
+        let border = theme().border.patch(self.border_style)
+        let left = self.borders.contains(Borders::LEFT)
+        let right = self.borders.contains(Borders::RIGHT)
+        if left {
+            fill(
+                Rect { x: area.x, y: area.y, width: 1, height: area.height },
+                symbols.vertical,
+                border,
+            )
+        }
+        if right {
+            fill(
+                Rect { x: area.right() - 1, y: area.y, width: 1, height: area.height },
+                symbols.vertical,
+                border,
+            )
+        }
+        var scratch = MemBuffer::empty()
+        let top_width = measure(top, mut scratch)
+        self.edge(
+            area,
+            y: area.y,
+            line: self.borders.contains(Borders::TOP),
+            corners: (symbols.top_left, symbols.top_right),
+            title: scratch.span(),
+            title_width: top_width,
+            alignment: self.title_alignment,
+        )
+        let bottom_width = measure(bottom, mut scratch)
+        self.edge(
+            area,
+            y: area.bottom() - 1,
+            line: self.borders.contains(Borders::BOTTOM),
+            corners: (symbols.bottom_left, symbols.bottom_right),
+            title: scratch.span(),
+            title_width: bottom_width,
+            alignment: self.bottom_title_alignment,
+        )
+        self.inner_of(area, top_row: top_width > 0, bottom_row: bottom_width > 0)
+    }
+
+    // Draws row `y` of `area`, the top or the bottom one: the border line
+    // if `line`, its corners where a side border meets it, and the title.
+    fn edge(
+        self,
+        _ area: Rect,
+        y: u16,
+        line: bool,
+        corners: (String<3>, String<3>),
+        title: MemSpan,
+        title_width: usize,
+        alignment: Alignment,
+    )
+    uses (frame: mut Frame)
+    {
+        let left = self.borders.contains(Borders::LEFT)
+        let right = self.borders.contains(Borders::RIGHT)
+        // The title's room: the row between the side borders.
+        let start = area.x + left as u16
+        let room = (area.right() - right as u16).saturating_sub(start)
+        let width = min(clamp_u16(title_width), room)
+        let at = start + clamp_u16(
+                alignment.offset(width: title_width, available: room as usize),
+            )
+        if line {
+            let border = theme().border.patch(self.border_style)
+            let horizontal = self.border_type.symbols().horizontal
+            fill(
+                Rect { x: area.x, y, width: at - area.x, height: 1 },
+                horizontal,
+                border,
+            )
+            fill(
+                Rect { x: at + width, y, width: area.right() - at - width, height: 1 },
+                horizontal,
+                border,
+            )
+            let (first, last) = corners
+            if left {
+                fill(Rect { x: area.x, y, width: 1, height: 1 }, first, border)
+            }
+            if right {
+                fill(
+                    Rect { x: area.right() - 1, y, width: 1, height: 1 },
+                    last,
+                    border,
+                )
+            }
+        }
+        if width > 0 {
+            print_in(
+                Rect { x: at, y, width, height: 1 },
+                title,
+                theme().title.patch(self.title_style),
+            )
+        }
+    }
+
+    // The area inside the borders and the padding, and inside a title row
+    // at the top or the bottom where it has no border.
+    fn inner_of(self, _ area: Rect, top_row: bool, bottom_row: bool) -> Rect {
+        let b = self.borders
+        let p = self.padding
+        let inside = area
+            .shrink(
+                top: (top_row || b.contains(Borders::TOP)) as u16,
+                right: b.contains(Borders::RIGHT) as u16,
+                bottom: (bottom_row || b.contains(Borders::BOTTOM)) as u16,
+                left: b.contains(Borders::LEFT) as u16,
+            )
+        inside.shrink(top: p.top, right: p.right, bottom: p.bottom, left: p.left)
+    }
+}
+
+#[test]
+fn corners_join_two_borders() {
+    let expected = [
+        "\n\n",
+        "───\n\n",
+        "  │\n  │\n  │",
+        "──┐\n  │\n  │",
+        "\n\n───",
+        "───\n\n───",
+        "  │\n  │\n──┘",
+        "──┐\n  │\n──┘",
+        "│\n│\n│",
+        "┌──\n│\n│",
+        "│ │\n│ │\n│ │",
+        "┌─┐\n│ │\n│ │",
+        "│\n│\n└──",
+        "┌──\n│\n└──",
+        "│ │\n│ │\n└─┘",
+        "┌─┐\n│ │\n└─┘",
+    ]
+    for (bits, text) in expected.enumerate() {
+        var borders = Borders::NONE
+        for (bit, side) in [Borders::TOP, Borders::RIGHT, Borders::BOTTOM, Borders::LEFT]
+            .enumerate() {
+            if bits >> bit & 1 == 1 {
+                borders = borders | side
+            }
+        }
+        let block = Block::new().borders(borders)
+        assert(
+            drawn_text(
+                    width: 3,
+                    height: 3,
+                    |frame, area| {
+                        with (frame) {
+                            block.render(area)
+                        }
+                    },
+                )
+                == text,
+        )
+    }
+}
+
+#[test]
+fn border_types_draw_their_symbols() {
+    let types = [
+        BorderType::Plain,
+        BorderType::Rounded,
+        BorderType::Double,
+        BorderType::Thick,
+        BorderType::Ascii,
+    ]
+    let expected = [
+        "┌─┐\n│ │\n└─┘",
+        "╭─╮\n│ │\n╰─╯",
+        "╔═╗\n║ ║\n╚═╝",
+        "┏━┓\n┃ ┃\n┗━┛",
+        "+-+\n| |\n+-+",
+    ]
+    for (i, border_type) in types.enumerate() {
+        let block = Block::bordered().border_type(border_type)
+        assert(
+            drawn_text(
+                    width: 3,
+                    height: 3,
+                    |frame, area| {
+                        with (frame) {
+                            block.render(area)
+                        }
+                    },
+                )
+                == expected[i],
+        )
+    }
+    assert(
+        drawn_text(
+                width: 2,
+                height: 2,
+                |frame, area| {
+                    with (frame) {
+                        Block::bordered().rounded().render(area)
+                    }
+                },
+            )
+            == "╭╮\n╰╯",
+    )
+}
+
+#[test]
+fn titles_align_between_the_corners() {
+    let text = drawn_text(
+        width: 10,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                Block::bordered().render_titled(area, "Files")
+            }
+        },
+    )
+    assert(text == "┌Files───┐\n│        │\n└────────┘")
+    let text = drawn_text(
+        width: 10,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Block::bordered()
+                    .title_alignment(Alignment::Center)
+                    .bottom_title_alignment(Alignment::Right)
+                    .render_titles(area, top: "Files", bottom: 42 as u8)
+            }
+        },
+    )
+    assert(text == "┌─Files──┐\n└──────42┘")
+    let text = drawn_text(
+        width: 10,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Block::bordered()
+                    .title_alignment(Alignment::Right)
+                    .bottom_title_alignment(Alignment::Center)
+                    .render_titles(area, top: "Files", bottom: "")
+            }
+        },
+    )
+    assert(text == "┌───Files┐\n└────────┘")
+    // Without side borders, titles reach the edges.
+    let text = drawn_text(
+        width: 8,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Block::new()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .title_alignment(Alignment::Right)
+                    .render_titles(area, top: "ab", bottom: "cd")
+            }
+        },
+    )
+    assert(text == "──────ab\ncd──────")
+}
+
+#[test]
+fn long_titles_are_cut_at_the_corners() {
+    let text = drawn_text(
+        width: 8,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Block::bordered()
+                    .title_alignment(Alignment::Center)
+                    .render_titles(area, top: "Directory listing", bottom: "exactly6")
+            }
+        },
+    )
+    assert(text == "┌Direct┐\n└exactl┘")
+    let text = drawn_text(
+        width: 2,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Block::bordered().render_titled(area, "Files")
+            }
+        },
+    )
+    assert(text == "┌┐\n└┘")
+    let text = drawn_text(
+        width: 3,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Block::new().borders(Borders::LEFT).render_titled(area, "Files")
+            }
+        },
+    )
+    assert(text == "│Fi")
+}
+
+#[test]
+fn titles_take_the_style_of_titles_and_borders_of_borders() {
+    let buffer = drawn(
+        width: 6,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                Block::bordered()
+                    .border_style(Style::new().fg(Color::RED))
+                    .title_style(Style::new().fg(Color::GREEN))
+                    .style(Style::new().bg(Color::BLUE))
+                    .render_titled(area, "ab")
+            }
+        },
+    )
+    let title = buffer.get(Pos::new(x: 1, y: 0)).unwrap()
+    assert(
+        title.modifier() == Modifier::BOLD && title.fg() == Color::GREEN,
+    )
+    assert(title.bg() == Color::BLUE)
+    let line = buffer.get(Pos::new(x: 3, y: 0)).unwrap()
+    assert(
+        line.modifier() == Modifier::DIM && line.fg() == Color::RED,
+    )
+    let corner = buffer.get(Pos::new(x: 5, y: 2)).unwrap()
+    assert(
+        corner.modifier() == Modifier::DIM && corner.bg() == Color::BLUE,
+    )
+    let inside = buffer.get(Pos::new(x: 2, y: 1)).unwrap()
+    assert(inside.bg() == Color::BLUE && inside.fg() == Color::RESET)
+    assert(inside.modifier().is_empty())
+}
+
+#[test]
+fn renders_return_the_inner_area() {
+    let area = Rect::new(x: 2, y: 1, width: 10, height: 6)
+    let block = Block::bordered()
+    assert(
+        block.inner(area) == Rect::new(x: 3, y: 2, width: 8, height: 4),
+    )
+    let padded = block.padding(Padding::new(top: 1, right: 2, bottom: 0, left: 3))
+    assert(
+        padded.inner(area) == Rect::new(x: 6, y: 3, width: 3, height: 3),
+    )
+    assert(block.padding(Padding::uniform(4)).inner(area).is_empty())
+    assert(Block::new().inner(area) == area)
+    assert(
+        Block::new().borders(Borders::LEFT | Borders::BOTTOM).inner(area)
+            == Rect::new(x: 3, y: 1, width: 9, height: 5),
+    )
+    assert(
+        Padding::horizontal(1) == Padding::new(top: 0, right: 1, bottom: 0, left: 1),
+    )
+    assert(
+        Padding::vertical(1) == Padding::new(top: 1, right: 0, bottom: 1, left: 0),
+    )
+    drawn(
+        width: 12,
+        height: 8,
+        |frame, _| {
+            with (frame) {
+                assert(block.render(area) == block.inner(area))
+                assert(padded.render_titled(area, "title") == padded.inner(area))
+                // A title without its border takes the row.
+                assert(
+                    Block::new().render_titles(area, top: "head", bottom: "")
+                        == Rect::new(x: 2, y: 2, width: 10, height: 5),
+                )
+                assert(
+                    Block::new().render_titles(area, top: "head", bottom: "foot")
+                        == Rect::new(x: 2, y: 2, width: 10, height: 4),
+                )
+                assert(Block::new().render_titled(area, "") == area)
+            }
+        },
+    )
+}
+
+#[test]
+fn blocks_draw_only_in_their_area() {
+    let text = drawn_text(
+        width: 7,
+        height: 5,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                Block::bordered()
+                    .render_titled(Rect::new(x: 1, y: 1, width: 5, height: 3), "abcdef")
+            }
+        },
+    )
+    assert(text == ".......\n.┌abc┐.\n.│...│.\n.└───┘.\n.......")
+    let text = drawn_text(
+        width: 3,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                assert(
+                    Block::bordered()
+                        .render_titled(Rect::new(x: 1, y: 1, width: 0, height: 2), "a")
+                        .is_empty(),
+                )
+                assert(
+                    Block::bordered().render(Rect::new(x: 1, y: 1, width: 2, height: 0)).is_empty(),
+                )
+                // One cell: every border meets at it, and the last corner drawn shows.
+                assert(
+                    Block::bordered()
+                        .render_titled(Rect::new(x: 1, y: 1, width: 1, height: 1), "a")
+                        .is_empty(),
+                )
+                Block::bordered().render(Rect::new(x: 2, y: 2, width: 9, height: 9))
+            }
+        },
+    )
+    assert(text == "...\n.┘.\n..┌")
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Block::bordered().render(area)
+            }
+        },
+    )
+    // One row: the bottom border is drawn over the top one.
+    assert(text == "└──┘")
+}

@@ -1,0 +1,219 @@
+//! An animation that shows work in progress.
+use std::io::Display
+use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::geom::{Pos, Rect}
+use ingot::style::{Color, Modifier, Style}
+use super::{drawn, drawn_text}
+
+// The kinds of frames a spinner cycles through.
+enum Frames {
+    Dots,
+    Line,
+    Arc,
+}
+
+impl Copy for Frames {}
+
+const DOTS: [String<3>; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+const LINE: [String<3>; 4] = ["|", "/", "-", "\\"]
+const ARC: [String<3>; 6] = ["◜", "◠", "◝", "◞", "◡", "◟"]
+
+/// A symbol in the top left of its area that changes with each tick, and
+/// an optional label after it:
+///
+/// ```fe
+/// fn view(self, _ area: Rect) uses (frame: mut Frame) {
+///     let spinner = Spinner::dots()
+///     spinner.render_labeled(area, tick: spinner.tick_at(self.elapsed_ms), label: "Loading")
+/// }
+/// ```
+///
+/// The frame shown is the tick's, in a cycle: a program passes a counter
+/// it advances, or the tick of the time since the spinner started, at the
+/// spinner's interval, from `tick_at`. A view reads no clock itself.
+///
+/// The symbol takes the theme's `accent` style and the label its `text`
+/// style, each with the spinner's own style for it over it.
+pub struct Spinner { frames: Frames, interval: u64, style: Style, label_style: Style }
+
+impl Copy for Spinner {}
+
+impl Spinner {
+    /// Braille dots that circle, `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, every 80 milliseconds.
+    pub fn dots() -> Self {
+        Spinner { frames: Frames::Dots, interval: 80, style: Style::NONE, label_style: Style::NONE }
+    }
+
+    /// A turning line, `|/-\`, every 130 milliseconds.
+    pub fn line() -> Self {
+        Spinner {
+            frames: Frames::Line,
+            interval: 130,
+            style: Style::NONE,
+            label_style: Style::NONE,
+        }
+    }
+
+    /// A turning arc, `◜◠◝◞◡◟`, every 100 milliseconds.
+    pub fn arc() -> Self {
+        Spinner { frames: Frames::Arc, interval: 100, style: Style::NONE, label_style: Style::NONE }
+    }
+
+    /// The milliseconds each frame shows for in `tick_at`, at least 1.
+    pub fn interval(var own self, _ millis: u64) -> Self {
+        self.interval = if millis == 0 { 1 } else { millis }
+        self
+    }
+
+    /// The style for the symbol, over the theme's `accent` style.
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
+    }
+
+    /// The style for the label, over the theme's `text` style.
+    pub fn label_style(var own self, _ style: Style) -> Self {
+        self.label_style = style
+        self
+    }
+
+    /// The number of frames in a cycle.
+    pub fn frame_count(self) -> usize {
+        match self.frames {
+            Frames::Dots => DOTS.len(),
+            Frames::Line => LINE.len(),
+            Frames::Arc => ARC.len(),
+        }
+    }
+
+    /// The tick `millis` milliseconds after the spinner started.
+    pub fn tick_at(self, _ millis: u64) -> u64 {
+        millis / self.interval
+    }
+
+    /// The symbol shown at `tick`.
+    pub fn symbol(self, _ tick: u64) -> String<3> {
+        let count: u64 = self.frame_count().downcast_truncate()
+        let frame: usize = (tick % count).downcast_truncate()
+        match self.frames {
+            Frames::Dots => DOTS[frame],
+            Frames::Line => LINE[frame],
+            Frames::Arc => ARC[frame],
+        }
+    }
+
+    /// Draws the symbol of `tick` in the top left of `area`.
+    pub fn render(self, _ area: Rect, tick: u64) uses (frame: mut Frame) {
+        print_in(area, self.symbol(tick), theme().accent.patch(self.style))
+    }
+
+    /// Draws the symbol of `tick` in the top left of `area`, then a space
+    /// and the `Display` text of `label`.
+    pub fn render_labeled<T: Display>(self, _ area: Rect, tick: u64, label: T)
+    uses (frame: mut Frame)
+    {
+        let (row, _) = area.split_top(1)
+        let symbol = print_in(row, self.symbol(tick), theme().accent.patch(self.style))
+        let (gap, rest) = row.split_left(symbol).1.split_left(1)
+        let style = theme().text.patch(self.label_style)
+        fill(gap, " ", style)
+        print_in(rest, label, style)
+    }
+}
+
+#[test]
+fn spinners_cycle_through_their_frames() {
+    let dots = Spinner::dots()
+    var shown = MemBuffer::empty()
+    for tick in 0 .. 12 {
+        write!(mut shown, dots.symbol(tick.downcast_truncate()))
+    }
+    assert(shown == "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋⠙")
+    assert(
+        format!(
+                Spinner::line().symbol(0),
+                Spinner::line().symbol(3),
+                Spinner::line().symbol(5),
+            )
+            == "|\\/",
+    )
+    assert(
+        format!(Spinner::arc().symbol(1), Spinner::arc().symbol(6)) == "◠◜",
+    )
+    assert(
+        dots.frame_count() == 10
+            && Spinner::line().frame_count() == 4
+            && Spinner::arc().frame_count() == 6,
+    )
+    assert(Spinner::line().symbol(18446744073709551615) == "\\")
+}
+
+#[test]
+fn ticks_follow_the_interval() {
+    assert(Spinner::dots().tick_at(0) == 0)
+    assert(Spinner::dots().tick_at(79) == 0)
+    assert(Spinner::dots().tick_at(800) == 10)
+    assert(Spinner::line().interval(50).tick_at(149) == 2)
+    assert(Spinner::line().interval(0).tick_at(7) == 7)
+}
+
+#[test]
+fn spinners_draw_their_symbol_and_label() {
+    let buffer = drawn(
+        width: 12,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Spinner::dots()
+                    .label_style(Style::new().bold())
+                    .render_labeled(area, tick: 2, label: "Loading")
+                Spinner::line().render(Rect::new(x: 10, y: 1, width: 2, height: 1), tick: 1)
+            }
+        },
+    )
+    assert(buffer.to_text() == "⠹ Loading\n          /")
+    assert(
+        buffer.get(Pos::new(x: 0, y: 0)).unwrap().fg() == Color::CYAN,
+    )
+    let label = buffer.get(Pos::new(x: 2, y: 0)).unwrap()
+    assert(
+        label.fg() == Color::RESET && label.modifier() == Modifier::BOLD,
+    )
+    // The space between takes the label's style.
+    assert(
+        buffer.get(Pos::new(x: 1, y: 0)).unwrap().modifier() == Modifier::BOLD,
+    )
+}
+
+#[test]
+fn spinners_draw_only_in_their_area() {
+    let text = drawn_text(
+        width: 5,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                Spinner::arc()
+                    .render_labeled(
+                        Rect::new(x: 1, y: 1, width: 3, height: 1),
+                        tick: 0,
+                        label: 1234 as u16,
+                    )
+                Spinner::arc()
+                    .render_labeled(
+                        Rect::new(x: 4, y: 0, width: 1, height: 1),
+                        tick: 0,
+                        label: "x",
+                    )
+                Spinner::arc()
+                    .render_labeled(
+                        Rect::new(x: 0, y: 2, width: 0, height: 1),
+                        tick: 0,
+                        label: "x",
+                    )
+                Spinner::arc().render(Rect::new(x: 1, y: 2, width: 3, height: 0), tick: 0)
+            }
+        },
+    )
+    assert(text == "....◜\n.◜ 1.\n.....")
+}

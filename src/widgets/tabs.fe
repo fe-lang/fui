@@ -1,0 +1,498 @@
+//! A row of tabs, one of them selected.
+use core::ops::{Index, Len}
+use std::abi::DynString
+use std::io::Display
+use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::geom::{Pos, Rect}
+use ingot::style::{Color, Modifier, Style}
+use super::{clamp_u16, drawn, drawn_text, measure}
+
+/// What a row of `Tabs` keeps between frames: the selected tab, and where
+/// the last render drew the tabs, which `Tabs::tab_at` maps positions by.
+pub struct TabsState {
+    /// The selected tab. A render makes it the last tab if it is past it.
+    pub selected: usize,
+    // The first tab shown.
+    first: usize,
+    area: Rect,
+}
+
+impl TabsState {
+    /// The state with tab `selected` selected.
+    pub fn new(_ selected: usize) -> Self {
+        TabsState { selected, first: 0, area: Rect::ZERO }
+    }
+
+    /// The row the last render drew the tabs in.
+    pub fn area(self) -> Rect {
+        self.area
+    }
+
+    /// The first tab the last render showed: more than 0 when the tabs do
+    /// not fit and the row scrolled to show the selected one.
+    pub fn first(self) -> usize {
+        self.first
+    }
+}
+
+/// A row of titles with one selected, on the top row of its area:
+///
+/// ```fe
+/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+///     let (head, body) = area.split_top(1)
+///     Tabs::new().render(head, ["Files", "Search", "Help"], mut self.tabs)
+/// }
+/// ```
+///
+/// The titles are any indexable list of `Display` values: an array, or a
+/// `MemSlice` or `MemVec` of `MemBuffer`s or `DynString`s. Each tab is its
+/// title with padding on both sides, and a divider stands between tabs.
+/// When the tabs do not fit, the row scrolls by whole tabs to show the
+/// selected one, as little as it can from where it was.
+///
+/// Titles take the theme's `text` style and the selected tab its `accent`
+/// style, over the padding too; dividers take the `border` style. A style
+/// set on the tabs applies over the theme's.
+pub struct Tabs {
+    divider: String<16>,
+    padding_left: u16,
+    padding_right: u16,
+    style: Style,
+    selected_style: Style,
+    divider_style: Style,
+}
+
+impl Copy for Tabs {}
+
+impl Tabs {
+    /// Tabs divided by `│`, with one cell of padding on each side.
+    pub fn new() -> Self {
+        Tabs {
+            divider: "│",
+            padding_left: 1,
+            padding_right: 1,
+            style: Style::NONE,
+            selected_style: Style::NONE,
+            divider_style: Style::NONE,
+        }
+    }
+
+    /// The text between two tabs.
+    pub fn divider(var own self, _ divider: String<16>) -> Self {
+        self.divider = divider
+        self
+    }
+
+    /// The cells before and after each title.
+    pub fn padding(var own self, left: u16, right: u16) -> Self {
+        self.padding_left = left
+        self.padding_right = right
+        self
+    }
+
+    /// The style for the tabs, over the theme's `text` style.
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
+    }
+
+    /// The style for the selected tab, over the theme's `accent` style.
+    pub fn selected_style(var own self, _ style: Style) -> Self {
+        self.selected_style = style
+        self
+    }
+
+    /// The style for the dividers, over the theme's `border` style.
+    pub fn divider_style(var own self, _ style: Style) -> Self {
+        self.divider_style = style
+        self
+    }
+
+    /// Draws `titles` on the top row of `area`, with `state.selected`
+    /// selected, and records in `state` what it drew.
+    pub fn render<C: Len + Index<usize>>(self, _ area: Rect, _ titles: C, _ state: mut TabsState)
+    uses (frame: mut Frame, C::E)
+    where C::Output: Display
+    {
+        let (row, _) = area.split_top(1)
+        state.area = row
+        let count = titles.len()
+        if count == 0 {
+            state.selected = 0
+            state.first = 0
+            return
+        }
+        if state.selected >= count {
+            state.selected = count - 1
+        }
+        var scratch = MemBuffer::empty()
+        let selected = state.selected
+        state.first = self
+            .scroll(
+                titles,
+                room: row.width as usize,
+                selected,
+                first: state.first,
+                mut scratch,
+            )
+        let divider_width = measure(self.divider, mut scratch)
+        let text = theme().text.patch(self.style)
+        let highlight = text.patch(theme().accent).patch(self.selected_style)
+        let divider = theme().border.patch(self.divider_style)
+        var x = row.x as usize
+        for i in state.first .. count {
+            if x >= row.right() as usize {
+                break
+            }
+            if i > state.first {
+                print_in(part(row, x, divider_width), self.divider, divider)
+                x += divider_width
+            }
+            let title = measure(titles[i], mut scratch)
+            let width = title + self.padding_width()
+            let style = if i == selected { highlight } else { text }
+            fill(part(row, x, width), " ", style)
+            print_in(
+                part(row, x + self.padding_left as usize, title),
+                scratch.span(),
+                Style::NONE,
+            )
+            x += width
+        }
+    }
+
+    /// The tab at `pos`, as the last render with `state` drew `titles`, or
+    /// `None` if `pos` is on a divider or past the tabs. Pass the titles
+    /// that render drew.
+    pub fn tab_at<C: Len + Index<usize>>(
+        self,
+        _ titles: C,
+        _ state: TabsState,
+        _ pos: Pos,
+    ) -> Option<usize>
+    uses C::E
+    where C::Output: Display
+    {
+        if !state.area.contains(pos) {
+            return Option::None
+        }
+        var scratch = MemBuffer::empty()
+        let divider_width = measure(self.divider, mut scratch)
+        let column = pos.x as usize
+        var x = state.area.x as usize
+        for i in state.first .. titles.len() {
+            if i > state.first {
+                x += divider_width
+                if column < x {
+                    return Option::None
+                }
+            }
+            x += self.tab_width(titles[i], mut scratch)
+            if column < x {
+                return Option::Some(i)
+            }
+        }
+        Option::None
+    }
+
+    // The first tab to show in `room` columns so that tab `selected` shows
+    // whole if it fits, moving as little as it can from tab `first`; and
+    // the first to start no later than it must, so no room is left after
+    // the last tab that an earlier one would fill.
+    fn scroll<C: Len + Index<usize>>(
+        self,
+        _ titles: C,
+        room: usize,
+        selected: usize,
+        first: usize,
+        _ scratch: mut MemBuffer,
+    ) -> usize
+    uses C::E
+    where C::Output: Display
+    {
+        let divider = measure(self.divider, mut scratch)
+        var first = if first > selected { selected } else { first }
+        // The columns from the start of tab `first` to the end of `selected`.
+        var shown: usize = 0
+        for i in first .. selected + 1 {
+            shown += self.tab_width(titles[i], mut scratch) + if i > first { divider } else { 0 }
+        }
+        while first < selected && shown > room {
+            shown -= self.tab_width(titles[first], mut scratch) + divider
+            first += 1
+        }
+        // From there to the end of the last tab.
+        for i in selected + 1 .. titles.len() {
+            shown += divider + self.tab_width(titles[i], mut scratch)
+        }
+        while first > 0 {
+            let before = self.tab_width(titles[first - 1], mut scratch) + divider
+            if shown + before > room {
+                break
+            }
+            shown += before
+            first -= 1
+        }
+        first
+    }
+
+    // The columns of a tab with `title`, which is left in `scratch`.
+    fn tab_width<T: Display>(self, _ title: T, _ scratch: mut MemBuffer) -> usize {
+        measure(title, mut scratch) + self.padding_width()
+    }
+
+    fn padding_width(self) -> usize {
+        self.padding_left as usize + self.padding_right as usize
+    }
+}
+
+// The cells of `row` from column `x`, `width` wide, that lie in it.
+fn part(_ row: Rect, _ x: usize, _ width: usize) -> Rect {
+    Rect::new(
+        x: clamp_u16(x),
+        y: row.y,
+        width: clamp_u16(width),
+        height: row.height,
+    ).intersect(row)
+}
+
+#[test]
+fn tabs_draw_titles_between_dividers() {
+    let text = drawn_text(
+        width: 20,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                var state = TabsState::new(1)
+                Tabs::new().render(area, ["One", "Two", "Three"], mut state)
+                assert(
+                    state.area() == Rect::new(x: 0, y: 0, width: 20, height: 1),
+                )
+            }
+        },
+    )
+    assert(text == " One │ Two │ Three\n")
+    let text = drawn_text(
+        width: 20,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                var state = TabsState::new(0)
+                Tabs::new()
+                    .divider(" / ")
+                    .padding(left: 0, right: 0)
+                    .render(area, ["a", "b", "c"], mut state)
+            }
+        },
+    )
+    assert(text == "a / b / c")
+}
+
+#[test]
+fn the_selected_tab_stands_out() {
+    let buffer = drawn(
+        width: 12,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                var state = TabsState::new(1)
+                Tabs::new()
+                    .selected_style(Style::new().bold())
+                    .render(area, ["ab", "cd"], mut state)
+            }
+        },
+    )
+    // " ab │ cd ": the selected tab is columns 5 to 8, padding included.
+    for x in [5, 6, 7, 8] {
+        let cell = buffer.get(Pos::new(x, y: 0)).unwrap()
+        assert(
+            cell.fg() == Color::CYAN && cell.modifier() == Modifier::BOLD,
+        )
+    }
+    let other = buffer.get(Pos::new(x: 1, y: 0)).unwrap()
+    assert(other.fg() == Color::RESET && other.modifier().is_empty())
+    assert(
+        buffer.get(Pos::new(x: 4, y: 0)).unwrap().modifier() == Modifier::DIM,
+    )
+}
+
+// What tabs of `titles` show in 12 columns as the selection moves through
+// `selections`, each row one render with the state the last left.
+fn scrolled(_ selections: [usize; 6]) -> MemBuffer {
+    drawn_text(
+        width: 12,
+        height: 6,
+        |frame, area| {
+            with (frame) {
+                var state = TabsState::new(0)
+                for (y, selected) in selections.enumerate() {
+                    state.selected = selected
+                    let row = Rect::new(x: 0, y: y.downcast_truncate(), width: 12, height: 1)
+                    Tabs::new().render(row, ["Alpha", "Beta", "Gamma", "Delta"], mut state)
+                }
+            }
+        },
+    )
+}
+
+#[test]
+fn tabs_scroll_to_show_the_selected_one() {
+    // The tabs are 7, 6, 7 and 7 columns, with a divider between each two.
+    assert(
+        scrolled([0, 1, 2, 3, 2, 0])
+            == " Alpha │ Bet\n Beta │ Gamm\n Gamma │ Del\n Delta\n Gamma │ Del\n Alpha │ Bet",
+    )
+    // A selection past the last tab selects the last.
+    drawn(
+        width: 12,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                var state = TabsState::new(9)
+                Tabs::new().render(area, ["Alpha", "Beta", "Gamma", "Delta"], mut state)
+                assert(state.selected == 3 && state.first() == 3)
+                // A wider row shows earlier tabs again.
+                Tabs::new()
+                    .render(
+                        Rect::new(x: 0, y: 0, width: 15, height: 1),
+                        ["Alpha", "Beta", "Gamma", "Delta"],
+                        mut state,
+                    )
+                assert(state.first() == 2)
+                Tabs::new()
+                    .render(
+                        Rect::new(x: 0, y: 0, width: 40, height: 1),
+                        ["Alpha", "Beta", "Gamma", "Delta"],
+                        mut state,
+                    )
+                assert(state.first() == 0)
+            }
+        },
+    )
+    // A tab wider than the row shows its start.
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                var state = TabsState::new(1)
+                Tabs::new().render(area, ["Alpha", "Beta"], mut state)
+            }
+        },
+    )
+    assert(text == " Bet")
+}
+
+#[test]
+fn positions_map_back_to_tabs() {
+    let titles = ["Alpha", "Beta", "Gamma", "Delta"]
+    drawn(
+        width: 14,
+        height: 3,
+        |frame, _| {
+            with (frame) {
+                let tabs = Tabs::new()
+                var state = TabsState::new(0)
+                tabs.render(
+                    Rect::new(x: 1, y: 1, width: 12, height: 2),
+                    titles,
+                    mut state,
+                )
+                assert(
+                    tabs.tab_at(titles, state, Pos::new(x: 1, y: 1)) == Option::Some(0),
+                )
+                assert(
+                    tabs.tab_at(titles, state, Pos::new(x: 7, y: 1)) == Option::Some(0),
+                )
+                assert(tabs.tab_at(titles, state, Pos::new(x: 8, y: 1)).is_none())
+                assert(
+                    tabs.tab_at(titles, state, Pos::new(x: 9, y: 1)) == Option::Some(1),
+                )
+                assert(
+                    tabs.tab_at(titles, state, Pos::new(x: 12, y: 1)) == Option::Some(1),
+                )
+                assert(
+                    tabs.tab_at(titles, state, Pos::new(x: 13, y: 1)).is_none(),
+                )
+                assert(tabs.tab_at(titles, state, Pos::new(x: 0, y: 1)).is_none())
+                assert(tabs.tab_at(titles, state, Pos::new(x: 3, y: 2)).is_none())
+                state.selected = 3
+                tabs.render(
+                    Rect::new(x: 1, y: 1, width: 12, height: 2),
+                    titles,
+                    mut state,
+                )
+                assert(
+                    tabs.tab_at(titles, state, Pos::new(x: 1, y: 1)) == Option::Some(3),
+                )
+                assert(tabs.tab_at(titles, state, Pos::new(x: 8, y: 1)).is_none())
+            }
+        },
+    )
+}
+
+#[test]
+fn titles_may_be_buffers_or_strings() {
+    var buffers: MemVec<MemBuffer> = MemVec::new()
+    buffers.push(format!("log"))
+    buffers.push(format!("tab ", 2 as u8))
+    var strings: MemVec<DynString> = MemVec::new()
+    strings.push("x")
+    strings.push("a title longer than thirty-one bytes")
+    let text = drawn_text(
+        width: 24,
+        height: 3,
+        |frame, area| {
+            with (frame) {
+                var state = TabsState::new(0)
+                let (first, rest) = area.split_top(1)
+                Tabs::new().render(first, buffers.as_slice(), mut state)
+                let (second, third) = rest.split_top(1)
+                Tabs::new().render(second, strings.as_slice(), mut state)
+                Tabs::new().render(third, strings, mut state)
+            }
+        },
+    )
+    assert(
+        text == " log │ tab 2\n x │ a title longer than\n x │ a title longer than",
+    )
+}
+
+#[test]
+fn tabs_draw_nothing_without_room_or_titles() {
+    let empty: [String<1>; 0] = []
+    let text = drawn_text(
+        width: 5,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                var state = TabsState::new(2)
+                Tabs::new().render(area, empty, mut state)
+                assert(state.selected == 0)
+                Tabs::new()
+                    .render(
+                        Rect::new(x: 1, y: 1, width: 0, height: 1),
+                        ["a", "b"],
+                        mut state,
+                    )
+                Tabs::new()
+                    .render(
+                        Rect::new(x: 1, y: 1, width: 3, height: 0),
+                        ["a", "b"],
+                        mut state,
+                    )
+                Tabs::new()
+                    .render(
+                        Rect::new(x: 1, y: 1, width: 3, height: 1),
+                        ["a", "b"],
+                        mut state,
+                    )
+                assert(
+                    Tabs::new().tab_at(["a", "b"], state, Pos::new(x: 4, y: 1)).is_none(),
+                )
+            }
+        },
+    )
+    assert(text == ".....\n. a .")
+}

@@ -1,0 +1,95 @@
+//! Widgets: what views draw with.
+//!
+//! A widget is a small `Copy` value that holds its configuration, built by
+//! methods that each return a changed copy:
+//! `Block::bordered().rounded().border_style(style)`. What it shows is
+//! passed to its render call as a view, so nothing is copied, and the state
+//! that outlives a frame, such as a selection or a scroll offset, is a `mut`
+//! parameter that lives in the program's model. A render may write what it
+//! laid out into that state, such as the area it drew, for event handling
+//! to use later.
+//!
+//! Every render draws through the `Frame` effect, only inside the area it
+//! is given: an empty or tiny area draws what fits, or nothing, and never
+//! panics. Widgets take their styles from the frame's theme, and a style set
+//! on a widget applies over the theme's.
+use std::io::Display
+use ingot::buffer::Buffer
+use ingot::frame::Frame
+use ingot::geom::{Rect, Size}
+use ingot::text::width
+use ingot::theme::Theme
+
+pub use block::{Block, BorderSymbols, BorderType, Borders, Padding}
+pub use clear::{clear, popup}
+pub use gauge::{Gauge, LineGauge}
+pub use scrollbar::{Orientation, Scrollbar}
+pub use sparkline::Sparkline
+pub use spinner::Spinner
+pub use tabs::{Tabs, TabsState}
+
+pub use ingot::text::Alignment
+
+// The columns the `Display` text of `text` takes. The text is left in
+// `scratch`, to draw from.
+pub(ingot) fn measure<T: Display>(_ text: T, _ scratch: mut MemBuffer) -> usize {
+    scratch.clear()
+    text.fmt(mut scratch)
+    width(scratch.span())
+}
+
+// `value` as a `u16`, or 65535 if it is larger.
+pub(ingot) fn clamp_u16(_ value: usize) -> u16 {
+    if value > 65535 {
+        65535
+    } else {
+        value.downcast_truncate()
+    }
+}
+
+/// For tests: the buffer `draw` leaves in a frame of `width` by `height`
+/// empty cells with the dark theme. `draw` gets the frame, to provide to
+/// what it draws, and the frame's area:
+///
+/// ```fe
+/// let text = drawn(width: 5, height: 3, |frame, area| {
+///     with (frame) { Block::bordered().render(area) }
+/// }).to_text()
+/// assert(text == "┌───┐\n│   │\n└───┘")
+/// ```
+pub(ingot) fn drawn<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> Buffer
+uses F::E
+{
+    var frame = Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
+    let area = frame.area()
+    draw(mut frame, area)
+    frame.into_buffer()
+}
+
+/// For tests: the text of the buffer `drawn` gives, row by row; see
+/// `Buffer::to_text`.
+pub(ingot) fn drawn_text<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> MemBuffer
+uses F::E
+{
+    drawn(width, height, draw).to_text()
+}
+
+#[test]
+fn alignments_place_content_in_the_room_left() {
+    assert(Alignment::Left.offset(width: 3, available: 10) == 0)
+    assert(Alignment::Center.offset(width: 3, available: 10) == 3)
+    assert(Alignment::Right.offset(width: 3, available: 10) == 7)
+    assert(Alignment::Center.offset(width: 12, available: 10) == 0)
+    assert(Alignment::Right.offset(width: 10, available: 10) == 0)
+    assert(Alignment::Center != Alignment::Right)
+}
+
+#[test]
+fn measures_display_text() {
+    var scratch = MemBuffer::empty()
+    assert(measure("abc", mut scratch) == 3)
+    assert(scratch == "abc")
+    assert(measure(1234 as u32, mut scratch) == 4)
+    assert(measure("", mut scratch) == 0)
+    assert(clamp_u16(70000) == 65535 && clamp_u16(7) == 7)
+}
