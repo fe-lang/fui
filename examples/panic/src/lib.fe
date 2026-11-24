@@ -1,0 +1,42 @@
+//! An app with a bug, for checking what a panic leaves behind: `p` reads
+//! past the end of a list, which panics while the app holds the terminal.
+//! The panic restores the terminal first, so its report shows on the
+//! shell's screen. `q` quits.
+use std::term::Tty
+use std::time::Clock
+use tui::prelude::*
+
+/// The model: a list that `p` reads one past the end of.
+pub struct Buggy { pub values: MemVec<u64> }
+
+impl App for Buggy {
+    uses E = ()
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        match event {
+            Event::Key(key) => if key.is_char(b'q') {
+                Flow::Quit
+            } else if key.is_char(b'p') {
+                // The bug: an index one past the last.
+                self.values.push(self.values[self.values.len()])
+                Flow::Redraw
+            } else {
+                Flow::Unchanged
+            },
+            _ => Flow::Unchanged,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let _ = print_in(area, "p panics, q quits", theme().text)
+    }
+}
+
+/// Runs the app on the terminal.
+pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
+    var app = Buggy { values: MemVec::new() }
+    match run(mut app, Options::new()) {
+        Result::Ok(()) => 0,
+        Result::Err(_) => 1,
+    }
+}
