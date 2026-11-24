@@ -1,9 +1,8 @@
 //! A scrollbar: where a view is in content longer than it.
 use core::ops::Eq
-use ingot::frame::{Frame, fill, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
-use super::{drawn, drawn_text}
 use super::scroll::ScrollState
 
 /// Which way a `Scrollbar` runs.

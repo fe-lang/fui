@@ -1,9 +1,8 @@
 //! An animation that shows work in progress.
 use std::io::Display
-use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, print_in, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
-use super::{drawn, drawn_text}
 
 // The kinds of frames a spinner cycles through.
 enum Frames {

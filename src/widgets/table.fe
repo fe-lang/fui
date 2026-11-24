@@ -3,15 +3,14 @@
 use core::{MemBuffer, MemSpan}
 use core::ops::{Eq, Index, Len}
 use std::io::Display
-use ingot::buffer::Buffer
+use ingot::buffer::{Buffer, cell_at}
 use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, measure, print, print_in, theme}
-use ingot::geom::{Pos, Rect, Size}
+use ingot::frame::{Frame, frame_of, measure, print, print_in, theme}
+use ingot::geom::{Pos, Rect}
 use ingot::layout::{Constraint, Layout}
 use ingot::layout::Constraint::{Fill, Length}
 use ingot::style::{Color, Modifier, Style}
 use ingot::text::{Alignment, ELLIPSIS, truncate, truncate_with_ellipsis, width}
-use ingot::theme::Theme
 use super::clamp_u16
 use super::list::ListState
 use super::scroll::ScrollState
@@ -240,7 +239,7 @@ impl Table {
             let y = row_y(state.rows.area(), row - first)
             let selected = state.rows.selected() == Option::Some(row)
             for (column, rect) in rects.enumerate() {
-                let cell = cell_at(rect, y)
+                let cell = cell_rect(rect, y)
                 // `with (Frame = clipped(cell))` would not reach `draw`; see
                 // `Frame::clip_to`.
                 let clip = frame.clip_to(cell)
@@ -298,7 +297,7 @@ impl Table {
                 scratch.clear()
                 column.title.fmt(mut scratch)
                 self.draw_text(
-                    cell_at(rects[i], header.y),
+                    cell_rect(rects[i], header.y),
                     scratch.span(),
                     column.alignment,
                 )
@@ -359,7 +358,7 @@ fn row_y(_ body: Rect, _ index: usize) -> u16 {
 }
 
 // The cell of the column `column` in row `y`.
-fn cell_at(_ column: Rect, _ y: u16) -> Rect {
+fn cell_rect(_ column: Rect, _ y: u16) -> Rect {
     Rect { x: column.x, y, width: column.width, height: 1 }
 }
 
@@ -568,11 +567,6 @@ impl TableState {
     }
 }
 
-// A frame of `width` by `height` empty cells, with the dark theme.
-fn blank(width: u16, height: u16) -> Frame {
-    Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
-}
-
 // The buffer `table` draws `rows` into, filling a frame of `width` by
 // `height`.
 fn rendered<R: Len + Index<usize>, T: Display, const N: usize>(
@@ -586,16 +580,12 @@ fn rendered<R: Len + Index<usize>, T: Display, const N: usize>(
 uses R::E
 where R::Output: TableRow
 {
-    var frame = blank(width, height)
+    var frame = frame_of(width, height)
     let area = frame.area()
     with (frame) {
         table.render(area, columns, rows, mut state)
     }
     frame.into_buffer()
-}
-
-fn modifier_at(_ buffer: Buffer, _ x: u16, _ y: u16) -> Modifier {
-    buffer.get(Pos::new(x, y)).unwrap().modifier()
 }
 
 fn ten_rows() -> [[u16; 2]; 10] {
@@ -726,9 +716,11 @@ fn headers_and_separators_take_their_rows() {
         mut state,
     )
     assert(buffer.to_text() == "Na… N\n──────\na   1\nb   2")
-    assert(modifier_at(buffer, 0, 0).contains(Modifier::BOLD))
-    assert(modifier_at(buffer, 0, 1) == Modifier::DIM)
-    assert(modifier_at(buffer, 0, 2).is_empty())
+    assert(
+        cell_at(buffer, x: 0, y: 0).modifier().contains(Modifier::BOLD),
+    )
+    assert(cell_at(buffer, x: 0, y: 1).modifier() == Modifier::DIM)
+    assert(cell_at(buffer, x: 0, y: 2).modifier().is_empty())
     let styled = rendered(
         Table::new().header_style(Style::new().fg(Color::RED)),
         width: 6,
@@ -740,7 +732,7 @@ fn headers_and_separators_take_their_rows() {
     assert(
         styled.get(Pos::new(x: 5, y: 0)).unwrap().fg() == Color::RED,
     )
-    assert(modifier_at(styled, 5, 0) == Modifier::BOLD)
+    assert(cell_at(styled, x: 5, y: 0).modifier() == Modifier::BOLD)
     let bare = rendered(
         Table::new().header(false),
         width: 6,
@@ -773,7 +765,8 @@ fn the_selected_row_is_highlighted_across_its_gaps() {
             cell.modifier() == Modifier::REVERSED && cell.fg() == Color::GREEN,
         )
         assert(
-            modifier_at(buffer, x, 1).is_empty() && modifier_at(buffer, x, 3).is_empty(),
+            cell_at(buffer, x, y: 1).modifier().is_empty()
+                && cell_at(buffer, x, y: 3).modifier().is_empty(),
         )
     }
 }
@@ -796,7 +789,9 @@ fn the_selected_row_starts_with_the_highlight_symbol() {
     assert(
         state.column(0) == Option::Some(Rect::new(x: 2, y: 0, width: 2, height: 3)),
     )
-    assert(modifier_at(buffer, 0, 2) == Modifier::REVERSED)
+    assert(
+        cell_at(buffer, x: 0, y: 2).modifier() == Modifier::REVERSED,
+    )
 }
 
 #[test]
@@ -926,7 +921,7 @@ fn clicks_hit_rows_and_columns() {
     let rows = ten_rows()
     var state = TableState::new()
     // At (1, 1), 6 by 5, with a separator: rows from y = 3, three shown.
-    var frame = blank(width: 8, height: 6)
+    var frame = frame_of(width: 8, height: 6)
     with (frame) {
         Table::new()
             .separator(true)
@@ -1057,7 +1052,9 @@ fn zero_columns_draw_no_cells() {
     )
     assert(buffer.to_text() == "\n\n")
     assert(state.column(0).is_none())
-    assert(modifier_at(buffer, 3, 1) == Modifier::REVERSED)
+    assert(
+        cell_at(buffer, x: 3, y: 1).modifier() == Modifier::REVERSED,
+    )
     assert(
         state.hit(Pos::new(x: 0, y: 1)) == Option::Some(TableHit::Row(0, Option::None)),
     )
@@ -1136,11 +1133,13 @@ uses (frame: mut Frame)
 fn closures_draw_each_cell_clipped_to_it() {
     var state = TableState::new()
     state.select(1)
-    var frame = blank(width: 7, height: 3)
+    var frame = frame_of(width: 7, height: 3)
     let area = frame.area()
     with (frame) {
         draw_numbers(area, ten_rows(), mut state)
     }
     assert(frame.buffer().to_text() == "A   B\n0xy 0xy\n>1x >10")
-    assert(modifier_at(frame.buffer(), 3, 2) == Modifier::REVERSED)
+    assert(
+        cell_at(frame.buffer(), x: 3, y: 2).modifier() == Modifier::REVERSED,
+    )
 }

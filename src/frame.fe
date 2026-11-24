@@ -41,7 +41,7 @@
 use core::MemSpan
 use core::mem::replace
 use std::io::Display
-use super::buffer::Buffer
+use super::buffer::{Buffer, cell_at}
 use super::geom::{Pos, Rect, Size}
 use super::style::{Color, Modifier, Style}
 use super::text::{Alignment, ELLIPSIS, Line, Run, Text, column_offset, next_cluster, width}
@@ -529,8 +529,37 @@ pub fn theme() -> Theme uses (frame: Frame) {
     frame.theme
 }
 
-fn frame_of(width: u16, height: u16) -> Frame {
+/// For tests: a frame of `width` by `height` empty cells with the dark
+/// theme.
+pub(ingot) fn frame_of(width: u16, height: u16) -> Frame {
     Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
+}
+
+/// For tests: the buffer `draw` leaves in a frame of `width` by `height`
+/// empty cells with the dark theme. `draw` gets the frame, to provide to
+/// what it draws, and the frame's area:
+///
+/// ```fe
+/// let text = drawn(width: 5, height: 3, |frame, area| {
+///     with (frame) { Block::bordered().render(area) }
+/// }).to_text()
+/// assert(text == "┌───┐\n│   │\n└───┘")
+/// ```
+pub(ingot) fn drawn<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> Buffer
+uses F::E
+{
+    var frame = frame_of(width, height)
+    let area = frame.area()
+    draw(mut frame, area)
+    frame.into_buffer()
+}
+
+/// For tests: the text of the buffer `drawn` gives, row by row; see
+/// `Buffer::to_text`.
+pub(ingot) fn drawn_text<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> MemBuffer
+uses F::E
+{
+    drawn(width, height, draw).to_text()
 }
 
 fn clip() -> Rect uses (frame: Frame) {
@@ -736,6 +765,13 @@ fn scopes_restore_on_every_way_out() {
 }
 
 #[test]
+fn display_text_measures_in_columns() {
+    var frame = frame_of(width: 1, height: 1)
+    assert(frame.measure("abc") == 3 && frame.measure("漢字") == 4)
+    assert(frame.measure(1234 as u32) == 4 && frame.measure("") == 0)
+}
+
+#[test]
 fn the_cursor_shows_only_in_the_clip() {
     var frame = frame_of(width: 4, height: 4)
     assert(frame.cursor().is_none())
@@ -765,10 +801,6 @@ fn empty_frames_draw_nothing() {
     assert(frame.into_buffer().to_text().is_empty())
 }
 
-fn fg_at(_ frame: Frame, x: u16, y: u16) -> Color {
-    frame.buffer().get(Pos::new(x, y)).unwrap().fg()
-}
-
 fn two_runs() -> Line {
     var line = Line::styled("ab", Style::new().fg(Color::RED))
     line.push("cdef", Style::new().fg(Color::BLUE))
@@ -788,14 +820,16 @@ fn lines_draw_each_run_in_its_style() {
                 ) == 4,
     )
     assert(frame.buffer().to_text() == " abcd\n")
-    assert(fg_at(frame, x: 0, y: 0) == Color::RESET)
+    assert(cell_at(frame.buffer(), x: 0, y: 0).fg() == Color::RESET)
     assert(
-        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 2, y: 0) == Color::RED,
+        cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::RED,
     )
     assert(
-        fg_at(frame, x: 3, y: 0) == Color::BLUE && fg_at(frame, x: 4, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 3, y: 0).fg() == Color::BLUE
+            && cell_at(frame.buffer(), x: 4, y: 0).fg() == Color::BLUE,
     )
-    assert(fg_at(frame, x: 5, y: 0) == Color::RESET)
+    assert(cell_at(frame.buffer(), x: 5, y: 0).fg() == Color::RESET)
 }
 
 #[test]
@@ -853,7 +887,8 @@ fn lines_never_split_a_wide_cluster() {
     )
     assert(frame.buffer().to_text() == "a漢.\n.a漢\n....")
     assert(
-        fg_at(frame, x: 1, y: 0) == Color::BLUE && fg_at(frame, x: 2, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::BLUE
+            && cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::BLUE,
     )
 }
 
@@ -873,7 +908,8 @@ fn cut_lines_may_end_in_an_ellipsis() {
     )
     // The ellipsis takes the style of the text it stands for.
     assert(
-        fg_at(frame, x: 2, y: 0) == Color::RED && fg_at(frame, x: 3, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 3, y: 0).fg() == Color::BLUE,
     )
     // A line that fits has none.
     assert(
@@ -917,7 +953,8 @@ fn clusters_take_the_style_of_the_run_they_start_in() {
     assert(frame.print_line(frame.area(), line, Alignment::Left) == 3)
     assert(frame.buffer().to_text() == "xéy")
     assert(
-        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 2, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::BLUE,
     )
 }
 
@@ -981,7 +1018,8 @@ fn skipped_columns_hide_the_start_of_a_range() {
             == 5,
     )
     assert(
-        fg_at(frame, x: 0, y: 0) == Color::RED && fg_at(frame, x: 1, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 0, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::BLUE,
     )
     assert(
         frame

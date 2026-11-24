@@ -1,9 +1,9 @@
 //! Progress as a bar.
 use std::io::Display
-use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
 use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Modifier, Style}
-use super::{Alignment, clamp_u16, drawn, drawn_text, measure}
+use super::{Alignment, clamp_u16}
 
 /// A bar that fills its area as far as `done` is of `total`, with a label
 /// in the middle:
@@ -65,14 +65,13 @@ impl Gauge {
         fill(edge, EIGHTHS[eighth], bar)
         fill(rest, " ", bar)
 
-        var scratch = MemBuffer::empty()
-        let width = measure(label, mut scratch)
+        let width = measure(label)
         let x = area.x + clamp_u16(
                 Alignment::Center.offset(width, available: area.width as usize),
             )
         let y = area.y + (area.height - 1) / 2
         let room = Rect { x, y, width: min(clamp_u16(width), area.right() - x), height: 1 }
-        print_in(room, scratch.span(), theme().text.patch(self.label_style))
+        print_in(room, label, theme().text.patch(self.label_style))
         let covered = full + (eighth >= 4) as u16
         let (inverted, _) = room.split_left(covered.saturating_sub(x - area.x))
         frame.set_style(inverted, Style::new().reversed())
@@ -132,10 +131,9 @@ impl LineGauge {
     uses (frame: mut Frame)
     {
         let (row, _) = area.split_top(1)
-        var scratch = MemBuffer::empty()
-        let width = measure(label, mut scratch)
+        let width = measure(label)
         let (head, line) = row.split_left(clamp_u16(if width > 0 { width + 1 } else { 0 }))
-        print_in(head, scratch.span(), theme().text.patch(self.label_style))
+        print_in(head, label, theme().text.patch(self.label_style))
         let (filled_part, rest) = line
             .split_left(
                 filled(line.width, done, total, parts: 1).downcast_truncate(),

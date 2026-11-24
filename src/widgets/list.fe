@@ -3,12 +3,10 @@ use core::MemVec
 use core::ops::{Index, Len}
 use std::abi::DynString
 use std::io::Display
-use ingot::buffer::Buffer
 use ingot::event::{Key, KeyCode, KeyKind, Modifiers, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, measure, print_in, set_style, theme}
-use ingot::geom::{Pos, Rect, Size, min}
+use ingot::frame::{Frame, frame_of, measure, print_in, set_style, theme}
+use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Modifier, Style}
-use ingot::theme::Theme
 use super::paragraph::Paragraph
 use super::scroll::{ScrollState, WHEEL_ROWS}
 
@@ -525,10 +523,6 @@ fn is_shift_g(_ key: Key) -> bool {
     key.is_char(b'G')
         || key.pressed(KeyCode::Char(b'G'), Modifiers::SHIFT)
         || key.pressed(KeyCode::Char(b'g'), Modifiers::SHIFT)
-}
-
-fn frame_of(width: u16, height: u16) -> Frame {
-    Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
 }
 
 fn letters() -> MemVec<MemBuffer> {

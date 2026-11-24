@@ -3,10 +3,10 @@ use core::ops::{Index, Len}
 use std::abi::DynString
 use std::io::Display
 use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
-use super::{clamp_u16, drawn, drawn_text, measure}
+use super::clamp_u16
 
 /// The most tabs a `TabsState` records for hit-testing. A row may show
 /// more, and a click on a later one selects none.
@@ -235,17 +235,14 @@ impl Tabs {
         if state.selected >= count {
             state.selected = count - 1
         }
-        var scratch = MemBuffer::empty()
         let selected = state.selected
-        state.first = self
-            .scroll(
+        state.first = self.scroll(
                 titles,
                 room: row.width as usize,
                 selected,
                 first: state.first,
-                mut scratch,
             )
-        let divider_width = measure(self.divider, mut scratch)
+        let divider_width = measure(self.divider)
         let text = theme().text.patch(self.style)
         let highlight = text.patch(theme().highlight).patch(self.highlight_style)
         let divider = theme().border.patch(self.divider_style)
@@ -258,7 +255,7 @@ impl Tabs {
                 print_in(part(row, x, divider_width), self.divider, divider)
                 x += divider_width
             }
-            let title = measure(titles[i], mut scratch)
+            let title = measure(titles[i])
             let width = title + self.padding_width()
             let style = if i == selected { highlight } else { text }
             let tab = part(row, x, width)
@@ -269,7 +266,7 @@ impl Tabs {
             fill(tab, " ", style)
             print_in(
                 part(row, x + self.padding_left as usize, title),
-                scratch.span(),
+                titles[i],
                 Style::NONE,
             )
             x += width
@@ -286,28 +283,27 @@ impl Tabs {
         room: usize,
         selected: usize,
         first: usize,
-        _ scratch: mut MemBuffer,
     ) -> usize
-    uses C::E
+    uses (frame: mut Frame, C::E)
     where C::Output: Display
     {
-        let divider = measure(self.divider, mut scratch)
+        let divider = measure(self.divider)
         var first = if first > selected { selected } else { first }
         // The columns from the start of tab `first` to the end of `selected`.
         var shown: usize = 0
         for i in first .. selected + 1 {
-            shown += self.tab_width(titles[i], mut scratch) + if i > first { divider } else { 0 }
+            shown += self.tab_width(titles[i]) + if i > first { divider } else { 0 }
         }
         while first < selected && shown > room {
-            shown -= self.tab_width(titles[first], mut scratch) + divider
+            shown -= self.tab_width(titles[first]) + divider
             first += 1
         }
         // From there to the end of the last tab.
         for i in selected + 1 .. titles.len() {
-            shown += divider + self.tab_width(titles[i], mut scratch)
+            shown += divider + self.tab_width(titles[i])
         }
         while first > 0 {
-            let before = self.tab_width(titles[first - 1], mut scratch) + divider
+            let before = self.tab_width(titles[first - 1]) + divider
             if shown + before > room {
                 break
             }
@@ -317,9 +313,9 @@ impl Tabs {
         first
     }
 
-    // The columns of a tab with `title`, which is left in `scratch`.
-    fn tab_width<T: Display>(self, _ title: T, _ scratch: mut MemBuffer) -> usize {
-        measure(title, mut scratch) + self.padding_width()
+    // The columns of a tab with `title`.
+    fn tab_width<T: Display>(self, _ title: T) -> usize uses (frame: mut Frame) {
+        measure(title) + self.padding_width()
     }
 
     fn padding_width(self) -> usize {

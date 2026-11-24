@@ -1,11 +1,10 @@
 //! Text in an area, wrapped or cut to its width.
 use std::io::Display
-use ingot::buffer::Buffer
-use ingot::frame::{Frame, StyledText, set_style, theme}
-use ingot::geom::{Pos, Rect, Size}
+use ingot::buffer::cell_at
+use ingot::frame::{Frame, StyledText, frame_of, set_style, theme}
+use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Style}
 use ingot::text::{Alignment, Line, Text, Wrap, WrapMode, WrappedLine}
-use ingot::theme::Theme
 use super::scroll::ScrollState
 
 /// Text in an area: plain text, a styled `text::Line`, or the lines of a
@@ -222,14 +221,6 @@ impl Default for Paragraph {
     }
 }
 
-fn frame_of(width: u16, height: u16) -> Frame {
-    Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
-}
-
-fn fg_at(_ frame: Frame, x: u16, y: u16) -> Color {
-    frame.buffer().get(Pos::new(x, y)).unwrap().fg()
-}
-
 #[test]
 fn plain_text_draws_a_row_per_line() {
     var frame = frame_of(width: 6, height: 4)
@@ -278,12 +269,14 @@ fn runs_keep_their_styles_across_wrapped_rows() {
         Paragraph::new().wrap(WrapMode::Word).render_styled(area, line)
     }
     assert(frame.buffer().to_text() == "ab\ncdef\ngh")
-    assert(fg_at(frame, x: 0, y: 0) == Color::RED)
+    assert(cell_at(frame.buffer(), x: 0, y: 0).fg() == Color::RED)
     assert(
-        fg_at(frame, x: 1, y: 1) == Color::RED && fg_at(frame, x: 2, y: 1) == Color::BLUE,
+        cell_at(frame.buffer(), x: 1, y: 1).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 2, y: 1).fg() == Color::BLUE,
     )
     assert(
-        fg_at(frame, x: 3, y: 1) == Color::BLUE && fg_at(frame, x: 0, y: 2) == Color::BLUE,
+        cell_at(frame.buffer(), x: 3, y: 1).fg() == Color::BLUE
+            && cell_at(frame.buffer(), x: 0, y: 2).fg() == Color::BLUE,
     )
 }
 
@@ -334,7 +327,8 @@ fn texts_draw_each_line_and_empty_lines_take_rows() {
     assert(frame.buffer().to_text() == "ab\n\ncd\n")
     assert(scroll.content() == 3 && scroll.viewport() == 4)
     assert(
-        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 0, y: 2) == Color::BLUE,
+        cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 0, y: 2).fg() == Color::BLUE,
     )
 }
 
@@ -414,7 +408,8 @@ fn unwrapped_lines_scroll_sideways() {
     }
     assert(frame.buffer().to_text() == "bcde\nb\n 字x")
     assert(
-        fg_at(frame, x: 0, y: 2) == Color::RED && fg_at(frame, x: 1, y: 2) == Color::BLUE,
+        cell_at(frame.buffer(), x: 0, y: 2).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 1, y: 2).fg() == Color::BLUE,
     )
     // Wrapped text does not scroll sideways.
     var wrapped = frame_of(width: 4, height: 2)

@@ -1,8 +1,8 @@
 //! Clearing an area, for what is drawn over other widgets.
-use ingot::frame::{Frame, fill}
+use ingot::frame::{Frame, drawn, drawn_text, fill}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Style}
-use super::{Block, drawn, drawn_text}
+use super::Block
 
 /// Makes every cell of `area` empty: a space in the terminal's default
 /// colors, without attributes. What was drawn there before no longer

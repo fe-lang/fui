@@ -1,9 +1,9 @@
 //! A small bar chart of recent values.
 use core::ops::{Index, Len}
-use ingot::frame::{Frame, fill, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, theme}
 use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Style}
-use super::{clamp_u16, drawn, drawn_text}
+use super::clamp_u16
 
 /// A bar for each value, a column wide, in the bottom-up eighths
 /// `▁▂▃▄▅▆▇█`:

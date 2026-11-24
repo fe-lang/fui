@@ -1,11 +1,10 @@
 //! Borders and titles around an area.
-use core::MemSpan
 use core::ops::{BitAnd, BitOr, Eq}
 use std::io::Display
-use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
 use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Modifier, Style}
-use super::{Alignment, clamp_u16, drawn, drawn_text, measure}
+use super::{Alignment, clamp_u16}
 
 /// A set of the sides of a `Block` that have a border:
 /// `Borders::TOP | Borders::BOTTOM`.
@@ -323,24 +322,23 @@ impl Block {
                 border,
             )
         }
-        var scratch = MemBuffer::empty()
-        let top_width = measure(top, mut scratch)
+        let top_width = measure(top)
         self.edge(
             area,
             y: area.y,
             line: self.borders.contains(Borders::TOP),
             corners: (symbols.top_left, symbols.top_right),
-            title: scratch.span(),
+            title: top,
             title_width: top_width,
             alignment: self.title_alignment,
         )
-        let bottom_width = measure(bottom, mut scratch)
+        let bottom_width = measure(bottom)
         self.edge(
             area,
             y: area.bottom() - 1,
             line: self.borders.contains(Borders::BOTTOM),
             corners: (symbols.bottom_left, symbols.bottom_right),
-            title: scratch.span(),
+            title: bottom,
             title_width: bottom_width,
             alignment: self.bottom_title_alignment,
         )
@@ -349,13 +347,13 @@ impl Block {
 
     // Draws row `y` of `area`, the top or the bottom one: the border line
     // if `line`, its corners where a side border meets it, and the title.
-    fn edge(
+    fn edge<T: Display>(
         self,
         _ area: Rect,
         y: u16,
         line: bool,
         corners: (String<3>, String<3>),
-        title: MemSpan,
+        title: T,
         title_width: usize,
         alignment: Alignment,
     )

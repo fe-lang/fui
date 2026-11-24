@@ -13,12 +13,6 @@
 //! is given: an empty or tiny area draws what fits, or nothing, and never
 //! panics. Widgets take their styles from the frame's theme, and a style set
 //! on a widget applies over the theme's.
-use std::io::Display
-use ingot::buffer::Buffer
-use ingot::frame::Frame
-use ingot::geom::{Rect, Size}
-use ingot::text::width
-use ingot::theme::Theme
 
 pub use block::{Block, BorderSymbols, BorderType, Borders, Padding}
 pub use clear::{clear, popup}
@@ -35,14 +29,6 @@ pub use text_input::{TextInput, TextInputState, TextLimit}
 
 pub use ingot::text::Alignment
 
-// The columns the `Display` text of `text` takes. The text is left in
-// `scratch`, to draw from.
-pub(ingot) fn measure<T: Display>(_ text: T, _ scratch: mut MemBuffer) -> usize {
-    scratch.clear()
-    text.fmt(mut scratch)
-    width(scratch.span())
-}
-
 // `value` as a `u16`, or 65535 if it is larger.
 pub(ingot) fn clamp_u16(_ value: usize) -> u16 {
     if value > 65535 {
@@ -50,33 +36,6 @@ pub(ingot) fn clamp_u16(_ value: usize) -> u16 {
     } else {
         value.downcast_truncate()
     }
-}
-
-/// For tests: the buffer `draw` leaves in a frame of `width` by `height`
-/// empty cells with the dark theme. `draw` gets the frame, to provide to
-/// what it draws, and the frame's area:
-///
-/// ```fe
-/// let text = drawn(width: 5, height: 3, |frame, area| {
-///     with (frame) { Block::bordered().render(area) }
-/// }).to_text()
-/// assert(text == "┌───┐\n│   │\n└───┘")
-/// ```
-pub(ingot) fn drawn<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> Buffer
-uses F::E
-{
-    var frame = Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
-    let area = frame.area()
-    draw(mut frame, area)
-    frame.into_buffer()
-}
-
-/// For tests: the text of the buffer `drawn` gives, row by row; see
-/// `Buffer::to_text`.
-pub(ingot) fn drawn_text<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> MemBuffer
-uses F::E
-{
-    drawn(width, height, draw).to_text()
 }
 
 #[test]
@@ -90,11 +49,8 @@ fn alignments_place_content_in_the_room_left() {
 }
 
 #[test]
-fn measures_display_text() {
-    var scratch = MemBuffer::empty()
-    assert(measure("abc", mut scratch) == 3)
-    assert(scratch == "abc")
-    assert(measure(1234 as u32, mut scratch) == 4)
-    assert(measure("", mut scratch) == 0)
-    assert(clamp_u16(70000) == 65535 && clamp_u16(7) == 7)
+fn values_clamp_to_u16() {
+    assert(
+        clamp_u16(70000) == 65535 && clamp_u16(65535) == 65535 && clamp_u16(7) == 7,
+    )
 }

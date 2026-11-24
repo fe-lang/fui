@@ -17,6 +17,7 @@ use super::{
     scalar_width,
     truncate,
     truncate_with_ellipsis,
+    utf8,
     valid_up_to,
     width,
 }
@@ -25,14 +26,6 @@ fn bytes<const N: usize>(_ values: [u8; N]) -> MemBuffer {
     var out = MemBuffer::empty()
     for b in values {
         out.push(b)
-    }
-    out
-}
-
-fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
-    var out = MemBuffer::empty()
-    for c in scalars {
-        encode(c, mut out)
     }
     out
 }
