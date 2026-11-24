@@ -1,0 +1,1446 @@
+//! A single-line text field: its text with a cursor and a selection, the
+//! readline editing keys, and a render that scrolls to keep the cursor in
+//! view.
+use core::{MemBuffer, MemSpan}
+use core::mem::replace
+use std::io::Display
+use ingot::buffer::Buffer
+use ingot::event::{Key, KeyCode, KeyKind, Modifiers, Mouse, MouseButton, MouseKind}
+use ingot::frame::{Frame, theme}
+use ingot::geom::{Pos, Rect, Size}
+use ingot::style::{Modifier, Style}
+use ingot::text::{column_offset, decode, encode, is_control, next_cluster, width}
+use ingot::theme::Theme
+
+/// The most text a `TextInputState` holds.
+pub enum TextLimit {
+    /// At most this many grapheme clusters.
+    Clusters(usize),
+    /// At most this many columns.
+    Columns(usize),
+}
+
+impl Copy for TextLimit {}
+
+impl TextLimit {
+    // How much of the limit `text` takes.
+    fn measure(self, _ text: MemSpan) -> usize {
+        match self {
+            TextLimit::Clusters(_) => clusters(text),
+            TextLimit::Columns(_) => width(text),
+        }
+    }
+
+    fn max(self) -> usize {
+        match self {
+            TextLimit::Clusters(n) => n,
+            TextLimit::Columns(n) => n,
+        }
+    }
+
+    // The byte length of the longest prefix of whole clusters of `text`
+    // that takes at most `room` of the limit.
+    fn fit(self, _ text: MemSpan, _ room: usize) -> usize {
+        match self {
+            TextLimit::Clusters(_) => {
+                let (len, _) = locate(text, room, mask: 1)
+                len
+            },
+            TextLimit::Columns(_) => {
+                let (len, _) = column_offset(text, room)
+                len
+            },
+        }
+    }
+
+    // The byte length of `text` without its last cluster that takes any of
+    // the limit, and the clusters after it.
+    fn shorten(self, _ text: MemSpan) -> usize {
+        var at: usize = 0
+        var cut: usize = 0
+        while at < text.len() {
+            let len = next_cluster(text, at).len
+            if self.measure(text.slice(offset: at, len)) > 0 {
+                cut = at
+            }
+            at += len
+        }
+        cut
+    }
+}
+
+/// The text of a `TextInput` and where editing is in it: the cursor, an
+/// optional selection, and the horizontal scroll of the last render.
+///
+/// The text is one line of UTF-8 without controls. The cursor is a byte
+/// offset that is always at a grapheme cluster boundary, so every motion
+/// and deletion moves over whole clusters: a letter with its combining
+/// marks, a CJK ideograph, an emoji ZWJ sequence. Text an insertion brings
+/// is made one line first: each run of line breaks (LF, CR, CR LF, VT, FF,
+/// NEL, U+2028, U+2029) becomes one space where text follows and precedes
+/// it, and none at its start or end; a tab becomes a space; other controls
+/// are dropped; bytes that are no UTF-8 become U+FFFD.
+///
+/// The selection runs from an anchor to the cursor. Moving with Shift
+/// extends it; any other motion or edit ends it, and an insertion, a
+/// backspace or a delete replaces or removes the selected text.
+///
+/// A limit, if set, caps the text in clusters or columns: an insertion
+/// keeps as much of its text as fits, whole clusters from its start.
+pub struct TextInputState {
+    text: MemBuffer,
+    cursor: usize,
+    anchor: Option<usize>,
+    scroll: usize,
+    limit: Option<TextLimit>,
+    // The last render's area, and the columns of a cluster there if it was
+    // masked, else 0.
+    area: Rect,
+    mask: usize,
+    // Whether a left press in the area has not been released.
+    dragging: bool,
+}
+
+impl TextInputState {
+    /// An empty field without a limit.
+    pub fn new() -> Self {
+        TextInputState {
+            text: MemBuffer::empty(),
+            cursor: 0,
+            anchor: Option::None,
+            scroll: 0,
+            limit: Option::None,
+            area: Rect::ZERO,
+            mask: 0,
+            dragging: false,
+        }
+    }
+
+    /// This state, holding at most what `limit` allows from now on.
+    pub fn limit(var own self, _ limit: TextLimit) -> Self {
+        self.limit = Option::Some(limit)
+        self
+    }
+
+    /// The text.
+    pub fn text(self) -> ref MemSpan {
+        self.text.span()
+    }
+
+    /// Whether there is no text.
+    pub fn is_empty(self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// The cursor, as a byte offset into the text.
+    pub fn cursor(self) -> usize {
+        self.cursor
+    }
+
+    /// The selected bytes, as a start and an end offset, if any are.
+    pub fn selection(self) -> Option<(usize, usize)> {
+        match self.anchor {
+            Option::Some(anchor) => if anchor < self.cursor {
+                Option::Some((anchor, self.cursor))
+            } else if anchor > self.cursor {
+                Option::Some((self.cursor, anchor))
+            } else {
+                Option::None
+            },
+            Option::None => Option::None,
+        }
+    }
+
+    /// Replaces the text with `text`, made one line and limited as an
+    /// insertion is, with the cursor at its end.
+    pub fn set_text(mut self, _ text: MemSpan) {
+        self.clear()
+        self.insert(text)
+    }
+
+    /// Removes all text.
+    pub fn clear(mut self) {
+        self.text.clear()
+        self.cursor = 0
+        self.anchor = Option::None
+        self.scroll = 0
+    }
+
+    /// Takes the text out, leaving the field empty.
+    pub fn take(mut self) -> MemBuffer {
+        let text = replace(mut self.text, MemBuffer::empty())
+        self.clear()
+        text
+    }
+
+    /// Inserts `text` at the cursor, or over the selection, made one line,
+    /// and moves the cursor after it. Pasted text goes in this way.
+    pub fn insert(mut self, _ text: MemSpan) {
+        var line = MemBuffer::with_capacity(text.len())
+        one_line(text, mut line)
+        let (start, end) = match self.selection() {
+            Option::Some(range) => range,
+            Option::None => (self.cursor, self.cursor),
+        }
+        self.splice(start, end, MemSpan::empty())
+        var len = line.len()
+        match self.limit {
+            Option::Some(limit) => {
+                let room = limit.max().saturating_sub(limit.measure(self.text.span()))
+                len = limit.fit(line.span(), room)
+                // Clusters joining across the ends can take more than the
+                // parts alone; cut the text until the whole fits.
+                self.splice(start, start, line.slice(offset: 0, len))
+                while len > 0 && limit.measure(self.text.span()) > limit.max() {
+                    self.splice(start, start + len, MemSpan::empty())
+                    len = limit.shorten(line.slice(offset: 0, len))
+                    self.splice(start, start, line.slice(offset: 0, len))
+                }
+            },
+            Option::None => self.splice(start, start, line.span()),
+        }
+        // The text may join the cluster after it.
+        self.cursor = self.ceil(start + len)
+        self.anchor = Option::None
+    }
+
+    /// Inserts the Unicode scalar `scalar` as `insert` inserts text: a
+    /// control is dropped, and a value that is no scalar is U+FFFD.
+    pub fn insert_scalar(mut self, _ scalar: u32) {
+        var bytes = MemBuffer::empty()
+        encode(scalar, mut bytes)
+        self.insert(bytes.span())
+    }
+
+    /// Removes the selection, or the cluster before the cursor.
+    pub fn backspace(mut self) {
+        match self.selection() {
+            Option::Some((start, end)) => self.remove(start, end),
+            Option::None => self.remove(self.previous(self.cursor), self.cursor),
+        }
+    }
+
+    /// Removes the selection, or the cluster after the cursor.
+    pub fn delete(mut self) {
+        match self.selection() {
+            Option::Some((start, end)) => self.remove(start, end),
+            Option::None => self.remove(self.cursor, self.next(self.cursor)),
+        }
+    }
+
+    /// Removes the text from the start of the word before the cursor, as
+    /// `move_word_left` finds it, to the cursor.
+    pub fn delete_word_back(mut self) {
+        self.remove(self.word_start(self.cursor), self.cursor)
+    }
+
+    /// Removes the text after the cursor.
+    pub fn delete_to_end(mut self) {
+        self.remove(self.cursor, self.text.len())
+    }
+
+    /// Removes the text before the cursor.
+    pub fn delete_to_start(mut self) {
+        self.remove(0, self.cursor)
+    }
+
+    /// Moves the cursor back a cluster.
+    pub fn move_left(mut self) {
+        self.move_to(self.previous(self.cursor), extend: false)
+    }
+
+    /// Moves the cursor on a cluster.
+    pub fn move_right(mut self) {
+        self.move_to(self.next(self.cursor), extend: false)
+    }
+
+    /// Moves the cursor to the start of the word it is in or the one before.
+    /// A word is a run of letters, digits and `_`: ASCII ones, and every
+    /// character outside ASCII other than the spaces and punctuation of
+    /// Latin-1, General Punctuation and CJK Symbols and Punctuation.
+    pub fn move_word_left(mut self) {
+        self.move_to(self.word_start(self.cursor), extend: false)
+    }
+
+    /// Moves the cursor to the end of the word it is in or the one after;
+    /// see `move_word_left`.
+    pub fn move_word_right(mut self) {
+        self.move_to(self.word_end(self.cursor), extend: false)
+    }
+
+    /// Moves the cursor to the start of the text.
+    pub fn home(mut self) {
+        self.move_to(0, extend: false)
+    }
+
+    /// Moves the cursor to the end of the text.
+    pub fn end(mut self) {
+        self.move_to(self.text.len(), extend: false)
+    }
+
+    /// Selects all text, the cursor at its end.
+    pub fn select_all(mut self) {
+        self.anchor = Option::Some(0)
+        self.cursor = self.text.len()
+    }
+
+    /// Edits for a key press or repeat, with the readline keys, and returns
+    /// whether the key is one of them:
+    ///
+    /// - Left and Right, or Ctrl+B and Ctrl+F, move a cluster; Ctrl or Alt
+    ///   with Left or Right, or Alt+B and Alt+F, move a word.
+    /// - Home and End, or Ctrl+A and Ctrl+E, move to the start and the end.
+    /// - Backspace or Ctrl+H, and Delete or Ctrl+D, remove a cluster; Ctrl+W,
+    ///   Alt+Backspace and Ctrl+Backspace remove the word before the cursor;
+    ///   Ctrl+K and Ctrl+U remove the text after and before it.
+    /// - A key that types a character, with no modifier but Shift, inserts
+    ///   it.
+    ///
+    /// Shift with a motion extends the selection. Releases, and keys such
+    /// as Enter, Tab and Esc, are not handled.
+    pub fn handle_key(mut self, _ key: Key) -> bool {
+        if key.is_release() {
+            return false
+        }
+        let extend = key.mods.contains(Modifiers::SHIFT)
+        let mods = key.mods.without(Modifiers::SHIFT)
+        let plain = mods.is_empty()
+        let ctrl = mods == Modifiers::CTRL
+        let alt = mods == Modifiers::ALT
+        let cursor = self.cursor
+        match key.code {
+            KeyCode::Left => if plain {
+                self.move_to(self.previous(cursor), extend)
+            } else if ctrl || alt {
+                self.move_to(self.word_start(cursor), extend)
+            } else {
+                return false
+            },
+            KeyCode::Right => if plain {
+                self.move_to(self.next(cursor), extend)
+            } else if ctrl || alt {
+                self.move_to(self.word_end(cursor), extend)
+            } else {
+                return false
+            },
+            KeyCode::Home => if plain {
+                self.move_to(0, extend)
+            } else {
+                return false
+            },
+            KeyCode::End => if plain {
+                self.move_to(self.text.len(), extend)
+            } else {
+                return false
+            },
+            KeyCode::Backspace => if plain {
+                self.backspace()
+            } else if ctrl || alt {
+                self.delete_word_back()
+            } else {
+                return false
+            },
+            KeyCode::Delete => if plain { self.delete() } else { return false },
+            KeyCode::Char(c) => if ctrl {
+                match c {
+                    b'a' => self.move_to(0, extend),
+                    b'e' => self.move_to(self.text.len(), extend),
+                    b'b' => self.move_to(self.previous(cursor), extend),
+                    b'f' => self.move_to(self.next(cursor), extend),
+                    b'h' => self.backspace(),
+                    b'd' => self.delete(),
+                    b'w' => self.delete_word_back(),
+                    b'k' => self.delete_to_end(),
+                    b'u' => self.delete_to_start(),
+                    _ => {
+                        return false
+                    },
+                }
+            } else if alt {
+                match c {
+                    b'b' => self.move_to(self.word_start(cursor), extend),
+                    b'f' => self.move_to(self.word_end(cursor), extend),
+                    _ => {
+                        return false
+                    },
+                }
+            } else if plain {
+                self.type_key(key)
+            } else {
+                return false
+            },
+            KeyCode::Unicode(_) => if plain {
+                self.type_key(key)
+            } else {
+                return false
+            },
+            _ => {
+                return false
+            },
+        }
+        true
+    }
+
+    /// Moves the cursor for a left press in the last render's area, to the
+    /// cluster under it or the end of the text, and extends the selection
+    /// to where a left drag from that press goes, until the release.
+    /// Returns whether it handled the event.
+    pub fn handle_mouse(mut self, _ mouse: Mouse) -> bool {
+        let area = self.area
+        let extend = match mouse.kind {
+            MouseKind::Down(MouseButton::Left) => {
+                self.dragging = area.contains(mouse.pos)
+                if !self.dragging {
+                    return false
+                }
+                false
+            },
+            MouseKind::Drag(MouseButton::Left) => if self.dragging { true } else { return false },
+            MouseKind::Up(MouseButton::Left) => {
+                let dragging = self.dragging
+                self.dragging = false
+                return dragging
+            },
+            _ => {
+                return false
+            },
+        }
+        // A drag past either side goes to the column at that side.
+        let x = if mouse.pos.x < area.x {
+            area.x
+        } else if mouse.pos.x >= area.right() {
+            area.right() - 1
+        } else {
+            mouse.pos.x
+        }
+        let (offset, _) = locate(
+            self.text.span(),
+            self.scroll + (x - area.x) as usize,
+            mask: self.mask,
+        )
+        self.move_to(offset, extend)
+        true
+    }
+
+    // Moves the cursor to `offset`, a boundary, extending the selection
+    // from where it was if `extend`, else ending it.
+    fn move_to(mut self, _ offset: usize, _ extend: bool) {
+        if !extend {
+            self.anchor = Option::None
+        } else if self.anchor.is_none() {
+            self.anchor = Option::Some(self.cursor)
+        }
+        self.cursor = offset
+    }
+
+    // Inserts the character `key` types.
+    fn type_key(mut self, _ key: Key) {
+        var typed = MemBuffer::empty()
+        key.push_text(mut typed)
+        self.insert(typed.span())
+    }
+
+    // Removes the bytes `start..end`, between boundaries, leaving the cursor
+    // at the boundary at or before `start`: the clusters either side may
+    // join.
+    fn remove(mut self, _ start: usize, _ end: usize) {
+        self.splice(start, end, MemSpan::empty())
+        self.cursor = self.floor(start)
+        self.anchor = Option::None
+    }
+
+    // Replaces the bytes `start..end` with `with`.
+    fn splice(mut self, _ start: usize, _ end: usize, _ with: MemSpan) {
+        let old = self.text.len()
+        let len = start + with.len() + (old - end)
+        if len > old {
+            self.text.resize(len)
+        }
+        self.text.span().copy_within(source: end, dest: start + with.len(), len: old - end)
+        self.text.slice(offset: start, len: with.len()).copy_from(with)
+        if len < old {
+            self.text.truncate(len)
+        }
+    }
+
+    // The boundary before `offset`, or 0.
+    fn previous(self, _ offset: usize) -> usize {
+        if offset == 0 { return 0 }
+        self.floor(offset - 1)
+    }
+
+    // The boundary after `offset`, a boundary, or the end.
+    fn next(self, _ offset: usize) -> usize {
+        if offset >= self.text.len() {
+            return self.text.len()
+        }
+        offset + next_cluster(self.text.span(), offset).len
+    }
+
+    // The last boundary at or before `offset`.
+    fn floor(self, _ offset: usize) -> usize {
+        var at: usize = 0
+        while at < offset {
+            let next = self.next(at)
+            if next > offset { break }
+            at = next
+        }
+        at
+    }
+
+    // The first boundary at or after `offset`.
+    fn ceil(self, _ offset: usize) -> usize {
+        var at: usize = 0
+        while at < offset {
+            at = self.next(at)
+        }
+        at
+    }
+
+    // The start of the last word that starts before `offset`, or 0.
+    fn word_start(self, _ offset: usize) -> usize {
+        var start: usize = 0
+        var at: usize = 0
+        var in_word = false
+        while at < offset {
+            let word = self.is_word_at(at)
+            if word && !in_word {
+                start = at
+            }
+            in_word = word
+            at = self.next(at)
+        }
+        start
+    }
+
+    // The end of the first word that ends after `offset`, or the end.
+    fn word_end(self, _ offset: usize) -> usize {
+        let len = self.text.len()
+        var at = offset
+        while at < len && !self.is_word_at(at) {
+            at = self.next(at)
+        }
+        while at < len && self.is_word_at(at) {
+            at = self.next(at)
+        }
+        at
+    }
+
+    // Whether the cluster at `offset` is part of a word.
+    fn is_word_at(self, _ offset: usize) -> bool {
+        let c = decode(self.text.span(), offset).value
+        if c < 0x80 {
+            return (c >= 0x30 && c <= 0x39)
+                || (c >= 0x41 && c <= 0x5a)
+                || (c >= 0x61 && c <= 0x7a)
+                || c == 0x5f
+        }
+        !((c >= 0x80 && c <= 0xbf)
+            || (c >= 0x2000 && c <= 0x206f)
+            || (c >= 0x3000 && c <= 0x3003)
+            || (c >= 0x3008 && c <= 0x301f))
+    }
+}
+
+/// A single-line text field, which draws a `TextInputState`:
+///
+/// ```fe
+/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+///     TextInput::new().focused(self.focus == Focus::Search).render(
+///         area,
+///         mut self.search,
+///         placeholder: "Search",
+///     )
+/// }
+/// ```
+///
+/// It draws on the top row of its area, scrolled by columns as little as
+/// keeps the cluster under the cursor in view, the cursor one column past
+/// the last cluster at the end of the text. A wide cluster cut by either
+/// edge leaves spaces in the columns shown of it, and a field narrower
+/// than the cluster under the cursor shows the cursor's column. When the
+/// text is empty, it draws the placeholder instead. When focused, which it
+/// is unless `focused(false)`, it shows the terminal cursor at the cursor's
+/// cell through the frame.
+///
+/// With a mask, every cluster is drawn as the mask's symbol, as wide as it
+/// is, so a password shows no more than its length.
+///
+/// The field's style applies over the theme's `text` style to its row, the
+/// placeholder style over the theme's `muted` style to the placeholder, and
+/// the selection style over the theme's `highlight` style to the selected
+/// text.
+pub struct TextInput {
+    style: Style,
+    placeholder_style: Style,
+    selection_style: Style,
+    mask: Option<String<4>>,
+    focused: bool,
+}
+
+impl Copy for TextInput {}
+
+impl TextInput {
+    /// A focused field without a mask.
+    pub fn new() -> Self {
+        TextInput {
+            style: Style::NONE,
+            placeholder_style: Style::NONE,
+            selection_style: Style::NONE,
+            mask: Option::None,
+            focused: true,
+        }
+    }
+
+    /// This field, with `style` over the theme's `text` style for its row.
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
+    }
+
+    /// This field, with `style` over the theme's `muted` style for its
+    /// placeholder.
+    pub fn placeholder_style(var own self, _ style: Style) -> Self {
+        self.placeholder_style = style
+        self
+    }
+
+    /// This field, with `style` over the theme's `highlight` style for the
+    /// selected text.
+    pub fn selection_style(var own self, _ style: Style) -> Self {
+        self.selection_style = style
+        self
+    }
+
+    /// This field, drawing every cluster as `symbol`, one cluster of one or
+    /// two columns, such as `"•"`.
+    pub fn mask(var own self, _ symbol: String<4>) -> Self {
+        self.mask = Option::Some(symbol)
+        self
+    }
+
+    /// This field, showing the terminal cursor at its cursor or not.
+    pub fn focused(var own self, _ focused: bool) -> Self {
+        self.focused = focused
+        self
+    }
+
+    /// Draws the text of `state` in the top row of `area`, or `placeholder`
+    /// if it has none, and records the area and the scroll in `state`.
+    pub fn render<P: Display>(self, _ area: Rect, _ state: mut TextInputState, placeholder: P)
+    uses (frame: mut Frame)
+    {
+        let (row, _) = area.split_top(1)
+        let mask: usize = match self.mask {
+            Option::Some(symbol) => {
+                let columns = width(format!(symbol).span())
+                if columns > 0 { columns } else { 1 }
+            },
+            Option::None => 0,
+        }
+        state.area = row
+        state.mask = mask
+        if row.is_empty() { return }
+        let theme = theme()
+        frame.set_style(row, theme.text.patch(self.style))
+        if state.text.is_empty() {
+            state.scroll = 0
+            frame.print_in(
+                    row,
+                    placeholder,
+                    theme.muted.patch(self.placeholder_style),
+                )
+            if self.focused {
+                frame.set_cursor(row.pos())
+            }
+            return
+        }
+        let text = state.text.span()
+        let field = row.width as usize
+        let cursor = shown_width(text.slice(offset: 0, len: state.cursor), mask)
+        let under = if state.cursor < text.len() {
+            max(shown(next_cluster(text, state.cursor).width, mask), 1)
+        } else {
+            1
+        }
+        // The least scroll from the last that shows the cluster under the
+        // cursor, or its first column if the field is narrower.
+        var scroll = min(
+            state.scroll,
+            (shown_width(text, mask) + 1).saturating_sub(field),
+        )
+        if cursor + under > scroll + field {
+            scroll = cursor + under - field
+        }
+        if cursor < scroll {
+            scroll = cursor
+        }
+        state.scroll = scroll
+
+        // The first cluster shown, after one the left edge cuts.
+        let (start, start_column) = locate(text, scroll, mask)
+        var from = start
+        var x = row.x
+        if start_column < scroll {
+            let cluster = next_cluster(text, start)
+            let cut: u16 = (start_column + shown(cluster.width, mask) - scroll).downcast_truncate()
+            frame.fill(
+                    Rect { x, y: row.y, width: cut, height: 1 },
+                    " ",
+                    Style::NONE,
+                )
+            from = start + cluster.len
+            x += cut
+        }
+        let rest = Rect { x, y: row.y, width: row.right() - x, height: 1 }
+        let tail = text.slice(offset: from, len: text.len() - from)
+        match self.mask {
+            Option::Some(symbol) => {
+                let columns: u16 = clamp(clusters(tail) * mask)
+                frame
+                    .fill(
+                        Rect {
+                            x,
+                            y: row.y,
+                            width: if columns < rest.width {
+                                columns
+                            } else {
+                                rest.width
+                            },
+                            height: 1,
+                        },
+                        symbol,
+                        Style::NONE,
+                    )
+            },
+            Option::None => {
+                let _ = frame.print_in(rest, tail, Style::NONE)
+            },
+        }
+        match state.selection() {
+            Option::Some((low, high)) => {
+                let left = max(shown_width(text.slice(offset: 0, len: low), mask), scroll)
+                let right = min(
+                    shown_width(text.slice(offset: 0, len: high), mask),
+                    scroll + field,
+                )
+                if left < right {
+                    frame
+                        .set_style(
+                            Rect {
+                                x: row.x + clamp(left - scroll),
+                                y: row.y,
+                                width: clamp(right - left),
+                                height: 1,
+                            },
+                            theme.highlight.patch(self.selection_style),
+                        )
+                }
+            },
+            Option::None => {},
+        }
+        if self.focused {
+            frame.set_cursor(Pos { x: row.x + clamp(cursor - scroll), y: row.y })
+        }
+    }
+}
+
+// Appends `text` to `out` as one line; see `TextInputState`.
+fn one_line(_ text: MemSpan, _ out: mut MemBuffer) {
+    let start = out.len()
+    var pending = false
+    var at: usize = 0
+    while at < text.len() {
+        let scalar = decode(text, at)
+        at += scalar.len
+        let c = scalar.value
+        if is_line_break(c) {
+            pending = out.len() > start
+            continue
+        }
+        if c != 0x09 && is_control(c) {
+            continue
+        }
+        if pending {
+            out.push(b' ')
+            pending = false
+        }
+        if c == 0x09 {
+            out.push(b' ')
+        } else {
+            encode(c, mut out)
+        }
+    }
+}
+
+fn is_line_break(_ c: u32) -> bool {
+    (c >= 0x0a && c <= 0x0d) || c == 0x85 || c == 0x2028 || c == 0x2029
+}
+
+// The number of clusters of `text`.
+fn clusters(_ text: MemSpan) -> usize {
+    var count: usize = 0
+    var at: usize = 0
+    while at < text.len() {
+        at += next_cluster(text, at).len
+        count += 1
+    }
+    count
+}
+
+// The columns a cluster of `width` columns is shown in: `mask`, if not 0.
+fn shown(_ width: u8, _ mask: usize) -> usize {
+    if mask > 0 { mask } else { width as usize }
+}
+
+// The columns `text` is shown in, each cluster in `mask` columns if `mask`
+// is not 0.
+fn shown_width(_ text: MemSpan, _ mask: usize) -> usize {
+    if mask == 0 {
+        return width(text)
+    }
+    clusters(text) * mask
+}
+
+// The start of the cluster of `text` shown at `column`, or the end, and the
+// column it starts at; see `text::column_offset`.
+fn locate(_ text: MemSpan, _ column: usize, mask: usize) -> (usize, usize) {
+    if mask == 0 {
+        return column_offset(text, column)
+    }
+    var at: usize = 0
+    var columns: usize = 0
+    while at < text.len() && columns + mask <= column {
+        at += next_cluster(text, at).len
+        columns += mask
+    }
+    (at, columns)
+}
+
+fn clamp(_ value: usize) -> u16 {
+    if value > 65535 {
+        65535
+    } else {
+        value.downcast_truncate()
+    }
+}
+
+fn min(_ a: usize, _ b: usize) -> usize {
+    if a < b { a } else { b }
+}
+
+fn max(_ a: usize, _ b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for c in scalars {
+        encode(c, mut out)
+    }
+    out
+}
+
+fn typed(_ text: MemSpan) -> TextInputState {
+    var state = TextInputState::new()
+    state.set_text(text)
+    state
+}
+
+fn press(_ code: KeyCode, _ mods: Modifiers) -> Key {
+    Key::new(code, mods)
+}
+
+// A one-row frame `width` wide, with the dark theme, after `input` draws
+// `state` across it with the placeholder `placeholder`.
+fn drawn<P: Display>(
+    _ input: TextInput,
+    width: u16,
+    _ state: mut TextInputState,
+    placeholder: P,
+) -> Frame {
+    var frame = Frame::new(Buffer::new(Size::new(width, height: 1)), Theme::dark())
+    let area = frame.area()
+    with (frame) {
+        input.render(area, mut state, placeholder)
+    }
+    frame
+}
+
+fn cursor_x(_ frame: Frame) -> u16 {
+    frame.cursor().unwrap().x
+}
+
+#[test]
+fn ascii_edits_move_and_remove_bytes() {
+    var state = typed(format!("hello").span())
+    assert(state.text() == "hello" && state.cursor() == 5)
+    state.move_left()
+    state.move_left()
+    state.insert(format!("XY").span())
+    assert(state.text() == "helXYlo" && state.cursor() == 5)
+    state.backspace()
+    state.delete()
+    assert(state.text() == "helXo" && state.cursor() == 4)
+    state.home()
+    state.delete()
+    state.end()
+    state.backspace()
+    assert(state.text() == "elX" && state.cursor() == 3)
+    state.move_left()
+    state.delete_to_end()
+    assert(state.text() == "el" && state.cursor() == 2)
+    state.move_left()
+    state.delete_to_start()
+    assert(state.text() == "l" && state.cursor() == 0)
+    state.backspace()
+    state.move_left()
+    state.end()
+    state.delete()
+    state.move_right()
+    assert(state.text() == "l" && state.cursor() == 1)
+    state.insert_scalar(b'x' as u32)
+    assert(state.take() == "lx")
+    assert(state.is_empty() && state.cursor() == 0)
+    state.insert_scalar(b'y' as u32)
+    state.clear()
+    assert(state.is_empty() && state.cursor() == 0)
+}
+
+#[test]
+fn combining_marks_move_and_go_with_their_base() {
+    // e + acute, x, a + diaeresis: clusters at 0, 3 and 4.
+    var state = typed(utf8([0x65, 0x301, 0x78, 0x61, 0x308]).span())
+    assert(state.cursor() == 7)
+    state.move_left()
+    assert(state.cursor() == 4)
+    state.move_left()
+    state.move_left()
+    assert(state.cursor() == 0)
+    state.move_right()
+    assert(state.cursor() == 3)
+    state.backspace()
+    assert(
+        utf8([0x78, 0x61, 0x308]) == state.text() && state.cursor() == 0,
+    )
+    state.end()
+    state.backspace()
+    assert(state.text() == "x" && state.cursor() == 1)
+    // A mark typed after a letter joins it; the cursor stays after both.
+    state.insert_scalar(0x301)
+    assert(state.cursor() == 3)
+    state.move_left()
+    assert(state.cursor() == 0)
+    state.delete()
+    assert(state.is_empty())
+}
+
+#[test]
+fn wide_clusters_and_emoji_sequences_are_whole() {
+    // 界, a, then man ZWJ woman ZWJ girl: one cluster of 18 bytes.
+    let family = utf8([0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467])
+    var text = format!("界a")
+    text.extend_from(family.span())
+    var state = typed(text.span())
+    assert(state.cursor() == 22)
+    state.move_left()
+    assert(state.cursor() == 4)
+    state.move_left()
+    state.move_left()
+    assert(state.cursor() == 0)
+    state.move_right()
+    state.move_right()
+    state.delete()
+    assert(state.text() == "界a" && state.cursor() == 4)
+    state.home()
+    state.delete()
+    assert(state.text() == "a")
+    state.insert(family.span())
+    assert(state.cursor() == 18)
+    state.backspace()
+    assert(state.text() == "a")
+}
+
+#[test]
+fn edits_that_join_clusters_keep_the_cursor_at_a_boundary() {
+    // A regional indicator before a lone one makes a flag.
+    var state = typed(utf8([0x1f1fa]).span())
+    state.home()
+    state.insert_scalar(0x1f1f8)
+    assert(state.cursor() == 8)
+    state.move_left()
+    assert(state.cursor() == 0)
+    // A, x, B C: removing x pairs A with B, so the cursor goes before A.
+    var flags = typed(utf8([0x1f1e6, 0x78, 0x1f1e7, 0x1f1e8]).span())
+    flags.home()
+    flags.move_right()
+    flags.move_right()
+    assert(flags.cursor() == 5)
+    flags.backspace()
+    assert(flags.cursor() == 0)
+    flags.move_right()
+    assert(flags.cursor() == 8)
+}
+
+#[test]
+fn words_skip_punctuation_and_runs_of_spaces() {
+    var state = typed(format!("foo, bar  baz-qux!").span())
+    for expected in [14, 10, 5, 0, 0] {
+        state.move_word_left()
+        assert(state.cursor() == expected)
+    }
+    for expected in [3, 8, 13, 17, 18, 18] {
+        state.move_word_right()
+        assert(state.cursor() == expected)
+    }
+    state.home()
+    for _ in 0 .. 3 {
+        state.move_word_right()
+    }
+    state.delete_word_back()
+    assert(state.text() == "foo, bar  -qux!" && state.cursor() == 10)
+    state.delete_word_back()
+    assert(state.text() == "foo, -qux!" && state.cursor() == 5)
+    // Letters outside ASCII are word characters; an em dash is not.
+    var other = typed(format!("über—straße").span())
+    other.move_word_left()
+    assert(other.cursor() == 8)
+    other.move_word_left()
+    other.move_word_right()
+    assert(other.cursor() == 5)
+}
+
+#[test]
+fn lines_are_joined_and_controls_dropped() {
+    var bytes = format!("\r\na\r\n\nb\tc")
+    bytes.push(0x1b)
+    bytes.push(b'd')
+    bytes.push(0xff)
+    bytes.extend_from(utf8([0x2028, 0x65, 0x85]).span())
+    bytes.extend_from(format!("\n\n").span())
+    var state = typed(format!("[]").span())
+    state.move_left()
+    state.insert(bytes.span())
+    var expected = format!("[a b cd")
+    encode(0xfffd, mut expected)
+    expected.extend_from(format!(" e]").span())
+    assert(expected == state.text())
+    assert(state.cursor() == expected.len() - 1)
+    state.set_text(format!("\n\n").span())
+    assert(state.is_empty())
+    state.insert_scalar(0x0a)
+    state.insert_scalar(0x07)
+    assert(state.is_empty())
+    state.insert_scalar(0xd800)
+    assert(utf8([0xfffd]) == state.text())
+}
+
+#[test]
+fn limits_keep_whole_clusters_that_fit() {
+    var state = TextInputState::new().limit(TextLimit::Clusters(3))
+    state.insert(format!("abcdef").span())
+    assert(state.text() == "abc")
+    state.insert(format!("x").span())
+    assert(state.text() == "abc" && state.cursor() == 3)
+    state.backspace()
+    state.insert(format!("界界").span())
+    assert(state.text() == "ab界")
+    state.set_text(utf8([0x65, 0x301, 0x65, 0x301, 0x65, 0x301]).span())
+    assert(
+        utf8([0x65, 0x301, 0x65, 0x301, 0x65, 0x301]) == state.text(),
+    )
+    var columns = TextInputState::new().limit(TextLimit::Columns(4))
+    columns.insert(format!("a界界").span())
+    assert(columns.text() == "a界")
+    columns.insert(format!("bc").span())
+    assert(columns.text() == "a界b" && columns.cursor() == 5)
+    // A selection replaced makes room.
+    columns.select_all()
+    columns.insert(format!("wxyz").span())
+    assert(columns.text() == "wxyz")
+    // U+FE0F would make the heart two columns wide.
+    var heart = TextInputState::new().limit(TextLimit::Columns(1))
+    heart.insert(utf8([0x2764]).span())
+    heart.insert(utf8([0xfe0f]).span())
+    assert(utf8([0x2764]) == heart.text())
+}
+
+#[test]
+fn keys_edit_as_readline_does() {
+    var state = TextInputState::new()
+    let none = Modifiers::NONE
+    let ctrl = Modifiers::CTRL
+    let alt = Modifiers::ALT
+    for code in [
+        KeyCode::Char(b'h'),
+        KeyCode::Unicode(0xe9),
+        KeyCode::Char(b'l'),
+        KeyCode::Char(b'l'),
+        KeyCode::Char(b'o'),
+        KeyCode::Char(b' '),
+        KeyCode::Char(b'w'),
+    ] {
+        assert(state.handle_key(press(code, none)))
+    }
+    assert(state.text() == "héllo w" && state.cursor() == 8)
+    assert(
+        state.handle_key(press(KeyCode::Char(b'a'), ctrl)) && state.cursor() == 0,
+    )
+    assert(
+        state.handle_key(press(KeyCode::Char(b'e'), ctrl)) && state.cursor() == 8,
+    )
+    assert(
+        state.handle_key(press(KeyCode::Char(b'b'), ctrl)) && state.cursor() == 7,
+    )
+    assert(
+        state.handle_key(press(KeyCode::Char(b'b'), alt)) && state.cursor() == 0,
+    )
+    assert(
+        state.handle_key(press(KeyCode::Char(b'f'), alt)) && state.cursor() == 6,
+    )
+    assert(
+        state.handle_key(press(KeyCode::Right, ctrl)) && state.cursor() == 8,
+    )
+    assert(
+        state.handle_key(press(KeyCode::Left, alt)) && state.cursor() == 7,
+    )
+    assert(
+        state.handle_key(press(KeyCode::Char(b'f'), ctrl)) && state.cursor() == 8,
+    )
+    assert(state.handle_key(press(KeyCode::Char(b'w'), ctrl)))
+    assert(state.text() == "héllo " && state.cursor() == 7)
+    assert(state.handle_key(press(KeyCode::Backspace, alt)))
+    assert(state.text().is_empty())
+    state.set_text(format!("one two").span())
+    assert(state.handle_key(press(KeyCode::Home, none)))
+    assert(state.handle_key(press(KeyCode::Delete, none)))
+    assert(state.handle_key(press(KeyCode::Char(b'd'), ctrl)))
+    assert(state.text() == "e two")
+    assert(state.handle_key(press(KeyCode::End, none)))
+    assert(state.handle_key(press(KeyCode::Backspace, none)))
+    assert(state.handle_key(press(KeyCode::Char(b'h'), ctrl)))
+    assert(state.text() == "e t")
+    assert(state.handle_key(press(KeyCode::Left, none)))
+    assert(state.handle_key(press(KeyCode::Char(b'u'), ctrl)))
+    assert(state.text() == "t" && state.cursor() == 0)
+    assert(state.handle_key(press(KeyCode::Char(b'k'), ctrl)))
+    assert(state.is_empty())
+    // Not for a text field.
+    let release = press(KeyCode::Char(b'x'), none).with_kind(KeyKind::Release)
+    assert(!state.handle_key(release))
+    assert(!state.handle_key(press(KeyCode::Char(b'x'), alt)))
+    assert(!state.handle_key(press(KeyCode::Char(b'x'), ctrl)))
+    assert(
+        !state.handle_key(press(KeyCode::Char(b'c'), Modifiers::SUPER)),
+    )
+    assert(!state.handle_key(press(KeyCode::Enter, none)))
+    assert(!state.handle_key(press(KeyCode::Tab, none)))
+    assert(!state.handle_key(press(KeyCode::Up, none)))
+    assert(state.is_empty())
+    // Shift extends a selection, and typing replaces it.
+    let shift = Modifiers::SHIFT
+    state.set_text(format!("ab cd").span())
+    assert(state.handle_key(press(KeyCode::Left, shift)))
+    assert(state.handle_key(press(KeyCode::Left, ctrl | shift)))
+    assert(state.selection() == Option::Some((3, 5)))
+    assert(state.handle_key(press(KeyCode::Char(b'X'), shift)))
+    assert(state.text() == "ab X" && state.selection().is_none())
+    assert(state.handle_key(press(KeyCode::Home, shift)))
+    assert(state.handle_key(press(KeyCode::Right, none)))
+    assert(state.selection().is_none() && state.cursor() == 1)
+    state.select_all()
+    assert(state.handle_key(press(KeyCode::Backspace, none)))
+    assert(state.is_empty())
+}
+
+#[test]
+fn the_field_scrolls_as_little_as_shows_the_cursor() {
+    var state = typed(format!("abcdefghij").span())
+    var frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    assert(frame.buffer().to_text() == "ghij" && cursor_x(frame) == 4)
+    state.home()
+    frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    assert(
+        frame.buffer().to_text() == "abcde" && cursor_x(frame) == 0,
+    )
+    // Right past the edge scrolls one column at a time, and back left
+    // scrolls only once the cursor reaches the left edge.
+    let right = ["abcde", "abcde", "abcde", "abcde", "bcdef", "cdefg"]
+    for expected in right {
+        state.move_right()
+        frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+        assert(frame.buffer().to_text() == expected)
+    }
+    assert(cursor_x(frame) == 4)
+    let left = ["cdefg", "cdefg", "cdefg", "cdefg", "bcdef", "abcde"]
+    for expected in left {
+        state.move_left()
+        frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+        assert(frame.buffer().to_text() == expected)
+    }
+    assert(cursor_x(frame) == 0)
+    // Removing text scrolls back to show what is left.
+    state.end()
+    drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    state.delete_to_start()
+    state.insert(format!("xy").span())
+    frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    assert(frame.buffer().to_text() == "xy" && cursor_x(frame) == 2)
+}
+
+#[test]
+fn wide_clusters_cut_by_an_edge_leave_spaces() {
+    var state = typed(format!("a界b界c").span())
+    var frame = drawn(TextInput::new(), width: 4, mut state, placeholder: "")
+    assert(frame.buffer().to_text() == "界c" && cursor_x(frame) == 3)
+    state.home()
+    frame = drawn(TextInput::new(), width: 4, mut state, placeholder: "")
+    assert(frame.buffer().to_text() == "a界b" && cursor_x(frame) == 0)
+    // The cursor on the second 界 shows it whole; the first is cut.
+    state.move_right()
+    state.move_right()
+    state.move_right()
+    frame = drawn(TextInput::new(), width: 4, mut state, placeholder: "")
+    assert(frame.buffer().to_text() == " b界" && cursor_x(frame) == 2)
+    // Cut by the right edge.
+    var right = typed(format!("abc界").span())
+    right.home()
+    frame = drawn(TextInput::new(), width: 4, mut right, placeholder: "")
+    assert(frame.buffer().to_text() == "abc")
+    assert(
+        frame.buffer().get(Pos::new(x: 3, y: 0)).unwrap().width() == 1,
+    )
+    // A field narrower than the cluster shows the cursor's column.
+    var narrow = typed(format!("界").span())
+    narrow.home()
+    frame = drawn(TextInput::new(), width: 1, mut narrow, placeholder: "")
+    assert(
+        frame.buffer().to_text().is_empty() && cursor_x(frame) == 0,
+    )
+    narrow.end()
+    frame = drawn(TextInput::new(), width: 1, mut narrow, placeholder: "")
+    assert(
+        frame.buffer().to_text().is_empty() && cursor_x(frame) == 0,
+    )
+    // The cursor on a zero-width cluster, U+200B, still takes a column.
+    var space = typed(utf8([0x61, 0x62, 0x63, 0x64, 0x200b]).span())
+    space.move_left()
+    frame = drawn(TextInput::new(), width: 4, mut space, placeholder: "")
+    assert(frame.buffer().to_text() == "bcd" && cursor_x(frame) == 3)
+}
+
+#[test]
+fn the_cursor_shows_only_when_focused() {
+    var state = typed(format!("ab").span())
+    var frame = Frame::new(Buffer::new(Size::new(width: 8, height: 4)), Theme::dark())
+    with (frame) {
+        TextInput::new()
+            .render(
+                Rect::new(x: 2, y: 1, width: 5, height: 2),
+                mut state,
+                placeholder: "",
+            )
+    }
+    assert(frame.cursor() == Option::Some(Pos::new(x: 4, y: 1)))
+    assert(frame.buffer().to_text() == "\n  ab\n\n")
+    state.move_left()
+    let unfocused = drawn(
+        TextInput::new().focused(false),
+        width: 4,
+        mut state,
+        placeholder: "",
+    )
+    assert(
+        unfocused.cursor().is_none() && unfocused.buffer().to_text() == "ab",
+    )
+}
+
+#[test]
+fn masks_hide_every_cluster() {
+    var state = typed(format!("secret").span())
+    var frame = drawn(
+        TextInput::new().mask("*"),
+        width: 10,
+        mut state,
+        placeholder: "",
+    )
+    assert(
+        frame.buffer().to_text() == "******" && cursor_x(frame) == 6,
+    )
+    var mixed = typed(utf8([0x754c, 0x65, 0x301]).span())
+    frame = drawn(
+        TextInput::new().mask("•"),
+        width: 10,
+        mut mixed,
+        placeholder: "",
+    )
+    assert(frame.buffer().to_text() == "••" && cursor_x(frame) == 2)
+    // A wide mask, scrolled to an odd column: each cluster takes two.
+    var long = typed(format!("abcdef").span())
+    frame = drawn(
+        TextInput::new().mask("＊"),
+        width: 4,
+        mut long,
+        placeholder: "",
+    )
+    assert(frame.buffer().to_text() == " ＊" && cursor_x(frame) == 3)
+    // A click goes to the masked cluster under it.
+    let down = MouseKind::Down(MouseButton::Left)
+    assert(
+        long.handle_mouse(Mouse::new(down, Pos::new(x: 0, y: 0), Modifiers::NONE)),
+    )
+    assert(long.cursor() == 4)
+    assert(
+        long.handle_mouse(Mouse::new(down, Pos::new(x: 2, y: 0), Modifiers::NONE)),
+    )
+    assert(long.cursor() == 5)
+}
+
+#[test]
+fn an_empty_field_shows_its_placeholder() {
+    var state = TextInputState::new()
+    let frame = drawn(
+        TextInput::new(),
+        width: 4,
+        mut state,
+        placeholder: "Search",
+    )
+    assert(frame.buffer().to_text() == "Sear" && cursor_x(frame) == 0)
+    assert(
+        frame.buffer().get(Pos::new(x: 0, y: 0)).unwrap().modifier() == Modifier::DIM,
+    )
+    state.insert(format!("x").span())
+    let typed = drawn(
+        TextInput::new(),
+        width: 4,
+        mut state,
+        placeholder: "Search",
+    )
+    assert(typed.buffer().to_text() == "x" && cursor_x(typed) == 1)
+    assert(
+        typed.buffer().get(Pos::new(x: 0, y: 0)).unwrap().modifier().is_empty(),
+    )
+}
+
+#[test]
+fn the_selection_is_highlighted() {
+    var state = typed(format!("abcdef").span())
+    state.handle_key(press(KeyCode::Left, Modifiers::SHIFT))
+    state.handle_key(press(KeyCode::Left, Modifiers::SHIFT))
+    let frame = drawn(TextInput::new(), width: 8, mut state, placeholder: "")
+    for x in [0, 1, 2, 3, 6, 7] {
+        assert(
+            frame.buffer().get(Pos::new(x, y: 0)).unwrap().modifier().is_empty(),
+        )
+    }
+    for x in [4, 5] {
+        assert(
+            frame.buffer().get(Pos::new(x, y: 0)).unwrap().modifier() == Modifier::REVERSED,
+        )
+    }
+    assert(cursor_x(frame) == 4)
+}
+
+#[test]
+fn clicks_place_the_cursor_and_drags_select() {
+    var state = typed(format!("a界bcdefgh").span())
+    var frame = Frame::new(Buffer::new(Size::new(width: 8, height: 2)), Theme::dark())
+    let area = Rect::new(x: 2, y: 1, width: 4, height: 1)
+    with (frame) {
+        TextInput::new().render(area, mut state, placeholder: "")
+    }
+    // Scrolled to show "fgh" and the cursor: columns 7 to 10.
+    assert(frame.buffer().to_text() == "\n  fgh")
+    let left = MouseButton::Left
+    let none = Modifiers::NONE
+    assert(
+        state.handle_mouse(
+                Mouse::new(MouseKind::Down(left), Pos::new(x: 3, y: 1), none),
+            ),
+    )
+    assert(state.cursor() == 9 && state.selection().is_none())
+    assert(
+        state.handle_mouse(
+                Mouse::new(MouseKind::Drag(left), Pos::new(x: 0, y: 0), none),
+            ),
+    )
+    assert(state.selection() == Option::Some((8, 9)))
+    assert(
+        state.handle_mouse(
+                Mouse::new(MouseKind::Drag(left), Pos::new(x: 9, y: 1), none),
+            ),
+    )
+    assert(state.selection() == Option::Some((9, 11)))
+    assert(
+        state.handle_mouse(
+                Mouse::new(MouseKind::Up(left), Pos::new(x: 9, y: 1), none),
+            ),
+    )
+    assert(
+        !state.handle_mouse(
+                Mouse::new(MouseKind::Drag(left), Pos::new(x: 3, y: 1), none),
+            ),
+    )
+    assert(
+        !state.handle_mouse(
+                Mouse::new(MouseKind::Up(left), Pos::new(x: 3, y: 1), none),
+            ),
+    )
+    // A press outside the field, and a drag from it, are not the field's.
+    assert(
+        !state.handle_mouse(
+                Mouse::new(MouseKind::Down(left), Pos::new(x: 1, y: 1), none),
+            ),
+    )
+    assert(
+        !state.handle_mouse(
+                Mouse::new(MouseKind::Drag(left), Pos::new(x: 3, y: 1), none),
+            ),
+    )
+    assert(state.selection() == Option::Some((9, 11)))
+    // Past the end of the text goes to the end.
+    state.set_text(format!("a界").span())
+    with (frame) {
+        TextInput::new().render(area, mut state, placeholder: "")
+    }
+    assert(
+        state.handle_mouse(
+                Mouse::new(MouseKind::Down(left), Pos::new(x: 5, y: 1), none),
+            ),
+    )
+    assert(state.cursor() == 4)
+    assert(
+        state.handle_mouse(
+                Mouse::new(MouseKind::Down(left), Pos::new(x: 4, y: 1), none),
+            ),
+    )
+    assert(state.cursor() == 1)
+}
+
+#[test]
+fn empty_areas_draw_nothing() {
+    var state = typed(format!("abc").span())
+    let sizes: [(u16, u16); 3] = [(0, 0), (0, 1), (3, 0)]
+    for size in sizes {
+        let (width, height) = size
+        var frame = Frame::new(Buffer::new(Size::new(width: 4, height: 2)), Theme::dark())
+        with (frame) {
+            TextInput::new()
+                .render(
+                    Rect::new(x: 1, y: 1, width, height),
+                    mut state,
+                    placeholder: "x",
+                )
+        }
+        assert(
+            frame.buffer().to_text() == "\n" && frame.cursor().is_none(),
+        )
+    }
+    let click = Mouse::new(
+        MouseKind::Down(MouseButton::Left),
+        Pos::new(x: 1, y: 1),
+        Modifiers::NONE,
+    )
+    assert(!state.handle_mouse(click))
+    assert(state.text() == "abc" && state.cursor() == 3)
+}

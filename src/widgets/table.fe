@@ -1,0 +1,1141 @@
+//! Tables: rows of cells in columns under a header, with a selected row and
+//! scrolling.
+use core::{MemBuffer, MemSpan}
+use core::ops::{Eq, Index, Len}
+use std::io::Display
+use ingot::buffer::Buffer
+use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
+use ingot::frame::{Frame, clipped, print, theme}
+use ingot::geom::{Pos, Rect, Size}
+use ingot::layout::{Constraint, Layout}
+use ingot::layout::Constraint::{Fill, Length}
+use ingot::style::{Color, Modifier, Style}
+use ingot::text::{Alignment, ELLIPSIS, truncate, truncate_with_ellipsis, width}
+use ingot::theme::Theme
+
+/// The most columns a `TableState` records for hit-testing. A table may
+/// have more, and a click on a later one reports no column.
+pub const MAX_COLUMNS: usize = 16
+
+/// The rows one step of the mouse wheel scrolls a table by.
+pub const WHEEL_ROWS: usize = 3
+
+/// A column of a `Table`: its title, the constraint its width is solved
+/// from, and where its title and cells sit in it. The title is any
+/// `Display` value, such as a string literal; the columns of a table share
+/// one title type, and string literals of any lengths take the longest's.
+pub struct Column<T> { title: T, constraint: Constraint, alignment: Alignment }
+
+impl<T: Copy> Copy for Column<T> {}
+
+impl<T> Column<T> {
+    /// A column titled `title`, as wide as `constraint` asks among the
+    /// table's columns, its title and cells on the left.
+    pub fn new(_ title: own T, _ constraint: Constraint) -> Self {
+        Column { title, constraint, alignment: Alignment::Left }
+    }
+
+    /// This column, with its title and cells placed by `alignment`.
+    pub fn align(var own self, _ alignment: Alignment) -> Self {
+        self.alignment = alignment
+        self
+    }
+}
+
+/// A row that gives the text of each of its cells, so that a collection of
+/// rows renders with `Table::render`.
+pub trait TableRow {
+    /// Appends the text of the cell in column `column` to `out`.
+    fn cell(self, _ column: usize, _ out: mut MemBuffer)
+}
+
+/// An array is a row of its elements' text, one in each column.
+impl<T: Display, const N: usize> TableRow for [T; N] {
+    fn cell(self, _ column: usize, _ out: mut MemBuffer) {
+        if column < N {
+            self[column].fmt(mut out)
+        }
+    }
+}
+
+/// A cell that a `Table::render_with` closure draws: its row and column,
+/// its rectangle, and whether its row is selected.
+pub struct TableCell { pub row: usize, pub column: usize, pub area: Rect, pub selected: bool }
+
+impl Copy for TableCell {}
+
+/// Rows of cells in columns under a header of titles, with one row selected
+/// and the rows scrolled to keep it in view:
+///
+/// ```fe
+/// struct File { name: MemBuffer, size: u64 }
+///
+/// impl TableRow for File {
+///     fn cell(self, _ column: usize, _ out: mut MemBuffer) {
+///         match column {
+///             0 => write!(mut out, self.name),
+///             _ => write!(mut out, self.size),
+///         }
+///     }
+/// }
+///
+/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+///     let columns = [
+///         Column::new("Name", Fill(1)),
+///         Column::new("Size", Length(8)).align(Alignment::Right),
+///     ]
+///     Table::new().separator(true).render(area, columns, self.files, mut self.table)
+/// }
+/// ```
+///
+/// The columns' widths are solved from their constraints as
+/// `Layout::columns()` solves them, with the table's column spacing between
+/// them, so they never overlap or leave the area. The header takes the top
+/// row, the separator, a line in the theme's `border` style, the next one,
+/// and the rows the rest, one row of the area each.
+///
+/// `render` draws a collection of `TableRow`s, writing each cell's text cut
+/// to its column at a cluster boundary, with an ellipsis where it is cut
+/// unless `ellipsis(false)`. `render_with` calls a closure for each cell
+/// instead, which draws in the cell's area. Either takes the rows as any
+/// collection indexed by position, such as a `MemVec`, a `MemSlice` or an
+/// array.
+///
+/// The table's `style` applies over the theme's `text` style to its whole
+/// area, the header style over the theme's `title` style to the header row,
+/// and the highlight style over the theme's `highlight` style to the whole
+/// selected row, gaps between columns included, after its cells are drawn.
+pub struct Table {
+    style: Style,
+    header_style: Style,
+    highlight_style: Style,
+    spacing: u16,
+    header: bool,
+    separator: bool,
+    ellipsis: bool,
+}
+
+impl Copy for Table {}
+
+impl Table {
+    /// A table with a header and no separator, one column between columns,
+    /// and an ellipsis in a cell cut to its column.
+    pub fn new() -> Self {
+        Table {
+            style: Style::NONE,
+            header_style: Style::NONE,
+            highlight_style: Style::NONE,
+            spacing: 1,
+            header: true,
+            separator: false,
+            ellipsis: true,
+        }
+    }
+
+    /// This table, with `style` over the theme's `text` style for its area.
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
+    }
+
+    /// This table, with `style` over the theme's `title` style for its
+    /// header.
+    pub fn header_style(var own self, _ style: Style) -> Self {
+        self.header_style = style
+        self
+    }
+
+    /// This table, with `style` over the theme's `highlight` style for its
+    /// selected row.
+    pub fn highlight_style(var own self, _ style: Style) -> Self {
+        self.highlight_style = style
+        self
+    }
+
+    /// This table, with `spacing` columns between its columns.
+    pub fn column_spacing(var own self, _ spacing: u16) -> Self {
+        self.spacing = spacing
+        self
+    }
+
+    /// This table, with a header row of the column titles or without one.
+    pub fn header(var own self, _ show: bool) -> Self {
+        self.header = show
+        self
+    }
+
+    /// This table, with a line under the header or without one.
+    pub fn separator(var own self, _ show: bool) -> Self {
+        self.separator = show
+        self
+    }
+
+    /// This table, ending a cell cut to its column with an ellipsis or not.
+    pub fn ellipsis(var own self, _ show: bool) -> Self {
+        self.ellipsis = show
+        self
+    }
+
+    /// Draws `rows` in `area` under the titles of `columns`, each cell the
+    /// text its row gives for its column. Records the layout in `state`,
+    /// after fitting its selection and scroll offset to the rows; see
+    /// `TableState`.
+    pub fn render<R: Len + Index<usize>, T: Display, const N: usize>(
+        self,
+        _ area: Rect,
+        _ columns: [Column<T>; N],
+        _ rows: R,
+        _ state: mut TableState,
+    )
+    uses (frame: mut Frame, R::E)
+    where R::Output: TableRow
+    {
+        var scratch = MemBuffer::empty()
+        let rects = self.prepare(area, columns, rows.len(), mut state, mut scratch)
+        if area.is_empty() { return }
+        let first = state.offset
+        for row in first .. min(first + state.viewport, rows.len()) {
+            let y = row_y(state.body, row - first)
+            for (column, rect) in rects.enumerate() {
+                scratch.clear()
+                rows[row].cell(column, mut scratch)
+                self.draw_text(
+                    cell_at(rect, y),
+                    scratch.span(),
+                    columns[column].alignment,
+                )
+            }
+            if state.selected == Option::Some(row) {
+                self.highlight(area, y)
+            }
+        }
+    }
+
+    /// Draws the visible rows of `rows` in `area` under the titles of
+    /// `columns`, calling `draw` for each cell with its row and the cell.
+    /// `draw` keeps to `cell.area`, as `print_in(cell.area, ..)` does, or
+    /// clips to it with `with (Frame = clipped(cell.area)) { .. }`. Records
+    /// the layout in `state` as `render` does.
+    pub fn render_with<
+        R: Len + Index<usize>,
+        T: Display,
+        const N: usize,
+        F: Fn(R::Output, TableCell),
+    >(self, _ area: Rect, _ columns: [Column<T>; N], _ rows: R, _ state: mut TableState, _ draw: F)
+    uses (frame: mut Frame, R::E, F::E)
+    {
+        var scratch = MemBuffer::empty()
+        let rects = self.prepare(area, columns, rows.len(), mut state, mut scratch)
+        if area.is_empty() { return }
+        let first = state.offset
+        for row in first .. min(first + state.viewport, rows.len()) {
+            let y = row_y(state.body, row - first)
+            let selected = state.selected == Option::Some(row)
+            for (column, rect) in rects.enumerate() {
+                draw(
+                    rows[row],
+                    TableCell { row, column, area: cell_at(rect, y), selected },
+                )
+            }
+            if selected {
+                self.highlight(area, y)
+            }
+        }
+    }
+
+    // Solves the columns, lays out the header, separator and rows, fits
+    // and records them in `state`, and draws the header and separator.
+    // Returns the columns' rectangles.
+    fn prepare<T: Display, const N: usize>(
+        self,
+        _ area: Rect,
+        _ columns: [Column<T>; N],
+        _ rows: usize,
+        _ state: mut TableState,
+        _ scratch: mut MemBuffer,
+    ) -> [Rect; N]
+    uses (frame: mut Frame)
+    {
+        var constraints: [Constraint; N] = [Constraint::Fill(1); N]
+        for (i, ref column) in columns.enumerate() {
+            constraints[i] = column.constraint
+        }
+        let rects = Layout::columns().spacing(self.spacing).split(area, constraints)
+        state.column_count = 0
+        for rect in rects.take(MAX_COLUMNS) {
+            state.columns[state.column_count] = rect
+            state.column_count += 1
+        }
+        let (header, rest) = area.split_top(if self.header { 1 } else { 0 })
+        let (line, body) = rest.split_top(if self.separator { 1 } else { 0 })
+        state.area = area
+        state.header = header
+        state.body = body
+        state.fit(rows, body.height as usize)
+        if area.is_empty() {
+            return rects
+        }
+        let theme = theme()
+        frame.set_style(area, theme.text.patch(self.style))
+        if !header.is_empty() {
+            frame.set_style(header, theme.title.patch(self.header_style))
+            for (i, ref column) in columns.enumerate() {
+                scratch.clear()
+                column.title.fmt(mut scratch)
+                self.draw_text(
+                    cell_at(rects[i], header.y),
+                    scratch.span(),
+                    column.alignment,
+                )
+            }
+        }
+        frame.fill(line, "─", theme.border)
+        rects
+    }
+
+    // Draws `text` in `cell`, cut to its width and placed by `alignment`.
+    fn draw_text(self, _ cell: Rect, _ text: MemSpan, _ alignment: Alignment)
+    uses (frame: mut Frame)
+    {
+        let room = cell.width as usize
+        let len = if self.ellipsis {
+            truncate_with_ellipsis(text, room)
+        } else {
+            truncate(text, room)
+        }
+        let shown = text.slice(offset: 0, len)
+        let cut = self.ellipsis && len < text.len() && room > 0
+        let columns = width(shown)
+        let lead: u16 = alignment
+            .offset(width: columns + if cut { 1 } else { 0 }, available: room)
+            .downcast_truncate()
+        let x = cell.x + lead
+        frame
+            .print_in(
+                Rect { x, y: cell.y, width: cell.right() - x, height: 1 },
+                shown,
+                Style::NONE,
+            )
+        if cut {
+            let end: u16 = x + columns.downcast_truncate()
+            frame
+                .print_in(
+                    Rect { x: end, y: cell.y, width: cell.right() - end, height: 1 },
+                    ELLIPSIS,
+                    Style::NONE,
+                )
+        }
+    }
+
+    // Applies the highlight style to row `y` of `area`, gaps included.
+    fn highlight(self, _ area: Rect, _ y: u16) uses (frame: mut Frame) {
+        frame
+            .set_style(
+                Rect { x: area.x, y, width: area.width, height: 1 },
+                theme().highlight.patch(self.highlight_style),
+            )
+    }
+}
+
+// The row `index` rows down `body`, which holds it.
+fn row_y(_ body: Rect, _ index: usize) -> u16 {
+    let dy: u16 = index.downcast_truncate()
+    body.y + dy
+}
+
+// The cell of the column `column` in row `y`.
+fn cell_at(_ column: Rect, _ y: u16) -> Rect {
+    Rect { x: column.x, y, width: column.width, height: 1 }
+}
+
+fn min(_ a: usize, _ b: usize) -> usize {
+    if a < b { a } else { b }
+}
+
+fn max(_ a: usize, _ b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// What a position in a table lands on.
+pub enum TableHit {
+    /// The header, in the column there if not between columns.
+    Header(Option<usize>),
+    /// A row, and the column there if not between columns.
+    Row(usize, Option<usize>),
+}
+
+impl Copy for TableHit {}
+
+impl Eq for TableHit {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (TableHit::Header(a), TableHit::Header(b)) => a == b,
+            (TableHit::Row(a, c), TableHit::Row(b, d)) => a == b && c == d,
+            _ => false,
+        }
+    }
+}
+
+/// The state of a `Table` that outlives a frame: the selected row and the
+/// scroll offset, which the program changes, and the layout of the last
+/// render, which event handling reads.
+///
+/// The selection moves within the rows of the last render, and each move
+/// scrolls the rows as little as keeps the selected one in view; so does a
+/// render, after it clamps the selection to the rows there are (no rows,
+/// no selection) and the offset to leave no empty rows below the last. The
+/// mouse wheel scrolls without moving the selection unless it would leave
+/// the view, and a click selects the row under it.
+///
+/// The layout records the area, the header and the rows of the last render,
+/// and the rectangles of its first `MAX_COLUMNS` columns.
+pub struct TableState {
+    selected: Option<usize>,
+    offset: usize,
+    viewport: usize,
+    rows: usize,
+    area: Rect,
+    header: Rect,
+    body: Rect,
+    columns: [Rect; MAX_COLUMNS],
+    column_count: usize,
+}
+
+impl Copy for TableState {}
+
+impl TableState {
+    /// A state with no row selected, scrolled to the top, before any render.
+    pub fn new() -> Self {
+        TableState {
+            selected: Option::None,
+            offset: 0,
+            viewport: 0,
+            rows: 0,
+            area: Rect::ZERO,
+            header: Rect::ZERO,
+            body: Rect::ZERO,
+            columns: [Rect::ZERO; MAX_COLUMNS],
+            column_count: 0,
+        }
+    }
+
+    /// The selected row.
+    pub fn selected(self) -> Option<usize> {
+        self.selected
+    }
+
+    /// Selects `row`, or no row, scrolling to keep it in view. The next
+    /// render clamps it to the rows there are.
+    pub fn select(mut self, _ row: Option<usize>) {
+        self.selected = row
+        self.follow()
+    }
+
+    /// The first row shown.
+    pub fn offset(self) -> usize {
+        self.offset
+    }
+
+    /// The rows shown at once in the last render.
+    pub fn viewport(self) -> usize {
+        self.viewport
+    }
+
+    /// The area of the last render.
+    pub fn area(self) -> Rect {
+        self.area
+    }
+
+    /// The rectangle of column `index` in the last render, header and rows
+    /// included, if it is one of the first `MAX_COLUMNS`.
+    pub fn column(self, _ index: usize) -> Option<Rect> {
+        if index < self.column_count {
+            Option::Some(self.columns[index])
+        } else {
+            Option::None
+        }
+    }
+
+    /// Selects the row below the selected one, or the first one shown.
+    pub fn select_next(mut self) {
+        if self.rows == 0 { return }
+        let row = match self.selected {
+            Option::Some(row) => row + 1,
+            Option::None => self.offset,
+        }
+        self.select(Option::Some(min(row, self.rows - 1)))
+    }
+
+    /// Selects the row above the selected one, or the last one shown.
+    pub fn select_previous(mut self) {
+        if self.rows == 0 { return }
+        let row = match self.selected {
+            Option::Some(row) => row.saturating_sub(1),
+            Option::None => self.last_shown(),
+        }
+        self.select(Option::Some(row))
+    }
+
+    /// Selects the first row.
+    pub fn select_first(mut self) {
+        if self.rows > 0 {
+            self.select(Option::Some(0))
+        }
+    }
+
+    /// Selects the last row.
+    pub fn select_last(mut self) {
+        if self.rows > 0 {
+            self.select(Option::Some(self.rows - 1))
+        }
+    }
+
+    /// Moves the selection and the rows shown down by a page, the rows the
+    /// last render showed, keeping the selected row's place in the view
+    /// where the rows allow. Without a selection, selects the first row
+    /// shown.
+    pub fn page_down(mut self) {
+        if self.rows == 0 { return }
+        match self.selected {
+            Option::Some(row) => {
+                let page = max(self.viewport, 1)
+                self.offset = min(self.offset + page, self.max_offset())
+                self.select(Option::Some(min(row + page, self.rows - 1)))
+            },
+            Option::None => self.select_next(),
+        }
+    }
+
+    /// Moves the selection and the rows shown up by a page; see
+    /// `page_down`. Without a selection, selects the last row shown.
+    pub fn page_up(mut self) {
+        if self.rows == 0 { return }
+        match self.selected {
+            Option::Some(row) => {
+                let page = max(self.viewport, 1)
+                self.offset = self.offset.saturating_sub(page)
+                self.select(Option::Some(row.saturating_sub(page)))
+            },
+            Option::None => self.select_previous(),
+        }
+    }
+
+    /// Scrolls the rows shown down by `rows`, as far as the last row. The
+    /// selection moves only to stay in view.
+    pub fn scroll_down(mut self, _ rows: usize) {
+        self.offset = min(self.offset + rows, self.max_offset())
+        self.drag()
+    }
+
+    /// Scrolls the rows shown up by `rows`, as far as the first row. The
+    /// selection moves only to stay in view.
+    pub fn scroll_up(mut self, _ rows: usize) {
+        self.offset = self.offset.saturating_sub(rows)
+        self.drag()
+    }
+
+    /// Moves the selection for a key press without modifiers: Up and Down
+    /// by a row, Page Up and Page Down by a page, Home and End to the first
+    /// and last rows. Returns whether the key is one of these.
+    pub fn handle_key(mut self, _ key: Key) -> bool {
+        if key.is(KeyCode::Up) {
+            self.select_previous()
+        } else if key.is(KeyCode::Down) {
+            self.select_next()
+        } else if key.is(KeyCode::PageUp) {
+            self.page_up()
+        } else if key.is(KeyCode::PageDown) {
+            self.page_down()
+        } else if key.is(KeyCode::Home) {
+            self.select_first()
+        } else if key.is(KeyCode::End) {
+            self.select_last()
+        } else {
+            return false
+        }
+        true
+    }
+
+    /// What `pos` lands on in the last render: the header or a row, with
+    /// the column there; nothing outside the table, on the separator or
+    /// below the last row.
+    pub fn hit(self, _ pos: Pos) -> Option<TableHit> {
+        if !self.area.contains(pos) {
+            return Option::None
+        }
+        var column: Option<usize> = Option::None
+        for (i, rect) in self.columns.enumerate().take(self.column_count) {
+            if pos.x >= rect.x && pos.x < rect.right() {
+                column = Option::Some(i)
+            }
+        }
+        if self.header.contains(pos) {
+            return Option::Some(TableHit::Header(column))
+        }
+        if self.body.contains(pos) {
+            let row = self.offset + (pos.y - self.body.y) as usize
+            if row < self.rows {
+                return Option::Some(TableHit::Row(row, column))
+            }
+        }
+        Option::None
+    }
+
+    /// Handles a mouse event over the last render: a left click selects the
+    /// row under it, and the wheel scrolls by `WHEEL_ROWS`. Returns what a
+    /// left click lands on; see `hit`.
+    pub fn handle_mouse(mut self, _ mouse: Mouse) -> Option<TableHit> {
+        if !self.area.contains(mouse.pos) {
+            return Option::None
+        }
+        match mouse.kind {
+            MouseKind::Down(MouseButton::Left) => {
+                let hit = self.hit(mouse.pos)
+                match hit {
+                    Option::Some(TableHit::Row(row, _)) => self.select(Option::Some(row)),
+                    _ => {},
+                }
+                hit
+            },
+            MouseKind::ScrollDown => {
+                self.scroll_down(WHEEL_ROWS)
+                Option::None
+            },
+            MouseKind::ScrollUp => {
+                self.scroll_up(WHEEL_ROWS)
+                Option::None
+            },
+            _ => Option::None,
+        }
+    }
+
+    // Fits the selection and offset to `rows` rows, `viewport` of them
+    // shown.
+    fn fit(mut self, _ rows: usize, _ viewport: usize) {
+        self.rows = rows
+        self.viewport = viewport
+        match self.selected {
+            Option::Some(row) => if rows == 0 {
+                self.selected = Option::None
+            } else if row >= rows {
+                self.selected = Option::Some(rows - 1)
+            },
+            Option::None => {},
+        }
+        self.offset = min(self.offset, self.max_offset())
+        self.follow()
+    }
+
+    // Scrolls as little as shows the selected row.
+    fn follow(mut self) {
+        match self.selected {
+            Option::Some(row) => if self.viewport > 0 {
+                if row < self.offset {
+                    self.offset = row
+                } else if row >= self.offset + self.viewport {
+                    self.offset = row + 1 - self.viewport
+                }
+            },
+            Option::None => {},
+        }
+    }
+
+    // Moves the selection as little as keeps it in view.
+    fn drag(mut self) {
+        match self.selected {
+            Option::Some(row) => if self.viewport > 0 {
+                if row < self.offset {
+                    self.selected = Option::Some(self.offset)
+                } else if row >= self.offset + self.viewport {
+                    self.selected = Option::Some(self.offset + self.viewport - 1)
+                }
+            },
+            Option::None => {},
+        }
+    }
+
+    // The offset that shows the last row at the bottom.
+    fn max_offset(self) -> usize {
+        self.rows.saturating_sub(self.viewport)
+    }
+
+    // The last row shown.
+    fn last_shown(self) -> usize {
+        min(self.offset + max(self.viewport, 1), self.rows) - 1
+    }
+}
+
+// A frame of `width` by `height` empty cells, with the dark theme.
+fn blank(width: u16, height: u16) -> Frame {
+    Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
+}
+
+// The buffer `table` draws `rows` into, filling a frame of `width` by
+// `height`.
+fn rendered<R: Len + Index<usize>, T: Display, const N: usize>(
+    _ table: Table,
+    width: u16,
+    height: u16,
+    _ columns: [Column<T>; N],
+    _ rows: R,
+    _ state: mut TableState,
+) -> Buffer
+uses R::E
+where R::Output: TableRow
+{
+    var frame = blank(width, height)
+    let area = frame.area()
+    with (frame) {
+        table.render(area, columns, rows, mut state)
+    }
+    frame.into_buffer()
+}
+
+fn modifier_at(_ buffer: Buffer, _ x: u16, _ y: u16) -> Modifier {
+    buffer.get(Pos::new(x, y)).unwrap().modifier()
+}
+
+fn ten_rows() -> [[u16; 2]; 10] {
+    var rows: [[u16; 2]; 10] = [[0, 0]; 10]
+    for i in 0 .. 10 {
+        let n: u16 = i.downcast_truncate()
+        rows[i] = [n, n * 10]
+    }
+    rows
+}
+
+#[test]
+fn columns_solve_their_widths_and_cut_cells() {
+    let columns = [
+        Column::new("Name", Length(4)),
+        Column::new("Kind", Fill(1)),
+        Column::new("Size", Length(3)).align(Alignment::Right),
+    ]
+    let rows = [["abcdef", "x", "7"], ["ab", "yyyy", "1234"]]
+    var state = TableState::new()
+    let wide = rendered(
+        Table::new(),
+        width: 12,
+        height: 3,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(
+        wide.to_text() == "Name Ki… Si…\nabc… x     7\nab   yy… 12…",
+    )
+    assert(
+        state.column(0) == Option::Some(Rect::new(x: 0, y: 0, width: 4, height: 3)),
+    )
+    assert(
+        state.column(1) == Option::Some(Rect::new(x: 5, y: 0, width: 3, height: 3)),
+    )
+    assert(
+        state.column(2) == Option::Some(Rect::new(x: 9, y: 0, width: 3, height: 3)),
+    )
+    assert(state.column(3).is_none())
+    // Too narrow: the lengths are served first, in order.
+    let narrow = rendered(
+        Table::new(),
+        width: 6,
+        height: 3,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(narrow.to_text() == "Name\nabc…\nab")
+    assert(
+        state.column(1) == Option::Some(Rect::new(x: 5, y: 0, width: 0, height: 3)),
+    )
+    let spaced = rendered(
+        Table::new().column_spacing(3).ellipsis(false),
+        width: 16,
+        height: 2,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(spaced.to_text() == "Name   Kin   Siz\nabcd   x       7")
+}
+
+#[test]
+fn cells_and_titles_follow_their_alignment() {
+    let columns = [
+        Column::new("L", Length(5)),
+        Column::new("C", Length(5)).align(Alignment::Center),
+        Column::new("R", Length(5)).align(Alignment::Right),
+    ]
+    let rows = [["ab", "ab", "ab"], ["abcd", "abcd", "abcd"]]
+    var state = TableState::new()
+    let buffer = rendered(
+        Table::new(),
+        width: 17,
+        height: 3,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(
+        buffer.to_text() == "L       C       R\nab     ab      ab\nabcd  abcd   abcd",
+    )
+}
+
+#[test]
+fn wide_clusters_are_cut_whole() {
+    let columns = [
+        Column::new("", Length(5)),
+        Column::new("", Length(4)),
+        Column::new("", Length(1)),
+    ]
+    let rows = [["界界界", "界界界", "界"]]
+    var state = TableState::new()
+    let cut = rendered(
+        Table::new().header(false),
+        width: 12,
+        height: 1,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(cut.to_text() == "界界… 界…  …")
+    let plain = rendered(
+        Table::new().header(false).ellipsis(false),
+        width: 12,
+        height: 1,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(plain.to_text() == "界界  界界")
+}
+
+#[test]
+fn headers_and_separators_take_their_rows() {
+    let columns = [Column::new("Name", Fill(1)), Column::new("N", Length(2))]
+    let rows = [["a", "1"], ["b", "2"]]
+    var state = TableState::new()
+    let buffer = rendered(
+        Table::new().separator(true),
+        width: 6,
+        height: 4,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(buffer.to_text() == "Na… N\n──────\na   1\nb   2")
+    assert(modifier_at(buffer, 0, 0).contains(Modifier::BOLD))
+    assert(modifier_at(buffer, 0, 1) == Modifier::DIM)
+    assert(modifier_at(buffer, 0, 2).is_empty())
+    let styled = rendered(
+        Table::new().header_style(Style::new().fg(Color::RED)),
+        width: 6,
+        height: 3,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(
+        styled.get(Pos::new(x: 5, y: 0)).unwrap().fg() == Color::RED,
+    )
+    assert(modifier_at(styled, 5, 0) == Modifier::BOLD)
+    let bare = rendered(
+        Table::new().header(false),
+        width: 6,
+        height: 3,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(bare.to_text() == "a   1\nb   2\n")
+    assert(state.viewport() == 3)
+}
+
+#[test]
+fn the_selected_row_is_highlighted_across_its_gaps() {
+    let columns = [Column::new("A", Length(2)), Column::new("B", Length(2))]
+    let rows = [["a", "1"], ["b", "2"], ["c", "3"]]
+    var state = TableState::new()
+    state.select(Option::Some(1))
+    let buffer = rendered(
+        Table::new().column_spacing(2).highlight_style(Style::new().fg(Color::GREEN)),
+        width: 8,
+        height: 4,
+        columns,
+        rows,
+        mut state,
+    )
+    for x in [0, 1, 2, 3, 4, 5, 6, 7] {
+        let cell = buffer.get(Pos::new(x, y: 2)).unwrap()
+        assert(
+            cell.modifier() == Modifier::REVERSED && cell.fg() == Color::GREEN,
+        )
+        assert(
+            modifier_at(buffer, x, 1).is_empty() && modifier_at(buffer, x, 3).is_empty(),
+        )
+    }
+}
+
+#[test]
+fn scrolling_follows_the_selection_without_jumps() {
+    let columns = [Column::new("N", Length(2)), Column::new("T", Length(3))]
+    let rows = ten_rows()
+    var state = TableState::new()
+    rendered(
+        Table::new(),
+        width: 6,
+        height: 4,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(state.viewport() == 3 && state.selected().is_none())
+    // Down from no selection selects the first row shown.
+    let down = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 7]
+    for expected in down {
+        assert(state.handle_key(Key::new(KeyCode::Down, Modifiers::NONE)))
+        assert(state.offset() == expected)
+    }
+    assert(state.selected() == Option::Some(9))
+    let buffer = rendered(
+        Table::new(),
+        width: 6,
+        height: 4,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(buffer.to_text() == "N  T\n7  70\n8  80\n9  90")
+    let up = [7, 7, 6, 5, 4, 3, 2, 1, 0, 0]
+    for expected in up {
+        state.select_previous()
+        assert(state.offset() == expected)
+    }
+    assert(state.selected() == Option::Some(0))
+    state.page_down()
+    assert(state.selected() == Option::Some(3) && state.offset() == 3)
+    state.page_down()
+    state.page_down()
+    assert(state.selected() == Option::Some(9) && state.offset() == 7)
+    state.page_up()
+    assert(state.selected() == Option::Some(6) && state.offset() == 4)
+    assert(state.handle_key(Key::new(KeyCode::Home, Modifiers::NONE)))
+    assert(state.selected() == Option::Some(0) && state.offset() == 0)
+    assert(state.handle_key(Key::new(KeyCode::End, Modifiers::NONE)))
+    assert(state.selected() == Option::Some(9) && state.offset() == 7)
+    assert(
+        !state.handle_key(Key::new(KeyCode::Down, Modifiers::SHIFT)),
+    )
+    assert(
+        !state.handle_key(Key::new(KeyCode::Char(b'j'), Modifiers::NONE)),
+    )
+    // Fewer rows: the selection and the offset clamp to them.
+    let few: [[u16; 2]; 5] = [[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]]
+    let shrunk = rendered(Table::new(), width: 6, height: 4, columns, few, mut state)
+    assert(state.selected() == Option::Some(4) && state.offset() == 2)
+    assert(shrunk.to_text() == "N  T\n3  30\n4  40\n5  50")
+    // A taller area shows more rows, and the offset leaves none empty.
+    rendered(Table::new(), width: 6, height: 9, columns, few, mut state)
+    assert(state.offset() == 0 && state.viewport() == 8)
+}
+
+#[test]
+fn clicks_hit_rows_and_columns() {
+    let columns = [Column::new("A", Length(2)), Column::new("B", Length(2))]
+    let rows = ten_rows()
+    var state = TableState::new()
+    // At (1, 1), 6 by 5, with a separator: rows from y = 3, three shown.
+    var frame = blank(width: 8, height: 6)
+    with (frame) {
+        Table::new()
+            .separator(true)
+            .render(
+                Rect::new(x: 1, y: 1, width: 6, height: 5),
+                columns,
+                rows,
+                mut state,
+            )
+    }
+    assert(state.area() == Rect::new(x: 1, y: 1, width: 6, height: 5))
+    assert(
+        state.hit(Pos::new(x: 1, y: 1)) == Option::Some(TableHit::Header(Option::Some(0))),
+    )
+    assert(
+        state.hit(Pos::new(x: 3, y: 1)) == Option::Some(TableHit::Header(Option::None)),
+    )
+    assert(state.hit(Pos::new(x: 4, y: 2)).is_none())
+    assert(
+        state.hit(Pos::new(x: 5, y: 4)) == Option::Some(TableHit::Row(1, Option::Some(1))),
+    )
+    assert(
+        state.hit(Pos::new(x: 6, y: 3)) == Option::Some(TableHit::Row(0, Option::None)),
+    )
+    assert(state.hit(Pos::new(x: 0, y: 3)).is_none())
+    assert(state.hit(Pos::new(x: 7, y: 3)).is_none())
+    let click = Mouse::new(
+        MouseKind::Down(MouseButton::Left),
+        Pos::new(x: 2, y: 5),
+        Modifiers::NONE,
+    )
+    assert(
+        state.handle_mouse(click) == Option::Some(TableHit::Row(2, Option::Some(0))),
+    )
+    assert(state.selected() == Option::Some(2))
+    // The wheel scrolls, dragging the selection only to keep it shown.
+    let wheel = Mouse::new(
+        MouseKind::ScrollDown,
+        Pos::new(x: 2, y: 4),
+        Modifiers::NONE,
+    )
+    assert(state.handle_mouse(wheel).is_none())
+    assert(state.offset() == 3 && state.selected() == Option::Some(3))
+    state.handle_mouse(wheel)
+    state.handle_mouse(wheel)
+    assert(state.offset() == 7 && state.selected() == Option::Some(7))
+    assert(
+        state.hit(Pos::new(x: 1, y: 5)) == Option::Some(TableHit::Row(9, Option::Some(0))),
+    )
+    state.scroll_up(1)
+    assert(state.offset() == 6 && state.selected() == Option::Some(7))
+    let outside = Mouse::new(MouseKind::ScrollUp, Pos::new(x: 0, y: 0), Modifiers::NONE)
+    state.handle_mouse(outside)
+    assert(state.offset() == 6)
+    // Below the last row there is none.
+    let few: [[u16; 2]; 1] = [[1, 1]]
+    with (frame) {
+        Table::new().render(
+                Rect::new(x: 1, y: 1, width: 6, height: 5),
+                columns,
+                few,
+                mut state,
+            )
+    }
+    assert(state.hit(Pos::new(x: 1, y: 3)).is_none())
+    assert(
+        state.hit(Pos::new(x: 1, y: 2)) == Option::Some(TableHit::Row(0, Option::Some(0))),
+    )
+}
+
+#[test]
+fn zero_rows_show_the_header_and_select_nothing() {
+    let columns = [Column::new("Name", Fill(1))]
+    let rows: [[u8; 1]; 0] = []
+    var state = TableState::new()
+    state.select(Option::Some(3))
+    let buffer = rendered(
+        Table::new().separator(true),
+        width: 6,
+        height: 4,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(buffer.to_text() == "Name\n──────\n\n")
+    assert(state.selected().is_none())
+    assert(state.handle_key(Key::new(KeyCode::Down, Modifiers::NONE)))
+    state.select_last()
+    state.page_down()
+    assert(state.selected().is_none() && state.offset() == 0)
+    assert(state.hit(Pos::new(x: 0, y: 2)).is_none())
+}
+
+#[test]
+fn zero_columns_draw_no_cells() {
+    let columns: [Column<String<1>>; 0] = []
+    let rows: [[u8; 1]; 2] = [[1], [2]]
+    var state = TableState::new()
+    state.select(Option::Some(0))
+    let buffer = rendered(
+        Table::new(),
+        width: 4,
+        height: 3,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(buffer.to_text() == "\n\n")
+    assert(state.column(0).is_none())
+    assert(modifier_at(buffer, 3, 1) == Modifier::REVERSED)
+    assert(
+        state.hit(Pos::new(x: 0, y: 1)) == Option::Some(TableHit::Row(0, Option::None)),
+    )
+}
+
+#[test]
+fn tiny_areas_draw_what_fits() {
+    let columns = [Column::new("Name", Fill(1)), Column::new("N", Length(2))]
+    let rows = ten_rows()
+    var state = TableState::new()
+    state.select(Option::Some(5))
+    let sizes: [(u16, u16); 3] = [(0, 0), (0, 5), (5, 0)]
+    for size in sizes {
+        let (width, height) = size
+        let buffer = rendered(
+            Table::new().separator(true),
+            width,
+            height,
+            columns,
+            rows,
+            mut state,
+        )
+        assert(buffer.to_text().is_empty())
+        assert(state.viewport() == height.saturating_sub(2) as usize)
+    }
+    let one = rendered(
+        Table::new().separator(true),
+        width: 1,
+        height: 1,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(one.to_text().is_empty())
+    assert(
+        state.viewport() == 0 && state.selected() == Option::Some(5),
+    )
+    let two = rendered(
+        Table::new(),
+        width: 3,
+        height: 2,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(two.to_text() == " N\n 50")
+    assert(state.offset() == 5)
+}
+
+fn draw_numbers(_ area: Rect, _ rows: [[u16; 2]; 10], _ state: mut TableState)
+uses (frame: mut Frame)
+{
+    let columns = [Column::new("A", Length(3)), Column::new("B", Length(3))]
+    Table::new()
+        .render_with(
+            area,
+            columns,
+            rows,
+            mut state,
+            |row: [u16; 2], cell: TableCell| {
+                let mark = if cell.selected { ">" } else { "" }
+                with (Frame = clipped(cell.area)) {
+                    print(
+                        cell.area.pos(),
+                        format!(mark, row[cell.column], "xyz"),
+                        Style::new(),
+                    )
+                }
+            },
+        )
+}
+
+#[test]
+fn closures_draw_each_cell() {
+    var state = TableState::new()
+    state.select(Option::Some(1))
+    var frame = blank(width: 7, height: 3)
+    let area = frame.area()
+    with (frame) {
+        draw_numbers(area, ten_rows(), mut state)
+    }
+    assert(frame.buffer().to_text() == "A   B\n0xy 0xy\n>1x >10")
+    assert(modifier_at(frame.buffer(), 3, 2) == Modifier::REVERSED)
+}

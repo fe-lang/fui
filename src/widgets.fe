@@ -29,7 +29,9 @@ pub use scroll::ScrollState
 pub use scrollbar::{Orientation, Scrollbar}
 pub use sparkline::Sparkline
 pub use spinner::Spinner
+pub use table::{Column, MAX_COLUMNS, Table, TableCell, TableHit, TableRow, TableState, WHEEL_ROWS}
 pub use tabs::{Tabs, TabsState}
+pub use text_input::{TextInput, TextInputState, TextLimit}
 
 pub use ingot::text::Alignment
 
