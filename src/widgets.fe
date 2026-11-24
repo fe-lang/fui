@@ -25,6 +25,7 @@ pub use block::{Block, BorderSymbols, BorderType, Borders, Padding}
 pub use gauge::{Gauge, LineGauge}
 pub use scrollbar::{Orientation, Scrollbar}
 pub use sparkline::Sparkline
+pub use spinner::Spinner
 pub use tabs::{Tabs, TabsState}
 
 /// Where content narrower than its area sits in it.
