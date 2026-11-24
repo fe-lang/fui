@@ -38,10 +38,13 @@
 //! frame outside the block: `frame.print(..)` there ends the scoped access
 //! early and draws unclipped, or is rejected if the block uses the scoped
 //! frame after it.
+use core::MemSpan
+use core::mem::replace
 use std::io::Display
 use super::buffer::Buffer
 use super::geom::{Pos, Rect, Size}
-use super::style::{Modifier, Style}
+use super::style::{Color, Modifier, Style}
+use super::text::{Alignment, ELLIPSIS, Line, Run, Text, column_offset, next_cluster, width}
 use super::theme::Theme
 
 /// The surface view code draws on: a buffer, the clip rectangle drawing
@@ -147,6 +150,169 @@ impl Frame {
             )
     }
 
+    /// Draws `line` on the top row of `area`, each run in its style applied
+    /// over the cells' styles, placed in the row by `alignment`. A line
+    /// wider than the area is cut after its last whole cluster that fits,
+    /// so a wide cluster is never split: one that would cross the area's
+    /// right edge leaves its column as it was. Returns the columns written.
+    pub fn print_line(mut self, _ area: Rect, _ line: Line, _ alignment: Alignment) -> u16 {
+        self.print_line_cut(area, line, alignment, ellipsis: false)
+    }
+
+    /// Draws `line` as `print_line` does, except that a line wider than the
+    /// area ends in `text::ELLIPSIS`, in the style of the text it stands
+    /// for, after its last whole cluster that leaves a column for it.
+    pub fn print_line_with_ellipsis(
+        mut self,
+        _ area: Rect,
+        _ line: Line,
+        _ alignment: Alignment,
+    ) -> u16 {
+        self.print_line_cut(area, line, alignment, ellipsis: true)
+    }
+
+    fn print_line_cut(
+        mut self,
+        _ area: Rect,
+        _ line: Line,
+        _ alignment: Alignment,
+        ellipsis: bool,
+    ) -> u16 {
+        if area.is_empty() {
+            return 0
+        }
+        let available = area.width as usize
+        let full = line.width()
+        let cut = full > available
+        let elide = cut && ellipsis
+        let (len, shown) = if !cut {
+            (line.len(), full)
+        } else {
+            column_offset(line.text(), if elide { available - 1 } else { available })
+        }
+        let total = if elide { shown + 1 } else { shown }
+        let x: u16 = (area.x as usize + alignment.offset(width: total, available))
+            .downcast_truncate()
+        let (row, _) = area.split_top(1)
+        var written = self
+            .draw_styled(
+                line,
+                line: 0,
+                start: 0,
+                end: len,
+                Pos::new(x, y: area.y),
+                skip: 0,
+                within: row,
+            )
+        if elide {
+            let at: u16 = (x as usize + shown).downcast_truncate()
+            written += self.print_clipped(
+                Pos::new(x: at, y: area.y),
+                ELLIPSIS,
+                style_at(line, line: 0, offset: len),
+                self.clip.intersect(row),
+            )
+        }
+        written
+    }
+
+    // Draws the bytes `start..end` of line `line` of `text`, which start
+    // and end at clusters, on row `pos.y`: the column `skip` of the range
+    // at `pos.x`, the columns before it hidden, and only in the clip and
+    // `within`. Each run is drawn in its style over the cells' styles; a
+    // cluster belongs to the run it starts in. A wide cluster that `skip`
+    // cuts in half leaves a space in its style. Returns the columns
+    // written.
+    pub(ingot) fn draw_styled<S: StyledText>(
+        mut self,
+        _ text: S,
+        line: usize,
+        start: usize,
+        end: usize,
+        _ pos: Pos,
+        skip: usize,
+        within: Rect,
+    ) -> u16 {
+        let clip = self.clip.intersect(within)
+        if pos.y < clip.y || pos.y >= clip.bottom() || pos.x >= clip.right() {
+            return 0
+        }
+        let bytes = text.line_text(line)
+        let from = if pos.x > clip.x { pos.x } else { clip.x }
+        var written: u16 = 0
+        var offset = start
+        // The columns of the range before `offset`.
+        var column: usize = 0
+        while offset < end && column < skip {
+            let cluster = next_cluster(bytes, offset)
+            column += cluster.width as usize
+            if column > skip && pos.x >= from {
+                let style = style_at(text, line, offset)
+                self.buffer
+                    .fill(
+                        Rect::new(x: pos.x, y: pos.y, width: 1, height: 1),
+                        bytes.slice(offset: 0, len: 0),
+                        style,
+                    )
+                written += 1
+            }
+            offset += cluster.len
+        }
+        let to = clip.right() as usize
+        var x = pos.x as usize + (column - skip)
+        let runs = text.run_count(line)
+        var run: usize = 0
+        while offset < end && x < to {
+            while run + 1 < runs && text.run(line, run).end <= offset {
+                run += 1
+            }
+            // The last run takes any bytes after the runs.
+            let (run_end, style) = if runs == 0 {
+                (end, Style::NONE)
+            } else {
+                let current = text.run(line, run)
+                (if run + 1 == runs { end } else { current.end }, current.style)
+            }
+            let segment = offset
+            var columns: usize = 0
+            while offset < end && offset < run_end {
+                let cluster = next_cluster(bytes, offset)
+                offset += cluster.len
+                columns += cluster.width as usize
+            }
+            written += self.buffer
+                .draw(
+                    Pos::new(x: x.downcast_truncate(), y: pos.y),
+                    bytes.slice(offset: segment, len: offset - segment),
+                    style,
+                    from,
+                    to: clip.right(),
+                )
+            x += columns
+        }
+        written
+    }
+
+    /// The columns the `Display` text of `text` takes; see `text::width`.
+    pub fn measure<T: Display>(mut self, _ text: T) -> usize {
+        self.scratch.clear()
+        text.fmt(mut self.scratch)
+        width(self.scratch.span())
+    }
+
+    // The buffer the frame formats text into, for a widget that formats
+    // text and draws it in parts: an empty buffer stands in for it until
+    // `restore_scratch` gives it back, so its memory serves every frame.
+    pub(ingot) fn take_scratch(mut self) -> MemBuffer {
+        var scratch = replace(mut self.scratch, MemBuffer::empty())
+        scratch.clear()
+        scratch
+    }
+
+    pub(ingot) fn restore_scratch(mut self, _ scratch: own MemBuffer) {
+        self.scratch = scratch
+    }
+
     /// Writes the first grapheme cluster of the `Display` text of `symbol`
     /// into every cell of `area`; see `Buffer::fill`.
     pub fn fill<T: Display>(mut self, _ area: Rect, _ symbol: T, _ style: Style) {
@@ -164,6 +330,98 @@ impl Frame {
     /// colors.
     pub fn clear(mut self, _ area: Rect) {
         self.buffer.reset(area.intersect(self.clip))
+    }
+}
+
+/// Styled text a frame draws: lines of bytes, each in runs of styles that
+/// cover its bytes in order, the last run taking any bytes after the
+/// others. `Line` is one line, `Text` holds its lines, and bytes
+/// (`MemSpan`) are one line in no style. Widgets such as `Paragraph` lay a
+/// line out as `text::Wrap` reads it, so line breaks in a line's bytes end
+/// its rows there.
+pub trait StyledText {
+    /// The number of lines.
+    fn line_count(self) -> usize
+
+    /// The bytes of line `line`, which is less than `line_count()`.
+    fn line_text(self, _ line: usize) -> ref MemSpan
+
+    /// The number of runs of line `line`.
+    fn run_count(self, _ line: usize) -> usize
+
+    /// The run `index` of line `line`, which is less than `run_count(line)`.
+    fn run(self, _ line: usize, _ index: usize) -> Run
+}
+
+/// One line.
+impl StyledText for Line {
+    fn line_count(self) -> usize {
+        1
+    }
+
+    fn line_text(self, _ line: usize) -> ref MemSpan {
+        self.text()
+    }
+
+    fn run_count(self, _ line: usize) -> usize {
+        self.run_count()
+    }
+
+    fn run(self, _ line: usize, _ index: usize) -> Run {
+        self.run(index)
+    }
+}
+
+/// Its lines, top to bottom.
+impl StyledText for Text {
+    fn line_count(self) -> usize {
+        self.height()
+    }
+
+    fn line_text(self, _ line: usize) -> ref MemSpan {
+        self.lines()[line].text()
+    }
+
+    fn run_count(self, _ line: usize) -> usize {
+        self.lines()[line].run_count()
+    }
+
+    fn run(self, _ line: usize, _ index: usize) -> Run {
+        self.lines()[line].run(index)
+    }
+}
+
+/// One line of the bytes in no style, or none if there are no bytes.
+impl StyledText for MemSpan {
+    fn line_count(self) -> usize {
+        if self.is_empty() { 0 } else { 1 }
+    }
+
+    fn line_text(self, _ line: usize) -> ref MemSpan {
+        self
+    }
+
+    fn run_count(self, _ line: usize) -> usize {
+        1
+    }
+
+    fn run(self, _ line: usize, _ index: usize) -> Run {
+        Run { start: 0, end: self.len(), style: Style::NONE }
+    }
+}
+
+// The style of the run of line `line` of `text` that byte `offset` is in:
+// the last run's for an offset after the runs.
+fn style_at<S: StyledText>(_ text: S, line: usize, offset: usize) -> Style {
+    let runs = text.run_count(line)
+    var index: usize = 0
+    while index + 1 < runs && text.run(line, index).end <= offset {
+        index += 1
+    }
+    if runs == 0 {
+        Style::NONE
+    } else {
+        text.run(line, index).style
     }
 }
 
@@ -197,6 +455,32 @@ pub fn print_in<T: Display>(_ area: Rect, _ text: T, _ style: Style) -> u16
 uses (frame: mut Frame)
 {
     frame.print_in(area, text, style)
+}
+
+/// Draws `line` on the top row of `area`; see `Frame::print_line`.
+pub fn print_line(_ area: Rect, _ line: Line, _ alignment: Alignment) -> u16
+uses (frame: mut Frame)
+{
+    frame.print_line(area, line, alignment)
+}
+
+/// Draws `line` on the top row of `area`, with an ellipsis if it is cut;
+/// see `Frame::print_line_with_ellipsis`.
+pub fn print_line_with_ellipsis(_ area: Rect, _ line: Line, _ alignment: Alignment) -> u16
+uses (frame: mut Frame)
+{
+    frame.print_line_with_ellipsis(area, line, alignment)
+}
+
+/// Applies `style` over the style of each cell of `area`; see
+/// `Frame::set_style`.
+pub fn set_style(_ area: Rect, _ style: Style) uses (frame: mut Frame) {
+    frame.set_style(area, style)
+}
+
+/// The columns the `Display` text of `text` takes; see `Frame::measure`.
+pub fn measure<T: Display>(_ text: T) -> usize uses (frame: mut Frame) {
+    frame.measure(text)
 }
 
 /// Fills `area` with `symbol`; see `Frame::fill`.
@@ -404,4 +688,252 @@ fn empty_frames_draw_nothing() {
         )
     frame.clear(Rect::new(x: 0, y: 0, width: 5, height: 5))
     assert(frame.into_buffer().to_text().is_empty())
+}
+
+fn fg_at(_ frame: Frame, x: u16, y: u16) -> Color {
+    frame.buffer().get(Pos::new(x, y)).unwrap().fg()
+}
+
+fn two_runs() -> Line {
+    var line = Line::styled("ab", Style::new().fg(Color::RED))
+    line.push("cdef", Style::new().fg(Color::BLUE))
+    line
+}
+
+#[test]
+fn lines_draw_each_run_in_its_style() {
+    var frame = frame_of(width: 8, height: 2)
+    let line = two_runs()
+    // The first run ends inside the area, the second is cut.
+    assert(
+        frame.print_line(
+                    Rect::new(x: 1, y: 0, width: 4, height: 2),
+                    line,
+                    Alignment::Left,
+                ) == 4,
+    )
+    assert(frame.buffer().to_text() == " abcd\n")
+    assert(fg_at(frame, x: 0, y: 0) == Color::RESET)
+    assert(
+        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 2, y: 0) == Color::RED,
+    )
+    assert(
+        fg_at(frame, x: 3, y: 0) == Color::BLUE && fg_at(frame, x: 4, y: 0) == Color::BLUE,
+    )
+    assert(fg_at(frame, x: 5, y: 0) == Color::RESET)
+}
+
+#[test]
+fn lines_align_in_their_area() {
+    var frame = frame_of(width: 7, height: 3)
+    let line = Line::from("ab")
+    frame.print_line(
+            Rect::new(x: 0, y: 0, width: 7, height: 1),
+            line,
+            Alignment::Left,
+        )
+    frame.print_line(
+            Rect::new(x: 0, y: 1, width: 7, height: 1),
+            line,
+            Alignment::Center,
+        )
+    frame.print_line(
+            Rect::new(x: 0, y: 2, width: 7, height: 1),
+            line,
+            Alignment::Right,
+        )
+    assert(frame.buffer().to_text() == "ab\n  ab\n     ab")
+}
+
+#[test]
+fn lines_never_split_a_wide_cluster() {
+    var frame = frame_of(width: 4, height: 3)
+    frame.fill(frame.area(), ".", Style::new())
+    var line = Line::styled("a", Style::new().fg(Color::RED))
+    line.push("漢字", Style::new().fg(Color::BLUE))
+    // "a漢" fits in 4 columns, "字" would cross the edge: its column stays.
+    assert(
+        frame.print_line(
+                    Rect::new(x: 0, y: 0, width: 4, height: 1),
+                    line,
+                    Alignment::Left,
+                ) == 3,
+    )
+    // Cut content aligns by the columns it takes.
+    assert(
+        frame.print_line(
+                    Rect::new(x: 0, y: 1, width: 4, height: 1),
+                    line,
+                    Alignment::Right,
+                ) == 3,
+    )
+    assert(
+        frame
+                .print_line(
+                    Rect::new(x: 0, y: 2, width: 1, height: 1),
+                    Line::from("漢"),
+                    Alignment::Left,
+                )
+            == 0,
+    )
+    assert(frame.buffer().to_text() == "a漢.\n.a漢\n....")
+    assert(
+        fg_at(frame, x: 1, y: 0) == Color::BLUE && fg_at(frame, x: 2, y: 0) == Color::BLUE,
+    )
+}
+
+#[test]
+fn cut_lines_may_end_in_an_ellipsis() {
+    var frame = frame_of(width: 6, height: 4)
+    var line = Line::styled("abc", Style::new().fg(Color::RED))
+    line.push("def", Style::new().fg(Color::BLUE))
+    assert(
+        frame
+                .print_line_with_ellipsis(
+                    Rect::new(x: 0, y: 0, width: 4, height: 1),
+                    line,
+                    Alignment::Left,
+                )
+            == 4,
+    )
+    // The ellipsis takes the style of the text it stands for.
+    assert(
+        fg_at(frame, x: 2, y: 0) == Color::RED && fg_at(frame, x: 3, y: 0) == Color::BLUE,
+    )
+    // A line that fits has none.
+    assert(
+        frame
+                .print_line_with_ellipsis(
+                    Rect::new(x: 0, y: 1, width: 6, height: 1),
+                    line,
+                    Alignment::Right,
+                )
+            == 6,
+    )
+    // A wide cluster that leaves no column for the ellipsis is left out.
+    assert(
+        frame
+                .print_line_with_ellipsis(
+                    Rect::new(x: 0, y: 2, width: 3, height: 1),
+                    Line::from("漢字"),
+                    Alignment::Left,
+                )
+            == 3,
+    )
+    assert(
+        frame
+                .print_line_with_ellipsis(
+                    Rect::new(x: 0, y: 3, width: 2, height: 1),
+                    Line::from("漢字"),
+                    Alignment::Right,
+                )
+            == 1,
+    )
+    assert(frame.buffer().to_text() == "abc…\nabcdef\n漢…\n …")
+}
+
+#[test]
+fn clusters_take_the_style_of_the_run_they_start_in() {
+    var frame = frame_of(width: 4, height: 1)
+    // An "e" and a combining acute accent, in two runs: one cluster.
+    var line = Line::styled("xe", Style::new().fg(Color::RED))
+    line.push("́y", Style::new().fg(Color::BLUE))
+    assert(line.width() == 3)
+    assert(frame.print_line(frame.area(), line, Alignment::Left) == 3)
+    assert(frame.buffer().to_text() == "xéy")
+    assert(
+        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 2, y: 0) == Color::BLUE,
+    )
+}
+
+fn styled_rows() uses (frame: mut Frame) {
+    let line = two_runs()
+    with (Frame = clipped(Rect::new(x: 1, y: 0, width: 3, height: 1))) {
+        print_line(
+            Rect::new(x: 0, y: 0, width: 6, height: 2),
+            line,
+            Alignment::Left,
+        )
+        print_line_with_ellipsis(
+            Rect::new(x: 0, y: 1, width: 6, height: 1),
+            line,
+            Alignment::Left,
+        )
+    }
+    print_line_with_ellipsis(
+        Rect::new(x: 0, y: 1, width: 0, height: 1),
+        line,
+        Alignment::Left,
+    )
+    print_line(
+        Rect::new(x: 0, y: 1, width: 3, height: 0),
+        line,
+        Alignment::Left,
+    )
+}
+
+#[test]
+fn lines_stay_in_the_clip_and_their_area() {
+    var frame = frame_of(width: 6, height: 2)
+    with (frame) {
+        styled_rows()
+    }
+    assert(frame.buffer().to_text() == " bcd\n")
+    let empty = Line::new()
+    assert(
+        frame.print_line(frame.area(), empty, Alignment::Center) == 0,
+    )
+}
+
+#[test]
+fn skipped_columns_hide_the_start_of_a_range() {
+    var frame = frame_of(width: 6, height: 3)
+    var line = Line::styled("漢", Style::new().fg(Color::RED))
+    line.push("字ab", Style::new().fg(Color::BLUE))
+    let row = frame.area()
+    // Column 1 cuts "漢" in half: a space in its style stands for it.
+    assert(
+        frame
+                .draw_styled(
+                    line,
+                    line: 0,
+                    start: 0,
+                    end: line.len(),
+                    Pos::new(x: 0, y: 0),
+                    skip: 1,
+                    within: row,
+                )
+            == 5,
+    )
+    assert(
+        fg_at(frame, x: 0, y: 0) == Color::RED && fg_at(frame, x: 1, y: 0) == Color::BLUE,
+    )
+    assert(
+        frame
+                .draw_styled(
+                    line,
+                    line: 0,
+                    start: 0,
+                    end: line.len(),
+                    Pos::new(x: 1, y: 1),
+                    skip: 2,
+                    within: row,
+                )
+            == 4,
+    )
+    // A range of the bytes: "字a".
+    assert(
+        frame
+                .draw_styled(
+                    line,
+                    line: 0,
+                    start: 3,
+                    end: 7,
+                    Pos::new(x: 0, y: 2),
+                    skip: 0,
+                    within: row,
+                )
+            == 3,
+    )
+    assert(frame.buffer().to_text() == " 字ab\n 字ab\n字a")
 }
