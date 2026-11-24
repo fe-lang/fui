@@ -28,7 +28,7 @@ impl App for Buggy {
     }
 
     fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-        let _ = print_in(area, "p panics, q quits", theme().text)
+        print_in(area, "p panics, q quits", theme().text)
     }
 }
 

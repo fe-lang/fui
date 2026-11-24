@@ -552,7 +552,7 @@ fn field_view(
 uses (frame: mut Frame)
 {
     let (label_area, input) = area.columns((Length(10), Fill(1)))
-    let _ = print_in(
+    print_in(
         label_area,
         label,
         if focused {
@@ -607,7 +607,7 @@ uses (frame: mut Frame)
     let theme_name: String<8> = if dark { "dark" } else { "plain" }
     let (left, right) = area.columns((Fill(1), Length(6)))
     let muted = theme().muted
-    let _ = print_line_with_ellipsis(left, Line::styled(hints, muted), Alignment::Left)
+    print_line_with_ellipsis(left, Line::styled(hints, muted), Alignment::Left)
     print_line(right, Line::styled(theme_name, muted), Alignment::Right)
 }
 

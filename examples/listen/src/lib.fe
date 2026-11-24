@@ -63,7 +63,7 @@ impl App for Server {
             .highlight_symbol("> ")
             .placeholder("No connections yet")
             .render(inner, self.peers, mut self.list)
-        let _ = print_in(
+        print_in(
             foot,
             format!(self.peers.len(), " accepted  q quit"),
             theme().muted,
