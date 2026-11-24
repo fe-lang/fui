@@ -89,10 +89,6 @@ impl Scrollbar {
         bar
     }
 
-    pub fn orientation(self) -> Orientation {
-        self.orientation
-    }
-
     /// The symbol of each cell of the track the thumb is not on.
     pub fn track(var own self, _ symbol: String<4>) -> Self {
         self.track = symbol
@@ -458,9 +454,6 @@ fn scrollbars_draw_along_an_edge() {
     )
     assert(
         buffer.get(Pos::new(x: 0, y: 1)).unwrap().modifier() == Modifier::DIM,
-    )
-    assert(
-        Scrollbar::horizontal().orientation() == Orientation::Horizontal,
     )
 }
 
