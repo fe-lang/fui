@@ -19,9 +19,8 @@
 //! session.present()?
 //! ```
 //!
-//! Inside the block, draw through the frame effect only: the frame's access
-//! holds the session until the block ends, so naming the session there is
-//! a conflict. `present` is a call of its own, rather than the slide of
+//! Inside the block, draw through the frame effect only, and do not name
+//! the session: the frame's access holds it. `present` is a call of its own, rather than the slide of
 //! `frame`, so that a failed write is returned where it happens, and a
 //! block left early, by `return` or `?`, shows no half-drawn frame.
 //!

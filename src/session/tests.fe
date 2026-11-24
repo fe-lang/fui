@@ -1,4 +1,4 @@
-use core::{MemBuffer, Option, Result}
+use core::{MemBuffer, Option}
 use std::io::Display
 use std::term::Signal
 use std::time::Duration

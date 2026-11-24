@@ -1,13 +1,12 @@
-use core::{MemBuffer, Option, Result}
+use core::MemBuffer
 use std::io::Display
-use std::term::Signal
 use std::fs::Fs
-use std::term::Tty
+use std::term::{Signal, Tty}
 use std::time::{Clock, Duration}
 use ingot::backend::TestBackend
-use ingot::event::{Event, Key, KeyCode, Modifiers}
+use ingot::event::{Event, Key, KeyCode}
 use ingot::frame::{Frame, print}
-use ingot::geom::{Pos, Rect, Size}
+use ingot::geom::{Rect, Size}
 use ingot::session::Session
 use ingot::style::Style
 use super::{App, Flow, Options, run, run_session}

@@ -20,7 +20,6 @@
 //! the whole path from the terminal's bytes to the screen is tested.
 use core::{MemBuffer, MemSpan, Option}
 use std::io::Display
-use std::time::Duration
 use ingot::app::{App, Options, draw, handle}
 use ingot::backend::TestBackend
 use ingot::event::{Event, Key, KeyCode, Modifiers}

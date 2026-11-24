@@ -1,4 +1,4 @@
-use core::{MemBuffer, Option}
+use core::MemBuffer
 use ingot::app::{App, Flow, Options}
 use ingot::event::{Event, Key, KeyCode, Modifiers}
 use ingot::frame::{Frame, print}
