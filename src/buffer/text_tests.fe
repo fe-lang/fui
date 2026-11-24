@@ -1,0 +1,141 @@
+// Drawing with the widths and clusters of `text`.
+use ingot::buffer::Buffer
+use ingot::frame::Frame
+use ingot::geom::{Pos, Rect, Size}
+use ingot::style::Style
+use ingot::theme::Theme
+
+fn row(_ width: u16) -> Buffer {
+    Buffer::new(Size::new(width, height: 1))
+}
+
+fn cell_width(_ buffer: Buffer, _ x: u16) -> u8 {
+    buffer.get(Pos::new(x, y: 0)).unwrap().width()
+}
+
+#[test]
+fn wide_clusters_take_two_columns() {
+    var buffer = row(6)
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    format!("世界!").span(),
+                    Style::new(),
+                    max_width: 6,
+                )
+            == 5,
+    )
+    assert(buffer.to_text() == "世界!")
+    assert(
+        cell_width(buffer, 0) == 2 && buffer.get(Pos::new(x: 1, y: 0)).unwrap().is_continuation(),
+    )
+}
+
+#[test]
+fn wide_clusters_are_never_split() {
+    // At `max_width`, and at the buffer's edge: a space in the column left.
+    var buffer = row(6)
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    format!("a世界").span(),
+                    Style::new(),
+                    max_width: 4,
+                )
+            == 4,
+    )
+    assert(buffer.to_text() == "a世")
+    assert(cell_width(buffer, 3) == 1)
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 3, y: 0),
+                    format!("ab世").span(),
+                    Style::new(),
+                    max_width: 9,
+                )
+            == 3,
+    )
+    assert(buffer.to_text() == "a世ab")
+    assert(cell_width(buffer, 5) == 1)
+    assert(
+        buffer.set_symbol(Pos::new(x: 5, y: 0), format!("界").span(), Style::new()) == 1,
+    )
+    // Over the left half of a wide cell: its continuation becomes a space.
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 1, y: 0),
+                    format!("x").span(),
+                    Style::new(),
+                    max_width: 1,
+                )
+            == 1,
+    )
+    assert(buffer.to_text() == "ax ab")
+}
+
+#[test]
+fn marks_join_their_base_and_lone_ones_are_skipped() {
+    // A lone U+0301, `x`, then `e` and U+0301.
+    var text = MemBuffer::empty()
+    for byte in [0xcc, 0x81, b'x', b'e', 0xcc, 0x81] {
+        text.push(byte)
+    }
+    var buffer = row(4)
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    text.span(),
+                    Style::new(),
+                    max_width: 4,
+                ) == 2,
+    )
+    assert(buffer.to_text() == text.span().slice(offset: 2, len: 4))
+}
+
+#[test]
+fn long_clusters_draw_from_the_side_table() {
+    let family = format!("👨‍👩‍👧‍👦")
+    var buffer = row(5)
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    family.span(),
+                    Style::new(),
+                    max_width: 5,
+                ) == 2,
+    )
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 2, y: 0),
+                    family.span(),
+                    Style::new(),
+                    max_width: 5,
+                ) == 2,
+    )
+    assert(cell_width(buffer, 0) == 2)
+    var expected = MemBuffer::empty()
+    expected.extend_from(family.span())
+    expected.extend_from(family.span())
+    assert(buffer.to_text() == expected)
+    let other = Buffer::new(Size::new(width: 5, height: 1))
+    assert(
+        !buffer
+            .cell_eq(
+                buffer.get(Pos::new(x: 0, y: 0)).unwrap(),
+                other,
+                other.get(Pos::new(x: 0, y: 0)).unwrap(),
+            ),
+    )
+}
+
+#[test]
+fn a_wide_cluster_cut_by_the_clip_leaves_a_space() {
+    var frame = Frame::new(row(6), Theme::dark())
+    frame.fill(frame.area(), ".", Style::new())
+    with (frame) {
+        with (Frame = ingot::frame::clipped(Rect::new(x: 1, y: 0, width: 4, height: 1))) {
+            ingot::frame::print(Pos::new(x: 0, y: 0), "世界!", Style::new())
+        }
+    }
+    assert(frame.into_buffer().to_text() == ". 界!.")
+}

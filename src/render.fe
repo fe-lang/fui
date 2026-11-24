@@ -1,0 +1,100 @@
+//! Turning cell buffers into the bytes a terminal draws them from.
+use super::buffer::Buffer
+use super::geom::Pos
+
+/// How many colors the terminal shows. A color the terminal cannot show is
+/// drawn as the nearest one it can.
+pub enum ColorDepth {
+    /// No colors: attributes only.
+    NoColor,
+    /// The 16 ANSI colors.
+    Ansi16,
+    /// The 256 indexed colors.
+    Ansi256,
+    /// 24-bit colors.
+    TrueColor,
+}
+
+impl Copy for ColorDepth {}
+
+/// Writes frames as terminal output: `full` draws a buffer from nothing, and
+/// `diff` only what changed since the frame before it.
+pub struct Renderer { depth: ColorDepth }
+
+impl Renderer {
+    pub fn new(_ depth: ColorDepth) -> Self {
+        Renderer { depth }
+    }
+
+    /// Appends to `out` the bytes that make a terminal in any state show
+    /// `next`, with the cursor at `cursor`, or hidden without one.
+    pub fn full(mut self, _ next: Buffer, cursor: Option<Pos>, _ out: mut MemBuffer) {
+        // Placeholder: every cell's symbol, row by row, without styles.
+        push_csi(mut out, "0m")
+        push_csi(mut out, "2J")
+        var y: u16 = 0
+        while y < next.size().height {
+            push_csi(mut out, format!(y + 1, ";1H"))
+            for cell in next.row(y) {
+                next.write_symbol(cell, mut out)
+            }
+            y += 1
+        }
+        match cursor {
+            Option::Some(pos) => {
+                push_csi(mut out, format!(pos.y + 1, ";", pos.x + 1, "H"))
+                push_csi(mut out, "?25h")
+            },
+            Option::None => push_csi(mut out, "?25l"),
+        }
+    }
+
+    /// Appends to `out` the bytes that make a terminal showing `prev`, as
+    /// this renderer last drew it, show `next`, with the cursor at `cursor`,
+    /// or hidden without one. The buffers have the same size.
+    pub fn diff(
+        mut self,
+        _ prev: Buffer,
+        _ next: Buffer,
+        cursor: Option<Pos>,
+        _ out: mut MemBuffer,
+    ) {
+        self.full(next, cursor, mut out)
+    }
+}
+
+fn push_csi<T: std::io::Display>(_ out: mut MemBuffer, _ rest: T) {
+    out.push(0x1b)
+    out.push(b'[')
+    write!(mut out, rest)
+}
+
+#[test]
+fn a_full_frame_draws_every_row() {
+    use super::geom::Size
+    use super::style::Style
+    use super::vt::Vt
+
+    var buffer = Buffer::new(Size::new(width: 4, height: 2))
+    let _ = buffer
+        .set_string(
+            Pos::new(x: 0, y: 0),
+            format!("ab").span(),
+            Style::new(),
+            max_width: 4,
+        )
+    let _ = buffer
+        .set_string(
+            Pos::new(x: 1, y: 1),
+            format!("cd").span(),
+            Style::new(),
+            max_width: 4,
+        )
+    var renderer = Renderer::new(ColorDepth::TrueColor)
+    var out = MemBuffer::empty()
+    renderer.full(buffer, cursor: Option::None, mut out)
+    var vt = Vt::new(Size::new(width: 4, height: 2))
+    vt.feed(out.span())
+    assert(vt.to_text() == buffer.to_text())
+    assert(!vt.cursor_visible())
+}
