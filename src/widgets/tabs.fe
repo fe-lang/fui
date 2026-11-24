@@ -4,10 +4,10 @@ use std::abi::DynString
 use std::io::Display
 use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
 use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
-use ingot::geom::{Pos, Rect}
+use ingot::geom::{Pos, Rect, clamp_u16}
 use ingot::style::{Color, Modifier, Style}
 use ingot::text::Alignment
-use super::{clamp_u16, print_cut}
+use super::print_cut
 
 /// The most tabs a `TabsState` records for hit-testing. A row may show
 /// more, and a click on a later one selects none.

@@ -25,7 +25,7 @@
 //! a zero-width scalar no cluster takes joins the cell before the cursor.
 use core::{MemBuffer, MemSpan, MemVec, Option}
 use core::mem::replace
-use ingot::geom::{Pos, Size}
+use ingot::geom::{Pos, Size, min}
 use ingot::style::{Color, Modifier}
 use ingot::text::{Grapheme, REPLACEMENT_CHARACTER, encode, is_control}
 
@@ -189,10 +189,6 @@ impl Screen {
         }
         self.erase(0, shift, bg)
     }
-}
-
-fn min(_ a: usize, _ b: usize) -> usize {
-    if a < b { a } else { b }
 }
 
 // The cluster just written, which the next scalar may join: its cell and
@@ -640,12 +636,12 @@ impl Vt {
         let width = self.size.width
         match final {
             b'H' | b'f' => self.move_to(self.count(1) - 1, self.count(0) - 1),
-            b'A' => self.move_to(self.x, self.y - min16(self.count(0), self.y)),
+            b'A' => self.move_to(self.x, self.y - min(self.count(0), self.y)),
             b'B' => self.move_to(self.x, sum16(self.y, self.count(0))),
             b'C' => self.move_to(sum16(self.x, self.count(0)), self.y),
-            b'D' => self.move_to(self.x - min16(self.count(0), self.x), self.y),
+            b'D' => self.move_to(self.x - min(self.count(0), self.x), self.y),
             b'E' => self.move_to(0, sum16(self.y, self.count(0))),
-            b'F' => self.move_to(0, self.y - min16(self.count(0), self.y)),
+            b'F' => self.move_to(0, self.y - min(self.count(0), self.y)),
             b'G' | b'`' => self.move_to(self.count(0) - 1, self.y),
             b'd' => self.move_to(self.x, self.count(0) - 1),
             b'J' => {
@@ -997,10 +993,6 @@ impl Vt {
             self.pending_wrap = true
         }
     }
-}
-
-fn min16(_ a: u16, _ b: u16) -> u16 {
-    if a < b { a } else { b }
 }
 
 // `a + b`, at most 65535.

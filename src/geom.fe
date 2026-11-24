@@ -1,6 +1,6 @@
 //! Positions, sizes and rectangles of terminal cells. `x` grows to the
 //! right and `y` down, from the top left cell at `(0, 0)`.
-use core::ops::Eq
+use core::ops::{Eq, Ord}
 
 /// A cell: a column and a row.
 pub struct Pos { pub x: u16, pub y: u16 }
@@ -202,12 +202,25 @@ fn shrink_span(_ start: u16, _ len: u16, _ before: u16, _ after: u16) -> (u16, u
     (start + before, len - before - min(after, len - before))
 }
 
-pub fn min(_ a: u16, _ b: u16) -> u16 {
+/// The smaller of `a` and `b`: the library's one `min`, for coordinates
+/// and the counts and offsets behind them alike.
+pub fn min<T: Ord + Copy>(_ a: T, _ b: T) -> T {
     if a < b { a } else { b }
 }
 
-pub fn max(_ a: u16, _ b: u16) -> u16 {
+/// The larger of `a` and `b`.
+pub fn max<T: Ord + Copy>(_ a: T, _ b: T) -> T {
     if a > b { a } else { b }
+}
+
+/// `value` as a `u16`, or 65535 if it is larger: a count or offset as a
+/// coordinate, which stops at the screen's last cell.
+pub fn clamp_u16(_ value: usize) -> u16 {
+    if value > 65535 {
+        65535
+    } else {
+        value.downcast_truncate()
+    }
 }
 
 #[test]
@@ -256,4 +269,18 @@ fn rects_clamp_to_the_coordinate_range() {
     assert(a.right() == 65535)
     assert(a.contains(Pos::new(x: 65534, y: 0)))
     assert(!a.contains(Pos::new(x: 65529, y: 0)))
+}
+
+#[test]
+fn min_and_max_take_any_ordered_type() {
+    assert(min(3 as u16, 5) == 3 && max(3 as u16, 5) == 5)
+    assert(min(7 as usize, 2) == 2 && max(7 as u32, 2) == 7)
+    assert(min(4 as u64, 4) == 4)
+}
+
+#[test]
+fn values_clamp_to_u16() {
+    assert(
+        clamp_u16(70000) == 65535 && clamp_u16(65535) == 65535 && clamp_u16(7) == 7,
+    )
 }

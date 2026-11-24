@@ -41,7 +41,7 @@ use ingot::backend::{Backend, TermBackend}
 use ingot::buffer::Buffer
 use ingot::event::{Event, KeyboardFlags}
 use ingot::frame::Frame
-use ingot::geom::{Rect, Size}
+use ingot::geom::{Rect, Size, min}
 use ingot::input::{
     Parser,
     disable_bracketed_paste,
@@ -446,7 +446,7 @@ fn is_end(_ error: Error) -> bool {
 // The shorter of two optional waits; `None` is forever.
 fn earliest(_ a: Option<Duration>, _ b: Option<Duration>) -> Option<Duration> {
     match (a, b) {
-        (Option::Some(a), Option::Some(b)) => Option::Some(if a < b { a } else { b }),
+        (Option::Some(a), Option::Some(b)) => Option::Some(min(a, b)),
         (Option::Some(a), Option::None) => Option::Some(a),
         (Option::None, b) => b,
     }

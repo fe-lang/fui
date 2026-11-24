@@ -49,7 +49,7 @@ use ingot::event::{
     MouseKind,
     Reply,
 }
-use ingot::geom::Pos
+use ingot::geom::{Pos, clamp_u16}
 
 /// The most bytes one `Event::Paste` holds. A longer paste arrives as
 /// several, in order, each cut at a UTF-8 boundary, so a paste whose end
@@ -504,7 +504,7 @@ impl Parser {
             } else if final_byte == b'c' && self.intermediate == 0 {
                 self.event(mut events, Event::Reply(Reply::DeviceAttributes))
             } else if final_byte == b'y' && self.intermediate == b'$' && count == 2 {
-                let mode = Reply::Mode(clamp(p0), ModeSetting::from_value(p1))
+                let mode = Reply::Mode(clamp_u16(p0 as usize), ModeSetting::from_value(p1))
                 self.event(mut events, Event::Reply(mode))
             } else if final_byte == b'R' && self.intermediate == 0 && count >= 2 {
                 // DECXCPR: `CSI ? r ; c R`, unambiguous.
@@ -599,8 +599,8 @@ impl Parser {
             self.positions -= 1
         }
         let pos = Pos::new(
-            x: clamp(column.saturating_sub(1)),
-            y: clamp(row.saturating_sub(1)),
+            x: clamp_u16(column.saturating_sub(1) as usize),
+            y: clamp_u16(row.saturating_sub(1) as usize),
         )
         self.event(mut events, Event::Reply(Reply::CursorPosition(pos)))
     }
@@ -828,19 +828,11 @@ fn grow(_ value: u32, _ digit: u32) -> u32 {
     if next > MAX_PARAM { MAX_PARAM } else { next }
 }
 
-fn clamp(_ value: u32) -> u16 {
-    if value > 65535 {
-        65535
-    } else {
-        value.downcast_truncate()
-    }
-}
-
 // The zero-based cell of a one-based report.
 fn cell(_ x: u32, _ y: u32) -> Pos {
     Pos::new(
-        x: clamp(x.saturating_sub(1)),
-        y: clamp(y.saturating_sub(1)),
+        x: clamp_u16(x.saturating_sub(1) as usize),
+        y: clamp_u16(y.saturating_sub(1) as usize),
     )
 }
 
