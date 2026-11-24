@@ -431,9 +431,7 @@ fn diffed(
 #[test]
 fn unchanged_frames_write_nothing() uses (err: mut Stderr) {
     let a = text_buffer(width: 4, height: 2, "ab")
-    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 1, y: 1))
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 1, y: 1))
     assert(
         diffed(mut renderer, mut vt, a, a, cursor: at(x: 1, y: 1)).is_empty(),
     )
@@ -485,9 +483,7 @@ fn a_one_cell_change_is_small() uses (err: mut Stderr) {
             format!("X").span(),
             Style::new().fg(Color::RED),
         )
-    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
     assert(
         is(
             diffed(mut renderer, mut vt, a, b, cursor: Option::None),
@@ -759,9 +755,7 @@ fn equal_colors_at_the_depth_are_unchanged() {
             format!("x").span(),
             Style::new().fg(Color::rgb(250, 10, 5)),
         )
-    let (renderer, vt) = shown(a, ColorDepth::Ansi16, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(a, ColorDepth::Ansi16, cursor: Option::None)
     assert(
         diffed(mut renderer, mut vt, a, b, cursor: Option::None).is_empty(),
     )
@@ -866,9 +860,7 @@ fn depths_are_detected_from_the_environment() {
 fn wide_cells_leave_both_columns_right() uses (err: mut Stderr) {
     // A wide cell over two narrow ones writes only itself.
     let a = text_buffer(width: 4, height: 1, "abcd")
-    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
     let b = text_buffer(width: 4, height: 1, "a界d")
     assert(
         is(
@@ -886,9 +878,7 @@ fn wide_cells_leave_both_columns_right() uses (err: mut Stderr) {
     )
     // A wide cell moved by a column rewrites the columns it left and took.
     let d = text_buffer(width: 5, height: 1, "界ab")
-    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
     let e = text_buffer(width: 5, height: 1, "a界b")
     assert(
         is(
@@ -899,9 +889,7 @@ fn wide_cells_leave_both_columns_right() uses (err: mut Stderr) {
     // A narrow cell over the right half: the left half becomes a space.
     var f = text_buffer(width: 5, height: 1, "界ab")
     let _ = f.set_symbol(Pos::new(x: 1, y: 0), format!("x").span(), Style::new())
-    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
     assert(
         is(
             diffed(mut renderer, mut vt, d, f, cursor: Option::None),
@@ -911,9 +899,7 @@ fn wide_cells_leave_both_columns_right() uses (err: mut Stderr) {
     // And over the left half.
     var g = text_buffer(width: 5, height: 1, "界ab")
     let _ = g.set_symbol(Pos::new(x: 0, y: 0), format!("y").span(), Style::new())
-    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
     assert(
         is(
             diffed(mut renderer, mut vt, d, g, cursor: Option::None),
@@ -924,9 +910,7 @@ fn wide_cells_leave_both_columns_right() uses (err: mut Stderr) {
     var h = text_buffer(width: 5, height: 1, "界ab")
     let _ = h.set_symbol(Pos::new(x: 2, y: 0), format!("z").span(), Style::new())
     let _ = h.set_symbol(Pos::new(x: 0, y: 0), format!("世").span(), Style::new())
-    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
     assert(
         is(
             diffed(mut renderer, mut vt, d, h, cursor: Option::None),
@@ -952,9 +936,7 @@ uses (err: mut Stderr)
     )
     let _ = a.set_symbol(Pos::new(x: 2, y: 0), family.span(), Style::new())
     let _ = a.set_symbol(Pos::new(x: 4, y: 0), format!("y").span(), Style::new())
-    let (renderer, vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
     var expected = format!("^[[?2026h^[[H")
     expected.extend_from(utf8([0x65, 0x301]).span())
     write!(mut expected, "^[[;2Hx")
@@ -976,9 +958,7 @@ fn clusters_that_would_join_are_kept_apart() uses (err: mut Stderr) {
     var a = Buffer::new(Size::new(width: 4, height: 1))
     let _ = a.set_symbol(Pos::new(x: 0, y: 0), utf8([0x1f1fa]).span(), Style::new())
     let _ = a.set_symbol(Pos::new(x: 1, y: 0), utf8([0x1f1f8]).span(), Style::new())
-    let (renderer, vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
     var expected = format!("^[[?2026h^[[H")
     expected.extend_from(utf8([0x1f1fa]).span())
     write!(mut expected, "^[[2G")
@@ -997,9 +977,7 @@ fn rows_that_end_blank_are_erased_when_that_is_shorter()
 uses (err: mut Stderr)
 {
     let a = text_buffer(width: 10, height: 2, "abcdefghij")
-    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
     let b = text_buffer(width: 10, height: 2, "abc")
     assert(
         is(
@@ -1019,9 +997,7 @@ uses (err: mut Stderr)
     // shorter than `CSI 49 m`.
     var d = text_buffer(width: 10, height: 2, "abcdefghij")
     d.set_style(d.area(), Style::new().bg(Color::BLUE))
-    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
     var e = text_buffer(width: 10, height: 2, "abcdefghij")
     e.set_style(e.area(), Style::new().bg(Color::BLUE))
     e.reset(Rect::new(x: 2, y: 0, width: 8, height: 1))
@@ -1036,9 +1012,7 @@ uses (err: mut Stderr)
 #[test]
 fn short_gaps_are_written_again_instead_of_moved_over() uses (err: mut Stderr) {
     let a = text_buffer(width: 12, height: 1, "aaaaaaaaaaaa")
-    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
     // Three cells are shorter than `CSI 3 C`; four are not shorter than `CSI 4 C`.
     let b = text_buffer(width: 12, height: 1, "abaaabaaaaba")
     assert(
@@ -1053,9 +1027,7 @@ fn short_gaps_are_written_again_instead_of_moved_over() uses (err: mut Stderr) {
         Rect::new(x: 2, y: 0, width: 3, height: 1),
         Style::new().bold(),
     )
-    let (renderer, vt) = shown(c, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(c, ColorDepth::TrueColor, cursor: Option::None)
     var d = text_buffer(width: 12, height: 1, "acaaacaaaaba")
     d.set_style(
         Rect::new(x: 2, y: 0, width: 3, height: 1),
@@ -1075,9 +1047,7 @@ fn the_last_column_is_followed_by_an_absolute_move() uses (err: mut Stderr) {
     var a = Buffer::new(Size::new(width: 3, height: 2))
     let _ = a.set_symbol(Pos::new(x: 2, y: 0), format!("x").span(), Style::new())
     let _ = a.set_symbol(Pos::new(x: 0, y: 1), format!("y").span(), Style::new())
-    let (renderer, vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
     assert(
         is(
             diffed(mut renderer, mut vt, blank, a, cursor: Option::None),
@@ -1115,8 +1085,7 @@ fn cell_contents_never_reach_the_output_as_controls() {
                 )
             y += 1
         }
-        let (renderer, vt) = shown(buffer, ColorDepth::TrueColor, cursor: Option::None)
-        var renderer = renderer
+        let (var renderer, vt) = shown(buffer, ColorDepth::TrueColor, cursor: Option::None)
         var out = MemBuffer::empty()
         renderer.full(buffer, cursor: Option::None, mut out)
         // Every control is the ESC of a CSI sequence, and no C1 control is
@@ -1142,9 +1111,7 @@ fn cell_contents_never_reach_the_output_as_controls() {
 fn attributes_and_the_cursor_carry_across_frames() uses (err: mut Stderr) {
     let red = Style::new().fg(Color::RED)
     let a = Buffer::new(Size::new(width: 6, height: 2))
-    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 0, y: 1))
-    var renderer = renderer
-    var vt = vt
+    let (var renderer, var vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 0, y: 1))
     var b = Buffer::new(Size::new(width: 6, height: 2))
     let _ = b.set_symbol(Pos::new(x: 1, y: 0), format!("x").span(), red)
     // Hidden while drawing, then moved back and shown. `CSI ; 2 H` is shorter
@@ -1198,9 +1165,7 @@ fn buffers_of_any_size_draw() {
         Size::new(width: 3, height: 0),
     ] {
         let a = Buffer::new(size)
-        let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 0, y: 0))
-        var renderer = renderer
-        var vt = vt
+        let (var renderer, var vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 0, y: 0))
         let _ = diffed(mut renderer, mut vt, a, a, cursor: Option::None)
     }
     // Buffers of different sizes draw the next one whole.
