@@ -5,3 +5,5 @@ pub use geom
 pub use style
 pub use text
 pub use buffer
+pub use frame
+pub use theme

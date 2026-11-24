@@ -1,0 +1,407 @@
+//! The drawing effect.
+//!
+//! A `Frame` is what view code draws into: it declares
+//! `uses (frame: mut Frame)`, and widgets and the free functions of this
+//! module draw through it. A frame owns the `Buffer` it draws into and
+//! holds a clip rectangle, a theme and a cursor request.
+//!
+//! Every drawing call clips to the clip rectangle: a position or area
+//! outside it draws nothing there, and nothing panics. Writing over half of
+//! a wide symbol at the clip's edge turns its other half, outside the clip,
+//! into a space, so the buffer keeps whole symbols.
+//!
+//! Scoped changes are projections used through `with`. `clipped(area)`
+//! intersects the clip with `area`, and `themed(theme)` sets the theme,
+//! until the `with` block ends:
+//!
+//! ```fe
+//! fn view(_ area: Rect) uses (frame: mut Frame) {
+//!     let (head, body) = area.rows((Length(1), Fill(1)))
+//!     print(head.pos(), "Title", theme().title)
+//!     with (Frame = clipped(body)) {
+//!         with (Frame = themed(Theme::plain())) {
+//!             print(body.pos(), "inside the body", Style::new())
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! The change is undone when the access ends: after the block's last use
+//! of the frame, and on every path out of the block, including a `return`,
+//! `break`, `continue` or failing `?` inside it. A panic aborts the
+//! program, so nothing is undone then. `clipped` and `themed` take the
+//! frame from the effect, so each nested `with` changes the innermost frame
+//! and a nested clip never leaves its parent's.
+//!
+//! Inside such a block, draw through the free functions and widgets, which
+//! take the innermost frame. The enclosing function's own binding names the
+//! frame outside the block: `frame.print(..)` there ends the scoped access
+//! early and draws unclipped, or is rejected if the block uses the scoped
+//! frame after it.
+use std::io::Display
+use super::buffer::Buffer
+use super::geom::{Pos, Rect, Size}
+use super::style::{Modifier, Style}
+use super::theme::Theme
+
+/// The surface view code draws on: a buffer, the clip rectangle drawing
+/// stays in, the theme widgets draw with, and where to show the cursor.
+pub struct Frame {
+    buffer: Buffer,
+    clip: Rect,
+    theme: Theme,
+    // Text being drawn, formatted.
+    scratch: MemBuffer,
+    cursor: Option<Pos>,
+}
+
+impl Frame {
+    /// A frame that draws over what `buffer` holds, clipped to the whole
+    /// buffer, with `theme` and the cursor hidden. Clear the buffer first to
+    /// draw a frame from nothing.
+    pub fn new(_ buffer: own Buffer, _ theme: Theme) -> Self {
+        let clip = buffer.area()
+        Frame { buffer, clip, theme, scratch: MemBuffer::empty(), cursor: Option::None }
+    }
+
+    /// The buffer drawn into.
+    pub fn into_buffer(own self) -> Buffer {
+        self.buffer
+    }
+
+    /// The buffer drawn into. Drawing into it directly ignores the clip.
+    pub fn buffer(mut? self) -> mut? Buffer {
+        mut? self.buffer
+    }
+
+    /// The whole drawing area: the buffer's.
+    pub fn area(self) -> Rect {
+        self.buffer.area()
+    }
+
+    /// The rectangle drawing stays in.
+    pub fn clip(self) -> Rect {
+        self.clip
+    }
+
+    pub fn theme(self) -> Theme {
+        self.theme
+    }
+
+    /// Where the cursor should be shown after this frame, or `None` to hide
+    /// it.
+    pub fn cursor(self) -> Option<Pos> {
+        self.cursor
+    }
+
+    /// Asks for the cursor at `pos` after this frame. A position outside the
+    /// clip hides it, as the widget asking is not shown there.
+    pub fn set_cursor(mut self, _ pos: Pos) {
+        self.cursor = if self.clip.contains(pos) {
+            Option::Some(pos)
+        } else {
+            Option::None
+        }
+    }
+
+    /// Asks for the cursor to be hidden after this frame, as it is unless
+    /// `set_cursor` asks otherwise.
+    pub fn hide_cursor(mut self) {
+        self.cursor = Option::None
+    }
+
+    /// Draws the `Display` text of `text` from `pos` to the right, with
+    /// `style` applied over the cells' styles, up to the clip's right edge.
+    /// Returns the columns written; see `Buffer::set_string`.
+    pub fn print<T: Display>(mut self, _ pos: Pos, _ text: T, _ style: Style) -> u16 {
+        self.print_clipped(pos, text, style, self.clip)
+    }
+
+    /// Draws `text` from the top left of `area`, on its top row and within
+    /// it, as `print` does.
+    pub fn print_in<T: Display>(mut self, _ area: Rect, _ text: T, _ style: Style) -> u16 {
+        let (row, _) = area.split_top(1)
+        self.print_clipped(area.pos(), text, style, self.clip.intersect(row))
+    }
+
+    // Prints as `print` does, within `clip`.
+    fn print_clipped<T: Display>(
+        mut self,
+        _ pos: Pos,
+        _ text: T,
+        _ style: Style,
+        _ clip: Rect,
+    ) -> u16 {
+        if pos.y < clip.y || pos.y >= clip.bottom() || pos.x >= clip.right() {
+            return 0
+        }
+        self.scratch.clear()
+        text.fmt(mut self.scratch)
+        self.buffer
+            .draw(
+                pos,
+                self.scratch.span(),
+                style,
+                from: if pos.x > clip.x { pos.x } else { clip.x },
+                to: clip.right(),
+            )
+    }
+
+    /// Writes the first grapheme cluster of the `Display` text of `symbol`
+    /// into every cell of `area`; see `Buffer::fill`.
+    pub fn fill<T: Display>(mut self, _ area: Rect, _ symbol: T, _ style: Style) {
+        self.scratch.clear()
+        symbol.fmt(mut self.scratch)
+        self.buffer.fill(area.intersect(self.clip), self.scratch.span(), style)
+    }
+
+    /// Applies `style` over the style of each cell of `area`.
+    pub fn set_style(mut self, _ area: Rect, _ style: Style) {
+        self.buffer.set_style(area.intersect(self.clip), style)
+    }
+
+    /// Makes every cell of `area` empty: a space in the terminal's default
+    /// colors.
+    pub fn clear(mut self, _ area: Rect) {
+        self.buffer.reset(area.intersect(self.clip))
+    }
+}
+
+/// The frame, clipped to the part of its clip in `area` until the access
+/// ends: `with (Frame = clipped(area)) { .. }`.
+pub fn clipped(_ area: Rect) -> mut Frame uses (frame: mut Frame) {
+    let old = frame.clip
+    frame.clip = old.intersect(area)
+    yield mut frame
+    frame.clip = old
+}
+
+/// The frame, drawing with `theme` until the access ends:
+/// `with (Frame = themed(theme)) { .. }`.
+pub fn themed(_ theme: Theme) -> mut Frame uses (frame: mut Frame) {
+    let old = frame.theme
+    frame.theme = theme
+    yield mut frame
+    frame.theme = old
+}
+
+/// Draws the `Display` text of `text` from `pos`; see `Frame::print`.
+pub fn print<T: Display>(_ pos: Pos, _ text: T, _ style: Style) -> u16
+uses (frame: mut Frame)
+{
+    frame.print(pos, text, style)
+}
+
+/// Draws `text` on the top row of `area`; see `Frame::print_in`.
+pub fn print_in<T: Display>(_ area: Rect, _ text: T, _ style: Style) -> u16
+uses (frame: mut Frame)
+{
+    frame.print_in(area, text, style)
+}
+
+/// Fills `area` with `symbol`; see `Frame::fill`.
+pub fn fill<T: Display>(_ area: Rect, _ symbol: T, _ style: Style)
+uses (frame: mut Frame)
+{
+    frame.fill(area, symbol, style)
+}
+
+/// The whole drawing area.
+pub fn area() -> Rect uses (frame: Frame) {
+    frame.area()
+}
+
+/// The theme to draw with.
+pub fn theme() -> Theme uses (frame: Frame) {
+    frame.theme
+}
+
+fn frame_of(width: u16, height: u16) -> Frame {
+    Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
+}
+
+fn clip() -> Rect uses (frame: Frame) {
+    frame.clip
+}
+
+#[test]
+fn prints_clip_to_the_clip() {
+    var frame = frame_of(width: 8, height: 3)
+    assert(
+        frame.print(Pos::new(x: 6, y: 0), "abc", Style::new()) == 2,
+    )
+    assert(
+        frame.print(Pos::new(x: 0, y: 1), 4207 as u16, Style::new()) == 4,
+    )
+    assert(frame.print(Pos::new(x: 0, y: 3), "x", Style::new()) == 0)
+    assert(frame.print(Pos::new(x: 8, y: 2), "x", Style::new()) == 0)
+    assert(frame.into_buffer().to_text() == "      ab\n4207\n")
+}
+
+#[test]
+fn prints_in_an_area_keep_to_its_top_row() {
+    var frame = frame_of(width: 8, height: 3)
+    assert(
+        frame.print_in(
+                    Rect::new(x: 2, y: 1, width: 3, height: 2),
+                    "hello",
+                    Style::new(),
+                ) == 3,
+    )
+    assert(
+        frame.print_in(
+                    Rect::new(x: 0, y: 0, width: 0, height: 2),
+                    "hello",
+                    Style::new(),
+                ) == 0,
+    )
+    assert(
+        frame.print_in(
+                    Rect::new(x: 6, y: 2, width: 9, height: 9),
+                    "hello",
+                    Style::new(),
+                ) == 2,
+    )
+    assert(
+        frame.print_in(
+                    Rect::new(x: 9, y: 9, width: 9, height: 9),
+                    "hello",
+                    Style::new(),
+                ) == 0,
+    )
+    assert(frame.buffer().to_text() == "\n  hel\n      he")
+}
+
+fn draw_clipped() uses (frame: mut Frame) {
+    with (Frame = clipped(Rect::new(x: 2, y: 0, width: 3, height: 2))) {
+        // Starts left of the clip: only the columns in it are drawn.
+        print(Pos::new(x: 0, y: 0), "abcdefg", Style::new())
+        fill(
+            Rect::new(x: 0, y: 1, width: 9, height: 9),
+            "#",
+            Style::new(),
+        )
+        embolden()
+    }
+}
+
+// Naming `frame` inside the `with` above would reach the unclipped frame; a
+// callee's `frame` is the innermost one.
+fn embolden() uses (frame: mut Frame) {
+    frame.set_style(frame.area(), Style::new().bold())
+}
+
+#[test]
+fn drawing_stays_in_the_clip() {
+    var frame = frame_of(width: 6, height: 3)
+    frame.fill(frame.area(), ".", Style::new())
+    with (frame) {
+        draw_clipped()
+    }
+    assert(frame.clip() == frame.area())
+    assert(frame.buffer().to_text() == "..cde.\n..###.\n......")
+    let buffer = ref frame.buffer()
+    assert(
+        buffer.get(Pos::new(x: 2, y: 0)).unwrap().modifier() == Modifier::BOLD,
+    )
+    assert(
+        buffer.get(Pos::new(x: 1, y: 0)).unwrap().modifier().is_empty(),
+    )
+    frame.clear(Rect::new(x: 4, y: 0, width: 9, height: 2))
+    assert(frame.buffer().to_text() == "..cd\n..##\n......")
+}
+
+fn nested() -> bool uses (frame: mut Frame) {
+    var ok = true
+    let outer = Rect::new(x: 1, y: 1, width: 6, height: 4)
+    with (Frame = clipped(outer)) {
+        ok = ok && clip() == outer
+        with (Frame = themed(Theme::plain())) {
+            ok = ok && theme().accent == Theme::plain().accent
+            with (Frame = clipped(Rect::new(x: 0, y: 0, width: 3, height: 3))) {
+                // A nested clip stays in its parent's.
+                ok = ok && clip() == Rect::new(x: 1, y: 1, width: 2, height: 2)
+                print(Pos::new(x: 0, y: 1), "xyz", Style::new())
+            }
+            ok = ok && clip() == outer && theme().accent == Theme::plain().accent
+            print(Pos::new(x: 5, y: 4), "uvw", Style::new())
+        }
+        ok = ok && theme().accent == Theme::dark().accent && clip() == outer
+        print(Pos::new(x: 0, y: 2), "<>", Style::new())
+    }
+    ok && clip() == area()
+}
+
+#[test]
+fn scopes_nest_and_restore_in_order() {
+    var frame = frame_of(width: 8, height: 6)
+    var ok = false
+    with (frame) {
+        ok = nested()
+    }
+    assert(ok)
+    assert(frame.buffer().to_text() == "\n yz\n >\n\n     uv\n")
+}
+
+fn leave_early(_ how: u8) -> Option<u8> uses (frame: mut Frame) {
+    for i in 0 .. 3 {
+        with (Frame = clipped(Rect::new(x: 1, y: 1, width: 1, height: 1))) {
+            with (Frame = themed(Theme::plain())) {
+                if how == 0 {
+                    return Option::Some(0)
+                }
+                if how == 1 { break }
+                if how == 2 && i < 2 {
+                    continue
+                }
+                let none: Option<u8> = Option::None
+                if how == 3 { none? }
+                print(Pos::new(x: 1, y: 1), i, Style::new())
+            }
+        }
+    }
+    Option::Some(how)
+}
+
+#[test]
+fn scopes_restore_on_every_way_out() {
+    var frame = frame_of(width: 3, height: 3)
+    for how in [0, 1, 2, 3, 4] {
+        with (frame) {
+            leave_early(how)
+        }
+        assert(frame.clip() == frame.area())
+        assert(frame.theme().accent == Theme::dark().accent)
+    }
+    assert(frame.buffer().to_text() == "\n 2\n")
+}
+
+#[test]
+fn the_cursor_shows_only_in_the_clip() {
+    var frame = frame_of(width: 4, height: 4)
+    assert(frame.cursor().is_none())
+    frame.set_cursor(Pos::new(x: 3, y: 3))
+    assert(frame.cursor() == Option::Some(Pos::new(x: 3, y: 3)))
+    frame.set_cursor(Pos::new(x: 4, y: 0))
+    assert(frame.cursor().is_none())
+    frame.set_cursor(Pos::new(x: 0, y: 0))
+    frame.hide_cursor()
+    assert(frame.cursor().is_none())
+}
+
+#[test]
+fn empty_frames_draw_nothing() {
+    var frame = frame_of(width: 0, height: 0)
+    assert(frame.print(Pos::new(x: 0, y: 0), "x", Style::new()) == 0)
+    frame.fill(
+            Rect::new(x: 0, y: 0, width: 5, height: 5),
+            "x",
+            Style::new(),
+        )
+    frame.set_style(
+            Rect::new(x: 0, y: 0, width: 5, height: 5),
+            Style::new().bold(),
+        )
+    frame.clear(Rect::new(x: 0, y: 0, width: 5, height: 5))
+    assert(frame.into_buffer().to_text().is_empty())
+}

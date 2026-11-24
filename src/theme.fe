@@ -1,0 +1,91 @@
+//! The styles widgets draw with, by role.
+//!
+//! Widgets take the styles of the theme the `Frame` holds, so a program sets
+//! its look in one place, and a part of it can draw with another theme
+//! through `frame::themed`.
+use super::style::{Color, Style}
+
+/// A style for each role a widget gives what it draws.
+pub struct Theme {
+    /// Ordinary text.
+    pub text: Style,
+    /// Text of less importance: hints, placeholders, disabled items.
+    pub muted: Style,
+    /// Borders and separators.
+    pub border: Style,
+    /// Titles of blocks, tabs and tables.
+    pub title: Style,
+    /// The selected or focused item.
+    pub highlight: Style,
+    /// What should stand out: keys, links, the active tab.
+    pub accent: Style,
+    pub error: Style,
+    pub warning: Style,
+    pub success: Style,
+}
+
+impl Copy for Theme {}
+
+impl Theme {
+    /// A theme for terminals with a dark background. It uses the 16 ANSI
+    /// colors and attributes only, so it follows the terminal's palette.
+    pub fn dark() -> Self {
+        Theme {
+            text: Style::new(),
+            muted: Style::new().dim(),
+            border: Style::new().dim(),
+            title: Style::new().bold(),
+            highlight: Style::new().reversed(),
+            accent: Style::new().fg(Color::CYAN),
+            error: Style::new().fg(Color::LIGHT_RED),
+            warning: Style::new().fg(Color::YELLOW),
+            success: Style::new().fg(Color::GREEN),
+        }
+    }
+
+    /// A theme of attributes without colors, for terminals without color
+    /// or users who ask for none (`NO_COLOR`).
+    pub fn plain() -> Self {
+        Theme {
+            text: Style::new(),
+            muted: Style::new().dim(),
+            border: Style::new(),
+            title: Style::new().bold(),
+            highlight: Style::new().reversed(),
+            accent: Style::new().underlined(),
+            error: Style::new().bold(),
+            warning: Style::new().bold(),
+            success: Style::new(),
+        }
+    }
+}
+
+/// The dark theme.
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::dark()
+    }
+}
+
+#[test]
+fn the_plain_theme_sets_no_color() {
+    let plain = Theme::plain()
+    for style in [
+        plain.text,
+        plain.muted,
+        plain.border,
+        plain.title,
+        plain.highlight,
+        plain.accent,
+        plain.error,
+        plain.warning,
+        plain.success,
+    ] {
+        assert(style.fg.is_keep() && style.bg.is_keep())
+    }
+    let dark: Theme = Default::default()
+    assert(
+        dark.error == Theme::dark().error && !dark.error.fg.is_keep(),
+    )
+    assert(dark.text == Style::NONE)
+}
