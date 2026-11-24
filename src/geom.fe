@@ -139,18 +139,12 @@ impl Rect {
     }
 
     /// The rectangle without the given cells on each side, empty if they
-    /// take it all.
+    /// take it all. Each side takes at most the cells there are, so no
+    /// margin changes an empty rectangle's other side.
     pub fn shrink(self, top: u16, right: u16, bottom: u16, left: u16) -> Rect {
-        if left as u32 + right as u32 >= self.width as u32
-            || top as u32 + bottom as u32 >= self.height as u32 {
-            return Rect { x: self.x, y: self.y, width: 0, height: 0 }
-        }
-        Rect {
-            x: self.x + left,
-            y: self.y + top,
-            width: self.width - left - right,
-            height: self.height - top - bottom,
-        }
+        let (x, width) = shrink_span(self.x, self.width, left, right)
+        let (y, height) = shrink_span(self.y, self.height, top, bottom)
+        Rect { x, y, width, height }
     }
 
     /// The top `rows` rows and the rest. More rows than there are take all.
@@ -201,6 +195,13 @@ impl Rect {
     }
 }
 
+// The start and length of the span `start, len` without `before` cells at
+// its start and `after` at its end, each at most the cells left.
+fn shrink_span(_ start: u16, _ len: u16, _ before: u16, _ after: u16) -> (u16, u16) {
+    let before = min(before, len)
+    (start + before, len - before - min(after, len - before))
+}
+
 pub fn min(_ a: u16, _ b: u16) -> u16 {
     if a < b { a } else { b }
 }
@@ -228,6 +229,13 @@ fn rects_shrink_and_split() {
     let a = Rect::new(x: 2, y: 1, width: 10, height: 6)
     assert(a.inner(1) == Rect::new(x: 3, y: 2, width: 8, height: 4))
     assert(a.inner(3).is_empty())
+    assert(a.inner(3) == Rect::new(x: 5, y: 4, width: 4, height: 0))
+    let flat = Rect::new(x: 2, y: 2, width: 0, height: 5)
+    assert(flat.inner(0) == flat)
+    assert(
+        flat.shrink(top: 1, right: 1, bottom: 9, left: 1)
+            == Rect::new(x: 2, y: 3, width: 0, height: 0),
+    )
     let (top, rest) = a.split_top(2)
     assert(top == Rect::new(x: 2, y: 1, width: 10, height: 2))
     assert(rest == Rect::new(x: 2, y: 3, width: 10, height: 4))
