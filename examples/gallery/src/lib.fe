@@ -1,0 +1,806 @@
+//! Every widget of the library in one app, written the way an app is meant
+//! to be: a model that owns the widget states and the data, an `update`
+//! that matches events and hands them to the states, and a `view` that
+//! splits the screen and calls a small view function for each page.
+//!
+//! Four pages under tabs: a list with a detail pane, a table of planets, a
+//! form, and progress widgets fed by ticks. F1 to F4 pick a page, as do
+//! Left and Right outside the form; a click on a tab picks it too. `t`
+//! switches between the dark and the plain theme, `?` opens the help
+//! popup, `q` quits outside the form and Esc anywhere.
+use std::term::Tty
+use std::abi::DynString
+use std::io::Display
+use std::time::{Clock, Duration}
+use tui::prelude::*
+
+const PAGES: [String<8>; 4] = ["Items", "Table", "Form", "Progress"]
+const FORM: usize = 2
+const PROGRESS: usize = 3
+
+/// An entry of the list page: a name, and text about it for the detail
+/// pane.
+pub struct Item { pub name: String<16>, pub about: MemBuffer }
+
+/// A list shows an item by its name.
+impl Display for Item {
+    fn fmt(self, _ out: mut MemBuffer) {
+        write!(mut out, self.name)
+    }
+}
+
+/// The list page: the items, the list's selection and the detail pane's
+/// scroll position.
+pub struct Items {
+    pub items: MemVec<Item>,
+    pub list: ListState,
+    pub detail: ScrollState,
+    // Where the detail pane was last drawn, for the mouse wheel.
+    detail_area: Rect,
+}
+
+impl Items {
+    fn new() -> Self {
+        var items: MemVec<Item> = MemVec::new()
+        items
+            .push(
+                Item {
+                    name: "Block",
+                    about: format!(
+                        "Borders, titles and padding around an area. A block's render returns the area inside it, so the next widget draws there: this pane is a block holding a paragraph.",
+                    ),
+                },
+            )
+        items
+            .push(
+                Item {
+                    name: "Paragraph",
+                    about: format!(
+                        "Text wrapped at words or at clusters, or cut at the edge, aligned left, centered or right. With a ScrollState it scrolls: PageUp and PageDown move this text, as does the mouse wheel over it, and the scrollbar on the right border shows where it is. The text is long enough to scroll on a small screen, so here is more of it: a paragraph takes plain text, a styled Line, or Lines of styled runs.",
+                    ),
+                },
+            )
+        items
+            .push(
+                Item {
+                    name: "List",
+                    about: format!(
+                        "Items, one row each, with one selected and the rows scrolled to show it. Up, Down, Home, End, PageUp and PageDown move the selection; a click selects the row under it.",
+                    ),
+                },
+            )
+        items
+            .push(
+                Item {
+                    name: "Table",
+                    about: format!(
+                        "Rows of cells under titled columns, with widths solved from constraints. The table page sorts its rows and draws one column with a closure.",
+                    ),
+                },
+            )
+        items
+            .push(
+                Item {
+                    name: "Tabs",
+                    about: format!(
+                        "The row of titles at the top. Left and Right move the selection; a click on a title selects it.",
+                    ),
+                },
+            )
+        items
+            .push(
+                Item {
+                    name: "TextInput",
+                    about: format!(
+                        "A one-line text field with a cursor, a selection, word motions and a mask for passwords.",
+                    ),
+                },
+            )
+        items
+            .push(
+                Item {
+                    name: "Gauge",
+                    about: format!(
+                        "Progress as a filled bar, a thin line, a chart of recent values, or a spinner.",
+                    ),
+                },
+            )
+        Items {
+            items,
+            list: ListState::new(),
+            detail: ScrollState::new(),
+            detail_area: Rect::new(x: 0, y: 0, width: 0, height: 0),
+        }
+    }
+
+    fn handle_key(mut self, _ key: Key) -> bool {
+        if key.is(KeyCode::PageDown) {
+            self.detail.page_down()
+            return true
+        }
+        if key.is(KeyCode::PageUp) {
+            self.detail.page_up()
+            return true
+        }
+        let before = self.list.selected()
+        if !self.list.handle_key(key) {
+            return false
+        }
+        if self.list.selected() != before {
+            self.detail.to_start()
+        }
+        true
+    }
+
+    fn handle_mouse(mut self, _ mouse: Mouse) {
+        if self.detail_area.contains(mouse.pos) {
+            match mouse.kind {
+                MouseKind::ScrollDown => self.detail.scroll_by(3),
+                MouseKind::ScrollUp => self.detail.scroll_by(-3),
+                _ => {},
+            }
+        } else if let Option::Some(_) = self.list.handle_mouse(mouse) {
+            self.detail.to_start()
+        }
+    }
+}
+
+/// A row of the table page.
+pub struct Planet {
+    pub name: String<8>,
+    /// The planet's place from the Sun, from 1.
+    pub order: u64,
+    pub moons: u64,
+    /// The length of its day in hours, rounded.
+    pub day_hours: u64,
+    pub rings: bool,
+}
+
+impl Copy for Planet {}
+
+/// The table page: the planets, the table's selection and the column the
+/// rows are sorted by.
+pub struct Planets { pub rows: MemVec<Planet>, pub table: TableState, pub sort: usize }
+
+const SORTS: [String<16>; 3] = ["order", "moons", "day length"]
+
+impl Planets {
+    fn new() -> Self {
+        var rows: MemVec<Planet> = MemVec::new()
+        rows.push(
+            Planet { name: "Mercury", order: 1, moons: 0, day_hours: 4223, rings: false },
+        )
+        rows.push(
+            Planet { name: "Venus", order: 2, moons: 0, day_hours: 2802, rings: false },
+        )
+        rows.push(
+            Planet { name: "Earth", order: 3, moons: 1, day_hours: 24, rings: false },
+        )
+        rows.push(
+            Planet { name: "Mars", order: 4, moons: 2, day_hours: 25, rings: false },
+        )
+        rows.push(
+            Planet { name: "Jupiter", order: 5, moons: 95, day_hours: 10, rings: true },
+        )
+        rows.push(
+            Planet { name: "Saturn", order: 6, moons: 146, day_hours: 11, rings: true },
+        )
+        rows.push(
+            Planet { name: "Uranus", order: 7, moons: 28, day_hours: 17, rings: true },
+        )
+        rows.push(
+            Planet { name: "Neptune", order: 8, moons: 16, day_hours: 16, rings: true },
+        )
+        Planets { rows, table: TableState::new(), sort: 0 }
+    }
+
+    fn handle_key(mut self, _ key: Key) -> bool {
+        if key.is_char(b's') {
+            self.sort = (self.sort + 1) % SORTS.len()
+            self.sort_rows()
+            return true
+        }
+        self.table.handle_key(key)
+    }
+
+    // Sorts the rows by the sort column, stably, keeping the selected
+    // planet selected.
+    fn sort_rows(mut self) {
+        let selected = match self.table.selected() {
+            Option::Some(row) => self.rows[row].order,
+            Option::None => 0,
+        }
+        for i in 1 .. self.rows.len() {
+            var j = i
+            while j > 0 && self.key(j - 1) > self.key(j) {
+                self.rows.swap(j - 1, j)
+                j -= 1
+            }
+        }
+        for (row, ref planet) in self.rows.enumerate() {
+            if planet.order == selected {
+                self.table.select(row)
+            }
+        }
+    }
+
+    // The sort key of row `row`.
+    fn key(self, _ row: usize) -> u64 {
+        let planet = self.rows[row]
+        match self.sort {
+            0 => planet.order,
+            1 => planet.moons,
+            _ => planet.day_hours,
+        }
+    }
+}
+
+/// The form page: its fields, and which one has the focus.
+pub struct Form { pub fields: [TextInputState; 3], pub focus: usize }
+
+impl Form {
+    fn new() -> Self {
+        Form {
+            fields: [TextInputState::new(), TextInputState::new(), TextInputState::new()],
+            focus: 0,
+        }
+    }
+
+    fn handle_key(mut self, _ key: Key) -> bool {
+        let count = self.fields.len()
+        if key.is(KeyCode::Tab) || key.is(KeyCode::Down) {
+            self.focus = (self.focus + 1) % count
+            true
+        } else if key.is_press() && key.code == KeyCode::BackTab || key.is(KeyCode::Up) {
+            self.focus = (self.focus + count - 1) % count
+            true
+        } else {
+            self.fields[self.focus].handle_key(key)
+        }
+    }
+
+    fn handle_mouse(mut self, _ mouse: Mouse) {
+        for i in 0 .. self.fields.len() {
+            if self.fields[i].handle_mouse(mouse) {
+                self.focus = i
+            }
+        }
+    }
+}
+
+// The most values the chart keeps: more than any screen is wide.
+const KEPT: usize = 400
+
+/// The progress page: ticks counted while running, and a value for each
+/// tick for the chart.
+pub struct Progress { pub ticks: u64, pub running: bool, pub load: MemVec<u64>, seed: u64 }
+
+impl Progress {
+    fn new() -> Self {
+        Progress { ticks: 0, running: true, load: MemVec::new(), seed: 1 }
+    }
+
+    // Advances by a tick if running: whether anything changed.
+    fn tick(mut self) -> bool {
+        if !self.running {
+            return false
+        }
+        self.ticks += 1
+        // A small linear congruential generator: values that look random.
+        self.seed = (self.seed * 75 + 74) % 65537
+        if self.load.len() == KEPT {
+            for i in 1 .. KEPT {
+                self.load.swap(i - 1, i)
+            }
+            let _ = self.load.pop()
+        }
+        self.load.push(20 + self.seed % 80)
+        true
+    }
+
+    fn handle_key(mut self, _ key: Key) -> bool {
+        if !key.is_char(b' ') {
+            return false
+        }
+        self.running = !self.running
+        true
+    }
+}
+
+/// The model: the selected page, each page's part, and the popup and theme
+/// switches.
+pub struct Gallery {
+    pub tabs: TabsState,
+    pub items: Items,
+    pub planets: Planets,
+    pub form: Form,
+    pub progress: Progress,
+    pub help: bool,
+    pub dark: bool,
+}
+
+impl Gallery {
+    /// The gallery on its first page, with the first item selected, in the
+    /// dark theme.
+    pub fn new() -> Self {
+        var items = Items::new()
+        items.list.select(0)
+        Gallery {
+            tabs: TabsState::new(),
+            items,
+            planets: Planets::new(),
+            form: Form::new(),
+            progress: Progress::new(),
+            help: false,
+            dark: true,
+        }
+    }
+
+    fn key(mut self, _ key: Key) -> Flow {
+        if self.help {
+            if key.is(KeyCode::Esc) || key.is_char(b'?') || key.is_char(b'q') {
+                self.help = false
+                return Flow::Redraw
+            }
+            return Flow::Unchanged
+        }
+        if let KeyCode::F(n) = key.code && key.is_press() && n >= 1 && n <= 4 {
+            self.tabs.select((n - 1) as usize)
+            return Flow::Redraw
+        }
+        if key.is(KeyCode::Esc) {
+            return Flow::Quit
+        }
+        let page = self.tabs.selected()
+        let taken = match page {
+            0 => self.items.handle_key(key),
+            1 => self.planets.handle_key(key),
+            2 => self.form.handle_key(key),
+            _ => self.progress.handle_key(key),
+        }
+        if taken || page == FORM {
+            return if taken { Flow::Redraw } else { Flow::Unchanged }
+        }
+        // The shortcuts: `?` may come with Shift.
+        if !key.is_press() || !key.mods.without(Modifiers::SHIFT).is_empty() {
+            return Flow::Unchanged
+        }
+        match key.code {
+            KeyCode::Char(b'q') => Flow::Quit,
+            KeyCode::Char(b't') => {
+                self.dark = !self.dark
+                Flow::Redraw
+            },
+            KeyCode::Char(b'?') => {
+                self.help = true
+                Flow::Redraw
+            },
+            _ => if self.tabs.handle_key(key) {
+                Flow::Redraw
+            } else {
+                Flow::Unchanged
+            },
+        }
+    }
+
+    // Every mouse event redraws: with `MouseTracking::Clicks` they are
+    // presses, releases and wheel notches, and most of them move something.
+    fn mouse(mut self, _ mouse: Mouse) -> Flow {
+        if self.help {
+            return Flow::Unchanged
+        }
+        if let Option::Some(_) = self.tabs.handle_mouse(mouse) {
+            return Flow::Redraw
+        }
+        match self.tabs.selected() {
+            0 => self.items.handle_mouse(mouse),
+            1 => {
+                let _ = self.planets.table.handle_mouse(mouse)
+            },
+            2 => self.form.handle_mouse(mouse),
+            _ => {},
+        }
+        Flow::Redraw
+    }
+
+    // Draws the tabs, the selected page, the status line and the popup.
+    fn draw(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let (head, body, foot) = area.rows((Length(1), Fill(1), Length(1)))
+        Tabs::new().render(head, PAGES, mut self.tabs)
+        let page = self.tabs.selected()
+        match page {
+            0 => items_view(body, mut self.items),
+            1 => planets_view(body, mut self.planets),
+            2 => form_view(body, mut self.form),
+            _ => progress_view(body, self.progress),
+        }
+        status_view(foot, page, dark: self.dark)
+        if self.help {
+            help_view(body)
+        }
+    }
+}
+
+impl App for Gallery {
+    uses E = ()
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        match event {
+            Event::Key(key) => self.key(key),
+            Event::Mouse(mouse) => self.mouse(mouse),
+            // Ticks run the progress page even when it is not shown, but
+            // only draw when it is.
+            Event::Tick => if self.progress.tick() && self.tabs.selected() == PROGRESS {
+                Flow::Redraw
+            } else {
+                Flow::Unchanged
+            },
+            _ => Flow::Unchanged,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let theme = if self.dark {
+            Theme::dark()
+        } else {
+            Theme::plain()
+        }
+        with (Frame = themed(theme)) {
+            self.draw(area)
+        }
+    }
+}
+
+// The list of items on the left, the selected one's text on the right.
+fn items_view(_ area: Rect, _ items: mut Items) uses (frame: mut Frame) {
+    let (left, right) = area.columns((Length(15), Fill(1)))
+    let names = Block::bordered().render_titled(left, "Widgets")
+    List::new().highlight_symbol("> ").render(names, items.items, mut items.list)
+    let detail = Block::bordered().render_titled(right, "About")
+    items.detail_area = right
+    match items.list.selected() {
+        Option::Some(i) => Paragraph::new()
+            .wrap(WrapMode::Word)
+            .render_scrolled(detail, items.items[i].about, mut items.detail),
+        Option::None => Paragraph::new().render(detail, "Nothing selected"),
+    }
+    // On the block's right border, beside the text it scrolls.
+    let (_, track) = right.shrink(top: 1, right: 0, bottom: 1, left: 0).split_right(1)
+    Scrollbar::vertical().render_for(track, items.detail)
+}
+
+// The planets, with the rings column drawn by the cell closure.
+fn planets_view(_ area: Rect, _ planets: mut Planets) uses (frame: mut Frame) {
+    let inner = Block::bordered().render_titled(area, format!("Planets by ", SORTS[planets.sort]))
+    let columns: [Column<String<8>>; 4] = [
+        Column::new("Planet", Fill(1)),
+        Column::new("Moons", Length(5)).alignment(Alignment::Right),
+        Column::new("Day (h)", Length(7)).alignment(Alignment::Right),
+        Column::new("Rings", Length(5)),
+    ]
+    Table::new()
+        .highlight_symbol("> ")
+        .render_with(
+            inner,
+            columns,
+            planets.rows,
+            mut planets.table,
+            |planet, cell| {
+                match cell.column {
+                    0 => {
+                        let _ = print_in(cell.area, planet.name, Style::NONE)
+                    },
+                    1 => Paragraph::new().right().render(cell.area, planet.moons),
+                    2 => Paragraph::new().right().render(cell.area, planet.day_hours),
+                    _ => if planet.rings {
+                        let _ = print_in(cell.area, "◯◯", theme().accent)
+                    },
+                }
+            },
+        )
+}
+
+// The form's fields, one a row, and what they hold.
+fn form_view(_ area: Rect, _ form: mut Form) uses (frame: mut Frame) {
+    let inner = Block::bordered().render_titled(area, "Sign up")
+    let (name, email, password, _, echo) = inner
+        .rows((Length(1), Length(1), Length(1), Length(1), Fill(1)))
+    let focus = form.focus
+    field_view(
+        name,
+        "Name",
+        mut form.fields[0],
+        focused: focus == 0,
+        masked: false,
+    )
+    field_view(
+        email,
+        "Email",
+        mut form.fields[1],
+        focused: focus == 1,
+        masked: false,
+    )
+    field_view(
+        password,
+        "Password",
+        mut form.fields[2],
+        focused: focus == 2,
+        masked: true,
+    )
+    var text = Lines::new()
+    var line = Line::styled("Hello, ", theme().muted)
+    line.push(form.fields[0].text(), theme().accent)
+    text.push_line(line)
+    var line = Line::styled("Mail goes to ", theme().muted)
+    line.push(form.fields[1].text(), theme().accent)
+    text.push_line(line)
+    var line = Line::styled("The password is ", theme().muted)
+    line.push(measure(form.fields[2].text()), theme().accent)
+    line.push(" columns long.", theme().muted)
+    text.push_line(line)
+    Paragraph::new().wrap(WrapMode::Word).render_styled(echo, text)
+}
+
+// A labeled field.
+fn field_view(
+    _ area: Rect,
+    _ label: String<8>,
+    _ state: mut TextInputState,
+    focused: bool,
+    masked: bool,
+)
+uses (frame: mut Frame)
+{
+    let (label_area, input) = area.columns((Length(10), Fill(1)))
+    let _ = print_in(
+        label_area,
+        label,
+        if focused {
+            theme().accent
+        } else {
+            theme().text
+        },
+    )
+    let field = TextInput::new().placeholder("(empty)").focused(focused)
+    if masked {
+        field.mask("•").render(input, mut state)
+    } else {
+        field.render(input, mut state)
+    }
+}
+
+// A spinner, two gauges and a chart, all fed by ticks.
+fn progress_view(_ area: Rect, _ progress: Progress) uses (frame: mut Frame) {
+    let inner = Block::bordered().render_titled(area, "Progress")
+    let (spinner, gauge, line, _, chart) = inner
+        .rows((Length(1), Length(1), Length(1), Length(1), Fill(1)))
+    if progress.running {
+        Spinner::dots()
+            .render_labeled(
+                spinner,
+                tick: progress.ticks,
+                label: "Working (space pauses)",
+            )
+    } else {
+        let _ = print_in(spinner, "Paused (space runs)", theme().muted)
+    }
+    Gauge::new().render(gauge, done: progress.ticks % 101, total: 100)
+    LineGauge::new().render_labeled(
+            line,
+            done: progress.ticks % 41,
+            total: 40,
+            label: "Upload",
+        )
+    Sparkline::new().max(100).right_aligned().render(chart, progress.load)
+}
+
+// The key hints for the page, and the theme on the right.
+fn status_view(_ area: Rect, _ page: usize, dark: bool)
+uses (frame: mut Frame)
+{
+    let hints: DynString = match page {
+        0 => "Up/Down select  PgUp/PgDn scroll  t theme  ? help  q quit",
+        1 => "Up/Down select  s sort  t theme  ? help  q quit",
+        2 => "Tab/BackTab field  F1-F4 page  Esc quit",
+        _ => "space pause  t theme  ? help  q quit",
+    }
+    let theme_name: String<8> = if dark { "dark" } else { "plain" }
+    let (left, right) = area.columns((Fill(1), Length(6)))
+    let muted = theme().muted
+    let _ = print_line_with_ellipsis(left, Line::styled(hints, muted), Alignment::Left)
+    print_line(right, Line::styled(theme_name, muted), Alignment::Right)
+}
+
+// The help popup over `area`.
+fn help_view(_ area: Rect) uses (frame: mut Frame) {
+    let inner = Block::bordered().rounded().render_titled(popup(area, width: 34, height: 8), "Help")
+    Paragraph::new()
+        .render(
+            inner,
+            "F1-F4, Left/Right  pages\nclick              select\nwheel              scroll\nt                  theme\nq, Esc             quit\n? or Esc closes this",
+        )
+}
+
+/// Clicks and the wheel, and a tick every 100 ms.
+pub fn options() -> Options {
+    Options::new().mouse(MouseTracking::Clicks).tick(Duration::from_millis(100))
+}
+
+/// Runs the gallery on the terminal: 0 when it quits, 1 if the terminal
+/// fails.
+pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
+    var gallery = Gallery::new()
+    match run(mut gallery, options()) {
+        Result::Ok(()) => 0,
+        Result::Err(_) => 1,
+    }
+}
+
+// The gallery on a 40 by 10 terminal, as the tests run it.
+fn harness() -> Harness<Gallery> {
+    Harness::with_options(
+        Gallery::new(),
+        Size::new(width: 40, height: 10),
+        options(),
+    )
+}
+
+// Sends the SGR report of a press of mouse button `button` (0 the left
+// button, 64 and 65 the wheel up and down) at the zero-based `x` and `y`.
+fn press(_ harness: mut Harness<Gallery>, button: u8, x: u16, y: u16) {
+    var bytes = MemBuffer::empty()
+    bytes.push(0x1b)
+    write!(mut bytes, "[<", button, ";", x + 1, ";", y + 1, "M")
+    harness.input(bytes.span())
+}
+
+#[test]
+fn pages_switch_by_keys_and_clicks() {
+    var harness = harness()
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Widgets──────┐┌About──────────────────┐\n│> Block      ││Borders, titles and    █\n│  Paragraph  ││padding around an area.█\n│  List       ││A block's render       █\n│  Table      ││returns the area inside█\n│  Tabs       ││it, so the next widget │\n│  TextInput  ││draws there: this pane │\n└─────────────┘└───────────────────────┘\nUp/Down select  PgUp/PgDn scroll …  dark",
+    )
+    harness.key(KeyCode::Right)
+    assert(harness.app().tabs.selected() == 1)
+    harness.key(KeyCode::F(3))
+    // In the form, Left moves the cursor of the field.
+    harness.key(KeyCode::Left)
+    assert(harness.app().tabs.selected() == 2)
+    press(mut harness, button: 0, x: 26, y: 0)
+    assert(harness.app().tabs.selected() == 3)
+    press(mut harness, button: 0, x: 2, y: 0)
+    assert(harness.app().tabs.selected() == 0)
+    harness.key(KeyCode::Esc)
+    assert(harness.quit_requested())
+}
+
+#[test]
+fn the_list_selects_and_the_detail_scrolls() {
+    var harness = harness()
+    harness.key(KeyCode::Down)
+    harness.key(KeyCode::PageDown)
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Widgets──────┐┌About──────────────────┐\n│  Block      ││PageUp and PageDown    │\n│> Paragraph  ││move this text, as does│\n│  List       ││the mouse wheel over   █\n│  Table      ││it, and the scrollbar  │\n│  Tabs       ││on the right border    │\n│  TextInput  ││shows where it is. The │\n└─────────────┘└───────────────────────┘\nUp/Down select  PgUp/PgDn scroll …  dark",
+    )
+    // The wheel over the detail scrolls it by three rows.
+    press(mut harness, button: 65, x: 20, y: 4)
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Widgets──────┐┌About──────────────────┐\n│  Block      ││it, and the scrollbar  │\n│> Paragraph  ││on the right border    │\n│  List       ││shows where it is. The │\n│  Table      ││text is long enough to █\n│  Tabs       ││scroll on a small      │\n│  TextInput  ││screen, so here is more│\n└─────────────┘└───────────────────────┘\nUp/Down select  PgUp/PgDn scroll …  dark",
+    )
+    // A click on an item selects it and shows its text from the top.
+    press(mut harness, button: 0, x: 4, y: 4)
+    assert(harness.app().items.list.selected() == Option::Some(2))
+    assert(harness.app().items.detail.position() == 0)
+}
+
+#[test]
+fn the_table_selects_by_click_and_sorts() {
+    var harness = harness()
+    harness.key(KeyCode::Right)
+    press(mut harness, button: 0, x: 5, y: 5)
+    harness.type_text("s")
+    // Sorted by moons, stably, with Earth still selected.
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Planets by moons──────────────────────┐\n│  Planet           Moons Day (h) Rings│\n│  Mercury              0    4223      │\n│  Venus                0    2802      │\n│> Earth                1      24      │\n│  Mars                 2      25      │\n│  Neptune             16      16 ◯◯   │\n└──────────────────────────────────────┘\nUp/Down select  s sort  t theme  …  dark",
+    )
+    harness.type_text("ss")
+    assert(
+        harness.app().planets.sort == 0 && harness.app().planets.rows[2].name == "Earth",
+    )
+}
+
+#[test]
+fn the_form_moves_focus_and_masks_the_password() {
+    var harness = harness()
+    harness.key(KeyCode::F(3))
+    harness.type_text("Ada")
+    harness.key(KeyCode::Tab)
+    harness.key(KeyCode::Tab)
+    harness.type_text("pw")
+    harness.key(KeyCode::BackTab)
+    harness.type_text("a@b")
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Sign up───────────────────────────────┐\n│Name      Ada                         │\n│Email     a@b                         │\n│Password  ••                          │\n│                                      │\n│Hello, Ada                            │\n│Mail goes to a@b                      │\n└──────────────────────────────────────┘\nTab/BackTab field  F1-F4 page  Es…  dark",
+    )
+    // Keys the form takes do not quit or switch pages.
+    harness.type_text("q?t")
+    assert(
+        !harness.quit_requested() && !harness.app().help && harness.app().dark,
+    )
+    assert(harness.app().form.fields[1].text() == "a@bq?t")
+    // A click on a field gives it the focus.
+    press(mut harness, button: 0, x: 12, y: 2)
+    assert(harness.app().form.focus == 0)
+}
+
+#[test]
+fn ticks_feed_the_progress_page() {
+    var harness = harness()
+    harness.key(KeyCode::F(4))
+    harness.tick()
+    harness.tick()
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Progress──────────────────────────────┐\n│⠹ Working (space pauses)              │\n│▊                 2%                  │\n│Upload ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│\n│                                      │\n│                                    ▆▃│\n│                                    ██│\n└──────────────────────────────────────┘\nspace pause  t theme  ? help  q q…  dark",
+    )
+    harness.type_text(" ")
+    harness.tick()
+    assert(
+        harness.app().progress.ticks == 2 && harness.app().progress.load.len() == 2,
+    )
+}
+
+#[test]
+fn the_help_popup_opens_and_closes() {
+    var harness = harness()
+    harness.type_text("?")
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Wi╭Help────────────────────────────╮──┐\n│> │F1-F4, Left/Right  pages        │  █\n│  │click              select       │a.█\n│  │wheel              scroll       │  █\n│  │t                  theme        │de█\n│  │q, Esc             quit         │t │\n│  │? or Esc closes this            │e │\n└──╰────────────────────────────────╯──┘\nUp/Down select  PgUp/PgDn scroll …  dark",
+    )
+    // The popup takes every key while it is open.
+    harness.key(KeyCode::Down)
+    assert(
+        harness.app().help && harness.app().items.list.selected() == Option::Some(0),
+    )
+    harness.key(KeyCode::Esc)
+    assert(!harness.app().help && !harness.quit_requested())
+    assert(
+        harness.screen()
+            == " Items │ Table │ Form │ Progress\n┌Widgets──────┐┌About──────────────────┐\n│> Block      ││Borders, titles and    █\n│  Paragraph  ││padding around an area.█\n│  List       ││A block's render       █\n│  Table      ││returns the area inside█\n│  Tabs       ││it, so the next widget │\n│  TextInput  ││draws there: this pane │\n└─────────────┘└───────────────────────┘\nUp/Down select  PgUp/PgDn scroll …  dark",
+    )
+}
+
+#[test]
+fn the_theme_switches() {
+    var harness = harness()
+    let border = Pos::new(x: 0, y: 1)
+    assert(harness.cell(border).modifier == Modifier::DIM)
+    harness.type_text("t")
+    assert(harness.cell(border).modifier == Modifier::NONE)
+    harness.type_text("t")
+    assert(harness.cell(border).modifier == Modifier::DIM)
+}
+
+#[test]
+fn every_page_draws_in_any_size() {
+    var harness = harness()
+    for page in 1 .. 5 {
+        let key: u8 = page.downcast_truncate()
+        harness.key(KeyCode::F(key))
+        // Opens the popup, or types into the form.
+        harness.type_text("?")
+        for (width, height) in [(1, 1), (0, 0), (5, 2), (3, 40), (200, 3), (40, 10)] {
+            harness.resize(Size::new(width, height))
+        }
+        // Closes the popup, or types into the form.
+        harness.type_text("?")
+    }
+    harness.resize(Size::new(width: 0, height: 0))
+    assert(harness.screen() == "" && !harness.quit_requested())
+}
