@@ -105,12 +105,7 @@ impl Items {
                     ),
                 },
             )
-        Items {
-            items,
-            list: ListState::new(),
-            detail: ScrollState::new(),
-            detail_area: Rect::new(x: 0, y: 0, width: 0, height: 0),
-        }
+        Items { items, list: ListState::new(), detail: ScrollState::new(), detail_area: Rect::ZERO }
     }
 
     fn handle_key(mut self, _ key: Key) -> bool {
