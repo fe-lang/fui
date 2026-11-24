@@ -29,7 +29,10 @@
 //!   `Parser::request_cursor_position`.
 //! - `ESC P`, `ESC ]` and `ESC _` begin terminal strings (DCS, OSC, APC)
 //!   and are also Alt+Shift+P, Alt+] and Alt+_. A string with nothing in it
-//!   when `flush` comes is that key.
+//!   when `flush` or another `ESC` comes is that key. PM and SOS strings
+//!   (`ESC ^`, `ESC X`), which no terminal sends, are Alt keys.
+//! - A C1 control byte (`0x9b` for CSI) is not UTF-8 and reads as U+FFFD;
+//!   terminals send 7-bit sequences.
 use core::{MemBuffer, MemSpan, MemVec, Option}
 use core::mem::replace
 use core::ops::Eq
