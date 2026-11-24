@@ -645,15 +645,6 @@ fn harness() -> Harness<Gallery> {
     )
 }
 
-// Sends the SGR report of a press of mouse button `button` (0 the left
-// button, 64 and 65 the wheel up and down) at the zero-based `x` and `y`.
-fn press(_ harness: mut Harness<Gallery>, button: u8, x: u16, y: u16) {
-    var bytes = MemBuffer::empty()
-    bytes.push(0x1b)
-    write!(mut bytes, "[<", button, ";", x + 1, ";", y + 1, "M")
-    harness.input(bytes.span())
-}
-
 #[test]
 fn pages_switch_by_keys_and_clicks() {
     var harness = harness()
@@ -667,9 +658,9 @@ fn pages_switch_by_keys_and_clicks() {
     // In the form, Left moves the cursor of the field.
     harness.key(KeyCode::Left)
     assert(harness.app().tabs.selected() == 2)
-    press(mut harness, button: 0, x: 26, y: 0)
+    harness.click(Pos::new(x: 26, y: 0))
     assert(harness.app().tabs.selected() == 3)
-    press(mut harness, button: 0, x: 2, y: 0)
+    harness.click(Pos::new(x: 2, y: 0))
     assert(harness.app().tabs.selected() == 0)
     harness.key(KeyCode::Esc)
     assert(harness.quit_requested())
@@ -685,13 +676,13 @@ fn the_list_selects_and_the_detail_scrolls() {
             == " Items │ Table │ Form │ Progress\n┌Widgets──────┐┌About──────────────────┐\n│  Block      ││PageUp and PageDown    │\n│> Paragraph  ││move this text, as does│\n│  List       ││the mouse wheel over   █\n│  Table      ││it, and the scrollbar  │\n│  Tabs       ││on the right border    │\n│  TextInput  ││shows where it is. The │\n└─────────────┘└───────────────────────┘\nUp/Down select  PgUp/PgDn scroll …  dark",
     )
     // The wheel over the detail scrolls it by three rows.
-    press(mut harness, button: 65, x: 20, y: 4)
+    harness.mouse(MouseKind::ScrollDown, Pos::new(x: 20, y: 4))
     assert(
         harness.screen()
             == " Items │ Table │ Form │ Progress\n┌Widgets──────┐┌About──────────────────┐\n│  Block      ││it, and the scrollbar  │\n│> Paragraph  ││on the right border    │\n│  List       ││shows where it is. The │\n│  Table      ││text is long enough to █\n│  Tabs       ││scroll on a small      │\n│  TextInput  ││screen, so here is more│\n└─────────────┘└───────────────────────┘\nUp/Down select  PgUp/PgDn scroll …  dark",
     )
     // A click on an item selects it and shows its text from the top.
-    press(mut harness, button: 0, x: 4, y: 4)
+    harness.click(Pos::new(x: 4, y: 4))
     assert(harness.app().items.list.selected() == Option::Some(2))
     assert(harness.app().items.detail.position() == 0)
 }
@@ -700,7 +691,7 @@ fn the_list_selects_and_the_detail_scrolls() {
 fn the_table_selects_by_click_and_sorts() {
     var harness = harness()
     harness.key(KeyCode::Right)
-    press(mut harness, button: 0, x: 5, y: 5)
+    harness.click(Pos::new(x: 5, y: 5))
     harness.type_text("s")
     // Sorted by moons, stably, with Earth still selected.
     assert(
@@ -734,7 +725,7 @@ fn the_form_moves_focus_and_masks_the_password() {
     )
     assert(harness.app().form.fields[1].text() == "a@bq?t")
     // A click on a field gives it the focus.
-    press(mut harness, button: 0, x: 12, y: 2)
+    harness.click(Pos::new(x: 12, y: 2))
     assert(harness.app().form.focus == 0)
 }
 

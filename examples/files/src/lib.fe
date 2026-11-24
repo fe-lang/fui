@@ -115,8 +115,9 @@ impl Browser {
             Result::Ok(entries) => {
                 self.entries = entries
                 self.dir = dir
-                // A new state: the old one's lengths are the old entries'.
-                self.list = ListState::new()
+                // Keys queued before the next render move within the new
+                // entries.
+                self.list.set_len(self.entries.len())
                 var index: usize = 0
                 if let Option::Some(name) = select {
                     for (i, ref entry) in self.entries.enumerate() {
@@ -137,7 +138,7 @@ impl Browser {
 
     // Opens the selected entry if it is a directory.
     fn descend(mut self) -> Flow uses (fs: Fs) {
-        let index = match self.selected() {
+        let index = match self.list.selected() {
             Option::Some(index) => index,
             Option::None => {
                 return Flow::Unchanged
@@ -171,22 +172,11 @@ impl Browser {
         slash
     }
 
-    // The index of the selected entry, if it is one of the entries: the
-    // state's lengths are the last render's.
-    fn selected(self) -> Option<usize> {
-        let index = self.list.selected()?
-        if index < self.entries.len() {
-            Option::Some(index)
-        } else {
-            Option::None
-        }
-    }
-
     // Loads the preview of the selected entry, or records why it cannot.
     fn load_preview(mut self) uses (fs: Fs) {
         self.preview = MemBuffer::empty()
         self.preview_scroll = ScrollState::new()
-        let index = match self.selected() {
+        let index = match self.list.selected() {
             Option::Some(index) => index,
             Option::None => {
                 return
@@ -532,11 +522,6 @@ uses (env: Env, fs: mut Fs, proc: mut Spawn)
     remove(root)
 }
 
-// A mouse event of `kind` at column `x` and row `y`.
-fn mouse(_ kind: MouseKind, x: u16, y: u16) -> Event {
-    Event::Mouse(Mouse::new(kind, Pos::new(x, y), Modifiers::NONE))
-}
-
 #[test]
 fn clicks_select_and_the_wheel_scrolls()
 uses (env: Env, fs: mut Fs, proc: mut Spawn)
@@ -552,19 +537,19 @@ uses (env: Env, fs: mut Fs, proc: mut Spawn)
     let size = Size::new(width: 44, height: 6)
     var harness = Harness::with_options(Browser::open(root), size, options)
     // The list shows three rows; a click on the third selects `blob.bin`.
-    harness.send(mouse(MouseKind::Down(MouseButton::Left), x: 3, y: 3))
+    harness.click(Pos::new(x: 3, y: 3))
     assert(harness.app().list.selected() == Option::Some(2))
     assert(harness.app().preview == "(binary, not text)")
     // The wheel scrolls the view and leaves the selection.
-    harness.send(mouse(MouseKind::ScrollDown, x: 3, y: 2))
+    harness.mouse(MouseKind::ScrollDown, Pos::new(x: 3, y: 2))
     assert(harness.app().list.scroll().position() == 3)
     assert(harness.app().list.selected() == Option::Some(2))
-    harness.send(mouse(MouseKind::Down(MouseButton::Left), x: 3, y: 2))
+    harness.click(Pos::new(x: 3, y: 2))
     assert(
         harness.app().list.selected() == Option::Some(4) && harness.app().preview == lines,
     )
     // The wheel over the preview scrolls it.
-    harness.send(mouse(MouseKind::ScrollDown, x: 20, y: 2))
+    harness.mouse(MouseKind::ScrollDown, Pos::new(x: 20, y: 2))
     assert(harness.app().preview_scroll.position() == 3)
     assert(
         harness.screen()
