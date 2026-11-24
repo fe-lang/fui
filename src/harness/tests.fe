@@ -1,0 +1,146 @@
+use core::{MemBuffer, Option}
+use ingot::app::{App, Flow, Options}
+use ingot::event::{Event, Key, KeyCode, Modifiers}
+use ingot::frame::{Frame, print}
+use ingot::geom::{Pos, Rect, Size}
+use ingot::style::Style
+use super::Harness
+
+// What the app writes as it goes: the effect its `update` uses.
+struct Log { lines: MemBuffer }
+
+// Shows the text typed so far and the last event.
+struct Notes { text: MemBuffer, last: MemBuffer }
+
+impl App for Notes {
+    uses E = (log: mut Log)
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        write!(mut log.lines, event, ";")
+        self.last.clear()
+        write!(mut self.last, event)
+        match event {
+            Event::Key(key) => {
+                if key.is_char(b'q') {
+                    return Flow::Quit
+                }
+                if !key.push_text(mut self.text) {
+                    return Flow::Unchanged
+                }
+            },
+            Event::Paste(ref text) => self.text.extend_from(text.span()),
+            _ => {},
+        }
+        Flow::Redraw
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let (top, bottom) = area.split_top(1)
+        print(top.pos(), self.text, Style::new())
+        print(bottom.pos(), self.last, Style::new())
+    }
+}
+
+fn notes() -> Notes {
+    Notes { text: MemBuffer::empty(), last: format!("none") }
+}
+
+fn size(width: u16, height: u16) -> Size {
+    Size::new(width, height)
+}
+
+fn esc<T: std::io::Display>(_ rest: T) -> MemBuffer {
+    var out = MemBuffer::empty()
+    out.push(0x1b)
+    write!(mut out, rest)
+    out
+}
+
+#[test]
+fn a_harness_draws_the_first_frame() {
+    let harness = Harness::new(notes(), size(width: 12, height: 2))
+    assert(harness.screen() == "\nnone")
+    assert(!harness.quit_requested())
+}
+
+#[test]
+fn a_harness_sends_events_through_update_with_its_row() {
+    var log = Log { lines: MemBuffer::empty() }
+    var harness = Harness::new(notes(), size(width: 16, height: 2))
+    with (log) {
+        harness.type_text("hé")
+        harness.key(KeyCode::Up)
+        harness.key_with(KeyCode::Char(b'x'), Modifiers::ALT)
+        harness.paste("!!")
+        harness.tick()
+    }
+    assert(harness.screen() == "héx!!\nTick")
+    assert(
+        log.lines == "Key(h);Key(é);Key(Up);Key(Alt+x);Paste(2 bytes);Tick;",
+    )
+    assert(harness.app().text == "héx!!")
+    assert(harness.cell(Pos::new(x: 1, y: 0)).symbol() == "é")
+    log.lines.clear()
+    with (log) {
+        harness.type_text("a\tb\n")
+    }
+    assert(log.lines == "Key(a);Key(Tab);Key(b);Key(Enter);")
+}
+
+#[test]
+fn a_harness_resizes_and_quits() {
+    var log = Log { lines: MemBuffer::empty() }
+    var harness = Harness::new(notes(), size(width: 16, height: 3))
+    with (log) {
+        harness.resize(size(width: 8, height: 2))
+    }
+    assert(harness.screen() == "\nResize(8")
+    assert(harness.session().size() == size(width: 8, height: 2))
+    with (log) {
+        harness.type_text("q")
+        harness.type_text("z")
+    }
+    assert(harness.quit_requested())
+    assert(log.lines == "Resize(8x2);Key(q);")
+}
+
+#[test]
+fn a_harness_reads_raw_input_as_a_terminal_sends_it() {
+    var log = Log { lines: MemBuffer::empty() }
+    var harness = Harness::new(notes(), size(width: 20, height: 2))
+    with (log) {
+        harness.input(esc("[A").span())
+        harness.input(esc("[200~pasted").span())
+        harness.input(esc("[201~").span())
+        harness.input(esc("").span())
+        harness.input(format!("ok").span())
+    }
+    assert(
+        log.lines == "Key(Up);Paste(6 bytes);Key(Esc);Key(o);Key(k);",
+    )
+    assert(harness.screen() == "pastedok\nKey(k)")
+    // Ctrl+Z suspends and resumes, drawing again.
+    var ctrl_z = MemBuffer::empty()
+    ctrl_z.push(26)
+    with (log) {
+        harness.input(ctrl_z.span())
+    }
+    assert(harness.session().backend().stops() == 1)
+    assert(harness.screen() == "pastedok\nResume")
+}
+
+#[test]
+fn a_harness_takes_options() {
+    var log = Log { lines: MemBuffer::empty() }
+    var harness = Harness::with_options(
+        notes(),
+        size(width: 20, height: 2),
+        Options::new().ctrl_c_quits(false),
+    )
+    with (log) {
+        harness.key_with(KeyCode::Char(b'c'), Modifiers::CTRL)
+        harness.send(Event::Terminate)
+    }
+    assert(log.lines == "Key(Ctrl+C);")
+    assert(harness.quit_requested())
+}

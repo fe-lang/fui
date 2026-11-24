@@ -15,6 +15,7 @@ pub use event::{
     MouseKind,
 }
 pub use frame::Frame
+pub use harness::Harness
 pub use input::MouseTracking
 pub use layout::{Constraint, Layout}
 pub use render::ColorDepth
@@ -34,3 +35,4 @@ pub use render
 pub use backend
 pub use session
 pub use app
+pub use harness

@@ -1,0 +1,160 @@
+//! Headless tests of apps.
+//!
+//! A `Harness` runs an `App` as `run` does, over a `TestBackend`: each event
+//! goes through `update`, and the screen is drawn again when `run` would
+//! draw it, by the real renderer into a terminal emulator. So a test sends
+//! keys and reads the screen a user would see:
+//!
+//! ```fe
+//! #[test]
+//! fn counts() {
+//!     var harness = Harness::new(Counter { count: 0 }, Size::new(width: 20, height: 5))
+//!     harness.key(KeyCode::Up)
+//!     assert(harness.screen() == "1\n\n\n\n")
+//!     harness.key(KeyCode::Char(b'q'))
+//!     assert(harness.quit_requested())
+//! }
+//! ```
+//!
+//! `input` sends bytes as the terminal would, through the input parser, so
+//! the whole path from the terminal's bytes to the screen is tested.
+use core::{MemBuffer, MemSpan, Option}
+use std::io::Display
+use std::time::Duration
+use ingot::app::{App, Options, draw, handle}
+use ingot::backend::TestBackend
+use ingot::event::{Event, Key, KeyCode, Modifiers}
+use ingot::geom::{Pos, Size}
+use ingot::session::Session
+use ingot::text::decode
+use ingot::vt::Cell
+
+/// An app run on a scripted terminal, for tests.
+pub struct Harness<A: App> { app: A, session: Session<TestBackend>, quit: bool }
+
+impl<A: App> Harness<A> {
+    /// Runs `app` on a terminal of `size` with the default options, and
+    /// draws its first frame.
+    pub fn new(_ app: own A, _ size: Size) -> Self {
+        Harness::with_options(app, size, Options::new())
+    }
+
+    /// Runs `app` on a terminal of `size` with `options`, and draws its
+    /// first frame.
+    pub fn with_options(_ app: own A, _ size: Size, _ options: Options) -> Self {
+        let session = Session::enter(TestBackend::new(size), options).unwrap()
+        var harness = Harness { app, session, quit: false }
+        draw(mut harness.app, mut harness.session).unwrap()
+        harness
+    }
+
+    /// Gives `event` to the app as `run` does, then draws if `run` would.
+    /// Nothing once the app has quit.
+    pub fn send(mut self, _ event: own Event) uses A::E {
+        if self.quit { return }
+        var dirty = false
+        self.quit = handle(mut self.app, mut self.session, event, mut dirty).unwrap()
+        self.settle(dirty)
+    }
+
+    /// Sends a press of `code`.
+    pub fn key(mut self, _ code: KeyCode) uses A::E {
+        self.send(Event::Key(Key::new(code, Modifiers::NONE)))
+    }
+
+    /// Sends a press of `code` with `mods`.
+    pub fn key_with(mut self, _ code: KeyCode, _ mods: Modifiers) uses A::E {
+        self.send(Event::Key(Key::new(code, mods)))
+    }
+
+    /// Sends the keys that type the `Display` text of `text`, one per
+    /// character: a line break is Enter and a tab Tab.
+    pub fn type_text<T: Display>(mut self, _ text: T) uses A::E {
+        let bytes = format!(text)
+        var offset: usize = 0
+        while offset < bytes.len() {
+            let scalar = decode(bytes.span(), offset)
+            offset += scalar.len
+            let code = match scalar.value {
+                0x0a => KeyCode::Enter,
+                0x0d => KeyCode::Enter,
+                0x09 => KeyCode::Tab,
+                value => KeyCode::from_scalar(value),
+            }
+            self.key(code)
+        }
+    }
+
+    /// Sends a paste of the `Display` text of `text`.
+    pub fn paste<T: Display>(mut self, _ text: T) uses A::E {
+        self.send(Event::Paste(format!(text)))
+    }
+
+    /// Sends an `Event::Tick`.
+    pub fn tick(mut self) uses A::E {
+        self.send(Event::Tick)
+    }
+
+    /// Resizes the terminal to `size`, as dragging its window does: the
+    /// session takes the new size and the app gets `Event::Resize`.
+    pub fn resize(mut self, _ size: Size) uses A::E {
+        self.session.backend().push_resize(size)
+        self.settle(false)
+    }
+
+    /// Sends `bytes` as the terminal's input: they are decoded as from a
+    /// real terminal, a lone `ESC` after the Esc timeout, and their events
+    /// handled as `run` does.
+    pub fn input(mut self, _ bytes: MemSpan) uses A::E {
+        self.session.backend().push_input(bytes)
+        self.settle(false)
+    }
+
+    /// The text of the screen: its rows without trailing spaces, joined by
+    /// line feeds.
+    pub fn screen(self) -> MemBuffer {
+        self.session.backend().vt().to_text()
+    }
+
+    /// The cell of the screen at `pos`, which must be on it: its symbol,
+    /// colors and attributes.
+    pub fn cell(self, _ pos: Pos) -> ref Cell {
+        ref self.session.backend().vt().cell(pos)
+    }
+
+    /// The app.
+    pub fn app(mut? self) -> mut? A {
+        mut? self.app
+    }
+
+    /// The session, and through it the `TestBackend`: its emulator, its
+    /// output and its script.
+    pub fn session(mut? self) -> mut? Session<TestBackend> {
+        mut? self.session
+    }
+
+    /// Whether the app has ended the loop: `run` would have returned.
+    pub fn quit_requested(self) -> bool {
+        self.quit
+    }
+
+    // Handles the events the session has queued or that come within the
+    // Esc timeout, then draws if `dirty` or an event asks for it.
+    fn settle(mut self, _ dirty: bool) uses A::E {
+        var dirty = dirty
+        let wait = Option::Some(self.session.options().esc_timeout)
+        while !self.quit {
+            match self.session.next_event(wait).unwrap() {
+                Option::Some(event) => {
+                    self.quit = handle(mut self.app, mut self.session, event, mut dirty).unwrap()
+                },
+                Option::None => {
+                    break
+                },
+            }
+        }
+        if dirty && !self.quit {
+            draw(mut self.app, mut self.session).unwrap()
+        }
+    }
+}
