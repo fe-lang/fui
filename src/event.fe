@@ -18,6 +18,7 @@ use core::MemBuffer
 use core::ops::{BitAnd, BitOr, Eq}
 use std::io::Display
 use ingot::geom::{Pos, Size}
+use ingot::text::encode
 
 /// Something that happened: input from the terminal, or a tick or signal
 /// from the runtime.
@@ -418,7 +419,7 @@ impl Key {
     pub fn push_text(self, _ out: mut MemBuffer) -> bool {
         match self.code.scalar() {
             Option::Some(c) => {
-                push_utf8(mut out, c)
+                encode(c, mut out)
                 true
             },
             Option::None => false,
@@ -441,7 +442,7 @@ impl Display for Key {
             } else {
                 out.push(c)
             },
-            KeyCode::Unicode(c) => push_utf8(mut out, c),
+            KeyCode::Unicode(c) => encode(c, mut out),
             KeyCode::F(n) => write!(mut out, "F", n),
             KeyCode::Modifier(m) => {
                 // The modifiers' names without the last `+`.
@@ -482,31 +483,6 @@ impl Display for Key {
 
 fn ascii_lower(_ c: u8) -> u8 {
     if c >= b'A' && c <= b'Z' { c + 32 } else { c }
-}
-
-/// Appends the UTF-8 encoding of the Unicode scalar value `scalar`, or of
-/// U+FFFD if it is a surrogate or above U+10FFFF.
-pub fn push_utf8(_ out: mut MemBuffer, _ scalar: u32) {
-    let c = if scalar > 0x10ffff || (scalar >= 0xd800 && scalar < 0xe000) {
-        0xfffd
-    } else {
-        scalar
-    }
-    if c < 0x80 {
-        out.push(c.downcast_truncate())
-    } else if c < 0x800 {
-        out.push((0xc0 | c >> 6).downcast_truncate())
-        out.push((0x80 | c & 0x3f).downcast_truncate())
-    } else if c < 0x10000 {
-        out.push((0xe0 | c >> 12).downcast_truncate())
-        out.push((0x80 | c >> 6 & 0x3f).downcast_truncate())
-        out.push((0x80 | c & 0x3f).downcast_truncate())
-    } else {
-        out.push((0xf0 | c >> 18).downcast_truncate())
-        out.push((0x80 | c >> 12 & 0x3f).downcast_truncate())
-        out.push((0x80 | c >> 6 & 0x3f).downcast_truncate())
-        out.push((0x80 | c & 0x3f).downcast_truncate())
-    }
 }
 
 /// A mouse button.
@@ -902,21 +878,6 @@ fn modifiers_form_a_set() {
     assert(
         Modifiers::from_bits(0xff) == Modifiers::ALL && Modifiers::NONE.is_empty(),
     )
-}
-
-#[test]
-fn scalars_encode_as_utf8() {
-    var out = MemBuffer::empty()
-    push_utf8(mut out, 0x41)
-    push_utf8(mut out, 0xe9)
-    push_utf8(mut out, 0x20ac)
-    push_utf8(mut out, 0x1f600)
-    assert(out == "Aé€😀")
-    var bad = MemBuffer::empty()
-    push_utf8(mut bad, 0xd800)
-    push_utf8(mut bad, 0x110000)
-    assert(bad == "��")
-    assert(bad[0] == 0xef && bad[1] == 0xbf && bad[2] == 0xbd)
 }
 
 #[test]
