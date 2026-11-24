@@ -1,0 +1,318 @@
+use core::{MemBuffer, MemSpan, Option}
+use std::io::Stderr
+use ingot::buffer::Buffer
+use ingot::geom::{Pos, Rect, Size}
+use ingot::style::{Color, Modifier, Style}
+use ingot::text::encode
+use ingot::vt::Vt
+use super::{ColorDepth, Pen, Renderer, mismatch, sgr}
+
+// A xorshift generator: the same cases on every run.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn new(_ seed: u64) -> Self {
+        Rng { state: seed * 0x9e3779b97f4a7c15 | 1 }
+    }
+
+    fn next(mut self) -> u64 {
+        var x = self.state
+        x = x ^ x << 13
+        x = x ^ x >> 7
+        x = x ^ x << 17
+        self.state = x
+        x
+    }
+
+    // A number below `n`, which must not be 0.
+    fn below(mut self, _ n: u32) -> u32 {
+        ((self.next() >> 16) % (n as u64)).downcast_truncate()
+    }
+
+    fn chance(mut self, _ one_in: u32) -> bool {
+        self.below(one_in) == 0
+    }
+}
+
+fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for c in scalars {
+        encode(c, mut out)
+    }
+    out
+}
+
+// A symbol of the kinds a buffer holds: narrow, wide, joined, of more than
+// one scalar, and too long for a cell, among them some that join the
+// symbol written before them.
+fn symbol(_ rng: mut Rng) -> MemBuffer {
+    match rng.below(24) {
+        0 => utf8([0x754c]),
+        1 => utf8([0xe9]),
+        2 => utf8([0x65, 0x301]),
+        3 => utf8([0x263a, 0xfe0f]),
+        // A family: four people joined by ZWJs, 25 bytes.
+        4 => utf8(
+            [0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467, 0x200d, 0x1f466],
+        ),
+        5 => utf8([0x1f1fa, 0x1f1f8]),
+        6 => utf8([0x1f1fa]),
+        7 => utf8([0x1f1f8]),
+        // Hangul: a leading consonant, which joins a syllable after it.
+        8 => utf8([0x1100]),
+        9 => utf8([0xac00]),
+        // Devanagari: a consonant with a virama, which joins a consonant.
+        10 => utf8([0x915, 0x94d]),
+        11 => utf8([0x937]),
+        12 => utf8([0x1f44d, 0x1f3fd]),
+        // A letter with five marks: narrow, and too long for a cell.
+        13 => utf8([0x61, 0x300, 0x301, 0x302, 0x303, 0x304]),
+        14 => utf8([0x20]),
+        15 => utf8([0x2500]),
+        _ => {
+            var out = MemBuffer::empty()
+            out.push(b'a' + rng.below(26).downcast_truncate())
+            out
+        },
+    }
+}
+
+fn color(_ rng: mut Rng) -> Color {
+    match rng.below(5) {
+        0 => Color::ansi(rng.below(16).downcast_truncate()),
+        1 => Color::indexed(rng.below(256).downcast_truncate()),
+        2 => Color::rgb(
+            rng.below(256).downcast_truncate(),
+            rng.below(256).downcast_truncate(),
+            rng.below(256).downcast_truncate(),
+        ),
+        _ => Color::RESET,
+    }
+}
+
+// A style that sets every color and attribute.
+fn style(_ rng: mut Rng) -> Style {
+    let modifier = if rng.chance(2) {
+        Modifier::NONE
+    } else {
+        Modifier::from_bits(rng.below(256).downcast_truncate())
+    }
+    Style {
+        fg: color(mut rng),
+        bg: color(mut rng),
+        add: modifier,
+        remove: Modifier::ALL.without(modifier),
+    }
+}
+
+fn random_pos(_ rng: mut Rng, _ size: Size) -> Pos {
+    Pos::new(
+        x: rng.below(size.width as u32).downcast_truncate(),
+        y: rng.below(size.height as u32).downcast_truncate(),
+    )
+}
+
+fn random_rect(_ rng: mut Rng, _ size: Size) -> Rect {
+    let pos = random_pos(mut rng, size)
+    Rect::new(
+        x: pos.x,
+        y: pos.y,
+        width: (rng.below(size.width as u32) + 1).downcast_truncate(),
+        height: (rng.below(size.height as u32) + 1).downcast_truncate(),
+    )
+}
+
+// Text with controls among letters and symbols.
+fn hostile(_ rng: mut Rng) -> MemBuffer {
+    var out = MemBuffer::empty()
+    var n = rng.below(8)
+    while n > 0 {
+        match rng.below(6) {
+            0 => {
+                out.push(0x1b)
+                out.push(b'[')
+                out.push(b'2')
+                out.push(b'J')
+            },
+            1 => out.push(rng.below(32).downcast_truncate()),
+            2 => {
+                out.push(0xc2)
+                out.push(0x9b)
+            },
+            3 => out.push(0x7f),
+            _ => out.extend_from(symbol(mut rng).span()),
+        }
+        n -= 1
+    }
+    out
+}
+
+// Changes `buffer` by a random drawing call.
+fn scribble(_ rng: mut Rng, _ buffer: mut Buffer) {
+    let size = buffer.size()
+    match rng.below(8) {
+        0 => {
+            let text = hostile(mut rng)
+            let _ = buffer
+                .set_string(
+                    random_pos(mut rng, size),
+                    text.span(),
+                    style(mut rng),
+                    max_width: size.width,
+                )
+        },
+        1 => buffer.fill(
+                random_rect(mut rng, size),
+                symbol(mut rng).span(),
+                style(mut rng),
+            ),
+        2 => buffer.set_style(random_rect(mut rng, size), style(mut rng)),
+        3 => buffer.reset(random_rect(mut rng, size)),
+        _ => {
+            let _ = buffer
+                .set_symbol(
+                    random_pos(mut rng, size),
+                    symbol(mut rng).span(),
+                    style(mut rng),
+                )
+        },
+    }
+}
+
+fn random_buffer(_ rng: mut Rng, _ size: Size) -> Buffer {
+    var buffer = Buffer::new(size)
+    let area: u32 = size.area().downcast_truncate()
+    var n = rng.below(area * 2 + 1)
+    while n > 0 {
+        scribble(mut rng, mut buffer)
+        n -= 1
+    }
+    buffer
+}
+
+// `buffer` changed by a few drawing calls, or by none, or another buffer.
+fn changed(_ rng: mut Rng, _ buffer: Buffer) -> Buffer {
+    if rng.chance(8) {
+        return random_buffer(mut rng, buffer.size())
+    }
+    var next = Buffer::new(buffer.size())
+    next.copy_from(buffer, area: buffer.area(), to: Pos::new(x: 0, y: 0))
+    var n = rng.below(5)
+    while n > 0 {
+        scribble(mut rng, mut next)
+        n -= 1
+    }
+    next
+}
+
+fn random_size(_ rng: mut Rng) -> Size {
+    let width: u16 = (rng.below(12) + 1).downcast_truncate()
+    let height: u16 = (rng.below(6) + 1).downcast_truncate()
+    match rng.below(8) {
+        0 => Size::new(width: 1, height: 1),
+        1 => Size::new(width, height: 1),
+        2 => Size::new(width: 1, height),
+        _ => Size::new(width, height),
+    }
+}
+
+fn random_cursor(_ rng: mut Rng, _ size: Size) -> Option<Pos> {
+    if rng.chance(3) {
+        Option::None
+    } else {
+        Option::Some(random_pos(mut rng, size))
+    }
+}
+
+fn random_depth(_ rng: mut Rng) -> ColorDepth {
+    match rng.below(4) {
+        0 => ColorDepth::NoColor,
+        1 => ColorDepth::Ansi16,
+        2 => ColorDepth::Ansi256,
+        _ => ColorDepth::TrueColor,
+    }
+}
+
+// Leaves `vt` in some state a program may have left it in: attributes on,
+// the cursor hidden or wrapping, text on the screen.
+fn garble(_ rng: mut Rng, _ vt: mut Vt) {
+    var n = rng.below(6)
+    while n > 0 {
+        var out = MemBuffer::empty()
+        match rng.below(5) {
+            0 => write!(mut out, "x[1;4;31;48;5;200m"),
+            1 => write!(mut out, "x[?25l"),
+            2 => write!(mut out, "x[99;99H"),
+            3 => write!(mut out, "x[7m"),
+            _ => {},
+        }
+        if !out.is_empty() {
+            // ESC, which a literal cannot hold.
+            out.span()[0] = 0x1b
+        }
+        out.extend_from(hostile(mut rng).span())
+        vt.feed(out.span())
+        n -= 1
+    }
+}
+
+// Whether `vt` shows `buffer`; if not, writes what differs, with `case`.
+fn check(
+    _ vt: Vt,
+    _ buffer: Buffer,
+    _ depth: ColorDepth,
+    cursor: Option<Pos>,
+    _ case: u32,
+    _ what: MemSpan,
+) -> bool
+uses (err: mut Stderr)
+{
+    let Option::Some(message) = mismatch(vt, buffer, depth, cursor) else {
+        return true
+    }
+    var report = format!("case ", case, " after ")
+    report.extend_from(what)
+    write!(mut report, ": ")
+    report.extend_from(message.span())
+    write!(mut report, "\n")
+    let _ = err.write_stderr(report.span())
+    false
+}
+
+// The central property: a terminal in any state fed `full(a)` shows `a`,
+// then fed `diff(a, b)` shows `b`, then fed `diff(b, c)` shows `c`, for
+// random buffers of every size and content, at every depth.
+#[test]
+fn frames_draw_what_the_buffers_hold() uses (err: mut Stderr) {
+    var rng = Rng::new(1)
+    var failures: u32 = 0
+    var case: u32 = 0
+    while case < 4000 {
+        let size = random_size(mut rng)
+        let depth = random_depth(mut rng)
+        var renderer = Renderer::new(depth).synchronized(rng.chance(2))
+        var vt = Vt::new(size)
+        garble(mut rng, mut vt)
+        let a = random_buffer(mut rng, size)
+        let b = changed(mut rng, a)
+        let c = changed(mut rng, b)
+        var out = MemBuffer::empty()
+        let cursor = random_cursor(mut rng, size)
+        renderer.full(a, cursor, mut out)
+        vt.feed(out.span())
+        var ok = check(vt, a, depth, cursor, case, format!("full").span())
+        out.clear()
+        let cursor = random_cursor(mut rng, size)
+        renderer.diff(a, b, cursor, mut out)
+        vt.feed(out.span())
+        ok = ok && check(vt, b, depth, cursor, case, format!("diff(a, b)").span())
+        out.clear()
+        let cursor = random_cursor(mut rng, size)
+        renderer.diff(b, c, cursor, mut out)
+        vt.feed(out.span())
+        ok = ok && check(vt, c, depth, cursor, case, format!("diff(b, c)").span())
+        if !ok { failures += 1 }
+        case += 1
+    }
+    assert(failures == 0)
+}
