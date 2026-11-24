@@ -1,10 +1,11 @@
-//! What a typical view and update function needs, for `use tui::prelude::*`.
+//! What a typical app needs, for `use tui::prelude::*`.
 //!
-//! The geometry, styles, layout, drawing functions, widgets with their
-//! states, styled text and input events. Modules such as `buffer`, `render`
-//! and `input`, which programs that run their own loop use, stay under
-//! their own names.
-pub use ingot::event::{Event, Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
+//! The app trait and its loop, the test harness, the geometry, styles,
+//! layout, drawing functions, widgets with their states, styled text and
+//! input events. Modules such as `buffer`, `render` and `input`, which
+//! programs that run their own loop use, stay under their own names.
+pub use ingot::app::{App, Flow, Options, run}
+pub use ingot::event::{Event, Key, KeyCode, KeyKind, Modifiers, Mouse, MouseButton, MouseKind}
 pub use ingot::frame::{
     Frame,
     area,
@@ -20,6 +21,8 @@ pub use ingot::frame::{
     themed,
 }
 pub use ingot::geom::{Pos, Rect, Size}
+pub use ingot::harness::Harness
+pub use ingot::input::MouseTracking
 pub use ingot::layout::{Constraint, Flex, Layout}
 pub use ingot::layout::Constraint::{Fill, Length, Max, Min, Percent, Ratio}
 pub use ingot::style::{Color, Modifier, Style}

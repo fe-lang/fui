@@ -4,9 +4,7 @@
 //! or Ctrl+C quits. Ctrl+Z suspends, as in any program.
 use std::term::Tty
 use std::time::Clock
-use tui::{App, Event, Flow, Frame, Key, KeyCode, KeyKind, Options, Rect}
-use tui::frame::{print, theme}
-use tui::layout::Constraint::{Fill, Length}
+use tui::prelude::*
 
 /// The model: the count.
 pub struct Counter { pub count: u64 }
@@ -57,7 +55,7 @@ impl App for Counter {
 
 pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
     var counter = Counter { count: 0 }
-    match tui::run(mut counter, Options::new()) {
+    match run(mut counter, Options::new()) {
         Result::Ok(()) => 0,
         Result::Err(_) => 1,
     }
@@ -65,8 +63,6 @@ pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
 
 #[test]
 fn keys_change_the_count() {
-    use tui::{Harness, Modifiers, Size}
-
     var harness = Harness::new(Counter { count: 0 }, Size::new(width: 24, height: 5))
     assert(
         harness.screen() == "Counter\n\n        Count: 0\n\nUp/+ add  Down/- subtrac",
@@ -89,8 +85,6 @@ fn keys_change_the_count() {
 
 #[test]
 fn the_count_stays_centered_when_the_terminal_resizes() {
-    use tui::{Harness, Size}
-
     var harness = Harness::new(Counter { count: 7 }, Size::new(width: 24, height: 5))
     harness.resize(Size::new(width: 12, height: 3))
     assert(harness.screen() == "Counter\n  Count: 7\nUp/+ add  Do")
