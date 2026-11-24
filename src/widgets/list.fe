@@ -326,7 +326,7 @@ impl ListState {
         let len = self.len()
         if len == 0 { return }
         let next = match self.selected {
-            Option::Some(i) => if i + 1 < len {
+            Option::Some(i) => if i < len - 1 {
                 i + 1
             } else if self.wrap_around { 0 } else { len - 1 },
             Option::None => 0,
@@ -710,6 +710,13 @@ fn keys_wrap_around_and_vi_keys_when_asked() {
     assert(
         state.handle_key(Key::new(KeyCode::Char(b'g'), Modifiers::SHIFT)),
     )
+    assert(state.selected() == Option::Some(9))
+    // An index beyond the items, before a render clamps it.
+    state.select(18446744073709551615)
+    state.select_next()
+    assert(state.selected() == Option::Some(0))
+    state.select(18446744073709551615)
+    state.select_previous()
     assert(state.selected() == Option::Some(9))
     var plain = ListState::new()
     assert(

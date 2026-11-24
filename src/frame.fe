@@ -258,6 +258,9 @@ impl Frame {
             }
             offset += cluster.len
         }
+        if column < skip {
+            return written
+        }
         let to = clip.right() as usize
         var x = pos.x as usize + (column - skip)
         let runs = text.run_count(line)

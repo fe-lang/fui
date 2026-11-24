@@ -158,7 +158,7 @@ impl ScrollState {
         if index < self.position {
             self.scroll_to(index)
         } else if index - self.position >= self.viewport {
-            self.scroll_to(index + 1 - self.viewport)
+            self.scroll_to(index - (self.viewport - 1))
         }
     }
 }
@@ -269,6 +269,8 @@ fn ensure_visible_scrolls_as_little_as_it_can() {
     assert(s.position() == 10)
     // Beyond the content: the last position.
     s.ensure_visible(40)
+    assert(s.position() == 17)
+    s.ensure_visible(18446744073709551615)
     assert(s.position() == 17)
 }
 

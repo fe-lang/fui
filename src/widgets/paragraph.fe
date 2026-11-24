@@ -56,18 +56,22 @@ impl Paragraph {
         Paragraph { style, alignment: self.alignment, wrap: self.wrap, scroll_x: self.scroll_x }
     }
 
+    /// Places each row in the area as `alignment` says.
     pub fn alignment(own self, _ alignment: Alignment) -> Self {
         Paragraph { style: self.style, alignment, wrap: self.wrap, scroll_x: self.scroll_x }
     }
 
+    /// Aligns rows left, as a new paragraph does.
     pub fn left(own self) -> Self {
         self.alignment(Alignment::Left)
     }
 
+    /// Centers rows.
     pub fn centered(own self) -> Self {
         self.alignment(Alignment::Center)
     }
 
+    /// Aligns rows right.
     pub fn right(own self) -> Self {
         self.alignment(Alignment::Right)
     }
@@ -408,6 +412,8 @@ fn unwrapped_lines_scroll_sideways() {
     let (top, bottom) = frame.area().split_top(2)
     with (frame) {
         Paragraph::new().scroll_x(1).render(top, "abcdef\nab")
+        // Lines no wider than the shift are hidden whole.
+        Paragraph::new().scroll_x(9).render(top, "abc")
         // Column 1 cuts "漢" in half: a space in its style stands for it.
         Paragraph::new().scroll_x(1).render_styled(bottom, line)
     }
