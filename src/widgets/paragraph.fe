@@ -1,0 +1,480 @@
+//! Text in an area, wrapped or cut to its width.
+use std::io::Display
+use ingot::buffer::Buffer
+use ingot::frame::{Frame, StyledText, set_style, theme}
+use ingot::geom::{Pos, Rect, Size}
+use ingot::style::{Color, Style}
+use ingot::text::{Alignment, Line, Text, Wrap, WrapMode, WrappedLine}
+use ingot::theme::Theme
+use super::scroll::ScrollState
+
+/// Text in an area: plain text, a styled `text::Line`, or the lines of a
+/// `text::Text`, wrapped to the area's width or cut at it, and aligned.
+///
+/// ```fe
+/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+///     let (head, body) = area.rows((Length(1), Fill(1)))
+///     Paragraph::new().centered().style(theme().title).render(head, self.count)
+///     Paragraph::new().wrap(WrapMode::Word).render_styled_scrolled(body, self.log, mut self.scroll)
+/// }
+/// ```
+///
+/// `render` takes anything `Display` and draws it in the paragraph's style;
+/// `render_styled` takes `StyledText`, so each run of a `Line` or `Text`
+/// keeps its style, across the breaks wrapping makes, applied over the
+/// paragraph's. Byte spans are `StyledText` too, so text already in memory
+/// is drawn where it is.
+///
+/// Each line break in the text starts a row, and a final one starts none.
+/// With wrapping each line breaks into rows as `text::Wrap` breaks it, and
+/// each row is aligned on its own. Without, each line takes one row, cut
+/// after its last cluster that fits, and `scroll_x` shifts every line left
+/// by that many columns. Every empty line of a `Text` or `Line` takes a
+/// row, and empty bytes take none. Controls are not drawn (see `buffer`),
+/// though `Wrap` counts a tab as a column: replace tabs before drawing.
+///
+/// The paragraph's style, over the theme's `text` style, is applied to its
+/// whole area first, so a background fills it. Rows scroll by a
+/// `ScrollState` in the `_scrolled` forms, which record the rows of the
+/// wrapped text and of the area; the others draw from the first row.
+pub struct Paragraph { style: Style, alignment: Alignment, wrap: Option<WrapMode>, scroll_x: usize }
+
+impl Copy for Paragraph {}
+
+impl Paragraph {
+    /// A paragraph in the theme's text style, aligned left, not wrapped.
+    pub fn new() -> Self {
+        Paragraph {
+            style: Style::NONE,
+            alignment: Alignment::Left,
+            wrap: Option::None,
+            scroll_x: 0,
+        }
+    }
+
+    /// Applies `style` over the theme's text style.
+    pub fn style(own self, _ style: Style) -> Self {
+        Paragraph { style, alignment: self.alignment, wrap: self.wrap, scroll_x: self.scroll_x }
+    }
+
+    /// Places each row in the area as `alignment` says.
+    pub fn alignment(own self, _ alignment: Alignment) -> Self {
+        Paragraph { style: self.style, alignment, wrap: self.wrap, scroll_x: self.scroll_x }
+    }
+
+    /// Aligns rows left, as a new paragraph does.
+    pub fn left(own self) -> Self {
+        self.alignment(Alignment::Left)
+    }
+
+    /// Centers rows.
+    pub fn centered(own self) -> Self {
+        self.alignment(Alignment::Center)
+    }
+
+    /// Aligns rows right.
+    pub fn right(own self) -> Self {
+        self.alignment(Alignment::Right)
+    }
+
+    /// Wraps lines wider than the area as `mode` breaks them.
+    pub fn wrap(own self, _ mode: WrapMode) -> Self {
+        Paragraph {
+            style: self.style,
+            alignment: self.alignment,
+            wrap: Option::Some(mode),
+            scroll_x: self.scroll_x,
+        }
+    }
+
+    /// Shifts lines left by `columns`, hiding the columns before it. Only a
+    /// paragraph that does not wrap scrolls this way.
+    pub fn scroll_x(own self, _ columns: usize) -> Self {
+        Paragraph {
+            style: self.style,
+            alignment: self.alignment,
+            wrap: self.wrap,
+            scroll_x: columns,
+        }
+    }
+
+    /// The rows `text` takes in an area `width` columns wide.
+    pub fn rows<S: StyledText>(self, _ text: S, width: u16) -> usize {
+        let wrap = self.wrapper(width)
+        var rows: usize = 0
+        for line in 0 .. text.line_count() {
+            let bytes = text.line_text(line)
+            if bytes.is_empty() {
+                rows += 1
+            }
+            for _ in bytes.by(wrap) {
+                rows += 1
+            }
+        }
+        rows
+    }
+
+    /// Draws the `Display` text of `text` in `area`, from its first row.
+    pub fn render<T: Display>(self, _ area: Rect, _ text: T) uses (frame: mut Frame) {
+        var scroll = ScrollState::new()
+        self.render_scrolled(area, text, mut scroll)
+    }
+
+    /// Draws the `Display` text of `text` in `area`, from the row `scroll`
+    /// is at, and records in it the rows of the text and of the area.
+    pub fn render_scrolled<T: Display>(self, _ area: Rect, _ text: T, _ scroll: mut ScrollState)
+    uses (frame: mut Frame)
+    {
+        var bytes = frame.take_scratch()
+        text.fmt(mut bytes)
+        self.render_styled_scrolled(area, bytes.span(), mut scroll)
+        frame.restore_scratch(bytes)
+    }
+
+    /// Draws `text` in `area`, each run in its style, from its first row.
+    pub fn render_styled<S: StyledText>(self, _ area: Rect, _ text: S)
+    uses (frame: mut Frame)
+    {
+        var scroll = ScrollState::new()
+        self.render_styled_scrolled(area, text, mut scroll)
+    }
+
+    /// Draws `text` in `area`, each run in its style, from the row `scroll`
+    /// is at, and records in it the rows of the text and of the area.
+    pub fn render_styled_scrolled<S: StyledText>(
+        self,
+        _ area: Rect,
+        _ text: S,
+        _ scroll: mut ScrollState,
+    )
+    uses (frame: mut Frame)
+    {
+        scroll
+            .set_lengths(
+                content: self.rows(text, width: area.width),
+                viewport: area.height as usize,
+            )
+        if area.is_empty() { return }
+        set_style(area, theme().text.patch(self.style))
+        let wrap = self.wrapper(area.width)
+        let first = scroll.position()
+        let end = scroll.visible_end()
+        var row: usize = 0
+        for line in 0 .. text.line_count() {
+            if row >= end { break }
+            let bytes = text.line_text(line)
+            if bytes.is_empty() {
+                row += 1
+            }
+            for part in bytes.by(wrap) {
+                if row >= end { break }
+                if row >= first {
+                    let y: u16 = (area.y as usize + row - first).downcast_truncate()
+                    self.draw_row(area, text, line, part, y)
+                }
+                row += 1
+            }
+        }
+    }
+
+    // The wrap of lines to `width` columns, or one that only breaks lines
+    // at their line breaks.
+    fn wrapper(self, _ width: u16) -> Wrap {
+        match self.wrap {
+            Option::Some(mode) => Wrap::new(width: width as usize, mode),
+            Option::None => Wrap::new(width: usize::max(), mode: WrapMode::Char),
+        }
+    }
+
+    // Draws `part` of line `line` of `text` on row `y` of `area`.
+    fn draw_row<S: StyledText>(
+        self,
+        _ area: Rect,
+        _ text: S,
+        _ line: usize,
+        _ part: WrappedLine,
+        _ y: u16,
+    )
+    uses (frame: mut Frame)
+    {
+        let lead = self.alignment.offset(width: part.width, available: area.width as usize)
+        let scroll_x = if self.wrap.is_some() {
+            0
+        } else {
+            self.scroll_x
+        }
+        let (x, skip) = if lead >= scroll_x {
+            (lead - scroll_x, 0)
+        } else {
+            (0, scroll_x - lead)
+        }
+        frame
+            .draw_styled(
+                text,
+                line,
+                start: part.start,
+                end: part.end,
+                Pos::new(x: (area.x as usize + x).downcast_truncate(), y),
+                skip,
+                within: Rect::new(x: area.x, y, width: area.width, height: 1),
+            )
+    }
+}
+
+/// A paragraph in the theme's text style, aligned left, not wrapped.
+impl Default for Paragraph {
+    fn default() -> Self {
+        Paragraph::new()
+    }
+}
+
+fn frame_of(width: u16, height: u16) -> Frame {
+    Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
+}
+
+fn fg_at(_ frame: Frame, x: u16, y: u16) -> Color {
+    frame.buffer().get(Pos::new(x, y)).unwrap().fg()
+}
+
+#[test]
+fn plain_text_draws_a_row_per_line() {
+    var frame = frame_of(width: 6, height: 4)
+    let area = frame.area()
+    with (frame) {
+        Paragraph::new().render(area, "one\ntwo\r\nthree")
+    }
+    assert(frame.buffer().to_text() == "one\ntwo\nthree\n")
+}
+
+#[test]
+fn displayable_values_draw_as_text() {
+    var frame = frame_of(width: 6, height: 1)
+    let area = frame.area()
+    with (frame) {
+        Paragraph::new().right().render(area, 4207 as u64)
+    }
+    assert(frame.buffer().to_text() == "  4207")
+}
+
+#[test]
+fn words_wrap_at_spaces_and_wide_clusters_stay_whole() {
+    var frame = frame_of(width: 5, height: 5)
+    let area = frame.area()
+    with (frame) {
+        Paragraph::new().wrap(WrapMode::Word).render(area, "ab 漢字 cd abcd漢")
+    }
+    // "abcd漢" is wider than a row: it breaks between clusters, and "漢"
+    // does not cross the edge.
+    assert(frame.buffer().to_text() == "ab\n漢字\ncd\nabcd\n漢")
+    var chars = frame_of(width: 4, height: 3)
+    let area = chars.area()
+    with (chars) {
+        Paragraph::new().wrap(WrapMode::Char).render(area, "ab 漢字x")
+    }
+    assert(chars.buffer().to_text() == "ab\n漢字\nx")
+}
+
+#[test]
+fn runs_keep_their_styles_across_wrapped_rows() {
+    var frame = frame_of(width: 5, height: 3)
+    var line = Line::styled("ab cd", Style::new().fg(Color::RED))
+    line.push("ef gh", Style::new().fg(Color::BLUE))
+    let area = frame.area()
+    with (frame) {
+        Paragraph::new().wrap(WrapMode::Word).render_styled(area, line)
+    }
+    assert(frame.buffer().to_text() == "ab\ncdef\ngh")
+    assert(fg_at(frame, x: 0, y: 0) == Color::RED)
+    assert(
+        fg_at(frame, x: 1, y: 1) == Color::RED && fg_at(frame, x: 2, y: 1) == Color::BLUE,
+    )
+    assert(
+        fg_at(frame, x: 3, y: 1) == Color::BLUE && fg_at(frame, x: 0, y: 2) == Color::BLUE,
+    )
+}
+
+#[test]
+fn styles_apply_over_the_paragraph_style() {
+    var frame = frame_of(width: 4, height: 2)
+    let line = Line::styled("ab", Style::new().fg(Color::RED))
+    let area = frame.area()
+    with (frame) {
+        Paragraph::new()
+            .style(Style::new().fg(Color::GREEN).bg(Color::BLUE))
+            .render_styled(area, line)
+    }
+    let buffer = ref frame.buffer()
+    let styled = buffer.get(Pos::new(x: 0, y: 0)).unwrap()
+    assert(styled.fg() == Color::RED && styled.bg() == Color::BLUE)
+    // The paragraph's style fills its whole area.
+    let blank = buffer.get(Pos::new(x: 3, y: 1)).unwrap()
+    assert(blank.fg() == Color::GREEN && blank.bg() == Color::BLUE)
+}
+
+#[test]
+fn rows_align_on_their_own() {
+    var frame = frame_of(width: 7, height: 4)
+    let (top, bottom) = frame.area().split_top(2)
+    with (frame) {
+        Paragraph::new().centered().wrap(WrapMode::Word).render(top, "ab cd efghij")
+        Paragraph::new().right().render(bottom, "ab\nabcdefghij")
+    }
+    // A row too wide for the area starts at its left edge.
+    assert(
+        frame.buffer().to_text() == " ab cd\nefghij\n     ab\nabcdefg",
+    )
+}
+
+#[test]
+fn texts_draw_each_line_and_empty_lines_take_rows() {
+    var text = Text::new()
+    text.push_line(Line::styled("ab", Style::new().fg(Color::RED)))
+    text.push_line(Line::new())
+    text.push_line(Line::styled("cd", Style::new().fg(Color::BLUE)))
+    var frame = frame_of(width: 3, height: 4)
+    let area = frame.area()
+    var scroll = ScrollState::new()
+    with (frame) {
+        Paragraph::new().render_styled_scrolled(area, text, mut scroll)
+    }
+    assert(frame.buffer().to_text() == "ab\n\ncd\n")
+    assert(scroll.content() == 3 && scroll.viewport() == 4)
+    assert(
+        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 0, y: 2) == Color::BLUE,
+    )
+}
+
+#[test]
+fn empty_text_and_a_final_line_break_start_no_row() {
+    var frame = frame_of(width: 3, height: 3)
+    let area = frame.area()
+    var empty = ScrollState::new()
+    var ended = ScrollState::new()
+    with (frame) {
+        Paragraph::new().render_scrolled(area, "", mut empty)
+        Paragraph::new().wrap(WrapMode::Word).render_scrolled(area, "a\nb\n", mut ended)
+    }
+    assert(empty.content() == 0)
+    assert(ended.content() == 2)
+    assert(frame.buffer().to_text() == "a\nb\n")
+    let paragraph = Paragraph::new()
+    assert(paragraph.rows(Text::from("x\n\ny\n"), width: 5) == 3)
+    assert(paragraph.rows(Line::new(), width: 5) == 1)
+}
+
+#[test]
+fn scrolling_clamps_to_the_last_screenful() {
+    let lines = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9"
+    var frame = frame_of(width: 2, height: 3)
+    let area = frame.area()
+    var scroll = ScrollState::new()
+    // Before a render the lengths are unknown: nothing scrolls.
+    scroll.page_down()
+    assert(scroll.position() == 0)
+    with (frame) {
+        Paragraph::new().render_scrolled(area, lines, mut scroll)
+    }
+    assert(scroll.content() == 10 && scroll.viewport() == 3)
+    scroll.page_down()
+    assert(scroll.position() == 3)
+    scroll.scroll_to(100)
+    assert(scroll.position() == 7)
+    with (frame) {
+        Paragraph::new().render_scrolled(area, lines, mut scroll)
+    }
+    assert(frame.buffer().to_text() == "7\n8\n9")
+    // The text shrinks: the position follows its end.
+    with (frame) {
+        Paragraph::new().render_scrolled(area, "a\nb\nc\nd", mut scroll)
+    }
+    assert(scroll.position() == 1)
+    assert(frame.buffer().to_text() == "b\nc\nd")
+}
+
+#[test]
+fn wrapped_rows_scroll() {
+    var frame = frame_of(width: 3, height: 2)
+    let area = frame.area()
+    var scroll = ScrollState::new()
+    scroll.set_lengths(content: 9, viewport: 2)
+    scroll.scroll_to(2)
+    with (frame) {
+        Paragraph::new().wrap(WrapMode::Word).render_scrolled(area, "aa bb cc\ndd ee", mut scroll)
+    }
+    assert(scroll.content() == 5 && scroll.position() == 2)
+    assert(frame.buffer().to_text() == "cc\ndd")
+}
+
+#[test]
+fn unwrapped_lines_scroll_sideways() {
+    var frame = frame_of(width: 4, height: 3)
+    var line = Line::styled("漢", Style::new().fg(Color::RED))
+    line.push("字xy", Style::new().fg(Color::BLUE))
+    let (top, bottom) = frame.area().split_top(2)
+    with (frame) {
+        Paragraph::new().scroll_x(1).render(top, "abcdef\nab")
+        // Lines no wider than the shift are hidden whole.
+        Paragraph::new().scroll_x(9).render(top, "abc")
+        // Column 1 cuts "漢" in half: a space in its style stands for it.
+        Paragraph::new().scroll_x(1).render_styled(bottom, line)
+    }
+    assert(frame.buffer().to_text() == "bcde\nb\n 字x")
+    assert(
+        fg_at(frame, x: 0, y: 2) == Color::RED && fg_at(frame, x: 1, y: 2) == Color::BLUE,
+    )
+    // Wrapped text does not scroll sideways.
+    var wrapped = frame_of(width: 4, height: 2)
+    let area = wrapped.area()
+    with (wrapped) {
+        Paragraph::new().wrap(WrapMode::Char).scroll_x(2).render(area, "abcdef")
+    }
+    assert(wrapped.buffer().to_text() == "abcd\nef")
+}
+
+#[test]
+fn byte_spans_draw_in_place() {
+    var bytes = MemBuffer::empty()
+    write!(mut bytes, "left\nright")
+    var frame = frame_of(width: 6, height: 2)
+    let area = frame.area()
+    with (frame) {
+        Paragraph::new().right().render_styled(area, bytes.span())
+    }
+    assert(frame.buffer().to_text() == "  left\n right")
+}
+
+fn tiny_paragraphs() -> (ScrollState, ScrollState) uses (frame: mut Frame) {
+    var none = ScrollState::new()
+    var one = ScrollState::new()
+    Paragraph::new()
+        .wrap(WrapMode::Word)
+        .render_scrolled(
+            Rect::new(x: 1, y: 0, width: 0, height: 2),
+            "abc def",
+            mut none,
+        )
+    Paragraph::new()
+        .wrap(WrapMode::Word)
+        .render_scrolled(
+            Rect::new(x: 0, y: 0, width: 1, height: 1),
+            "漢 b",
+            mut one,
+        )
+    Paragraph::new().render(Rect::new(x: 0, y: 1, width: 2, height: 0), "xyz")
+    Paragraph::new().render(Rect::new(x: 9, y: 9, width: 4, height: 4), "outside")
+    (none, one)
+}
+
+#[test]
+fn tiny_and_empty_areas_draw_what_fits() {
+    var frame = frame_of(width: 2, height: 2)
+    var states = (ScrollState::new(), ScrollState::new())
+    with (frame) {
+        states = tiny_paragraphs()
+    }
+    let (none, one) = states
+    assert(none.viewport() == 2)
+    // A wide cluster wider than a one-column row is not drawn.
+    assert(one.content() == 2 && one.viewport() == 1)
+    assert(frame.buffer().to_text() == "\n")
+}

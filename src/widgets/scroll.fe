@@ -1,0 +1,293 @@
+//! Scrolling: which part of content longer than its viewport is shown.
+//!
+//! Every scrollable widget keeps its scroll position in a `ScrollState`,
+//! counted in the units it scrolls by: rows of a paragraph, items of a
+//! list. The state lives in the program's model. A render records the
+//! lengths it laid out, the content's and the viewport's, and clamps the
+//! position to them, so the event handling after it scrolls within the
+//! content the user sees:
+//!
+//! ```fe
+//! fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+//!     Paragraph::new().wrap(WrapMode::Word).render_scrolled(area, self.log, mut self.scroll)
+//! }
+//!
+//! fn update(mut self, _ event: Event) -> Flow {
+//!     match event {
+//!         Event::Key(key) => if key.is(KeyCode::PageDown) { self.scroll.page_down() },
+//!         _ => {},
+//!     }
+//!     Flow::Redraw
+//! }
+//! ```
+//!
+//! Every method clamps: the position stays between 0 and `max_position()`,
+//! the content's length less the viewport's, so the last screenful of
+//! content fills the viewport rather than scrolling off it. A scrollbar
+//! takes its three numbers from `content()`, `viewport()` and `position()`.
+use core::ops::Eq
+
+/// The position of a viewport over content: the first unit shown, and the
+/// lengths of the viewport and the content the last render recorded.
+pub struct ScrollState { position: usize, viewport: usize, content: usize }
+
+impl Copy for ScrollState {}
+
+impl Eq for ScrollState {
+    fn eq(self, _ other: Self) -> bool {
+        self.position == other.position
+            && self.viewport == other.viewport
+            && self.content == other.content
+    }
+}
+
+/// The state at the start of empty content.
+impl Default for ScrollState {
+    fn default() -> Self {
+        ScrollState::new()
+    }
+}
+
+impl ScrollState {
+    /// The state at the start of empty content, as before the first
+    /// render.
+    pub fn new() -> Self {
+        ScrollState { position: 0, viewport: 0, content: 0 }
+    }
+
+    /// The first unit shown: the offset of the first visible row or item.
+    pub fn position(self) -> usize {
+        self.position
+    }
+
+    /// The units the viewport shows, as the last render recorded.
+    pub fn viewport(self) -> usize {
+        self.viewport
+    }
+
+    /// The units of the content, as the last render recorded.
+    pub fn content(self) -> usize {
+        self.content
+    }
+
+    /// The last position: where the end of the content meets the end of
+    /// the viewport, or 0 if the content fits.
+    pub fn max_position(self) -> usize {
+        self.content.saturating_sub(self.viewport)
+    }
+
+    /// The unit after the last one shown.
+    pub fn visible_end(self) -> usize {
+        let end = self.position.saturating_add(self.viewport)
+        if end < self.content {
+            end
+        } else {
+            self.content
+        }
+    }
+
+    /// Whether the unit at `index` is shown.
+    pub fn is_visible(self, _ index: usize) -> bool {
+        index >= self.position && index < self.visible_end()
+    }
+
+    /// Whether the position is the first.
+    pub fn is_at_start(self) -> bool {
+        self.position == 0
+    }
+
+    /// Whether the position is the last: the end of the content is shown.
+    pub fn is_at_end(self) -> bool {
+        self.position == self.max_position()
+    }
+
+    /// Records the lengths of the content and of the viewport, as a render
+    /// laid them out, and clamps the position to them.
+    pub fn set_lengths(mut self, content: usize, viewport: usize) {
+        self.content = content
+        self.viewport = viewport
+        self.scroll_to(self.position)
+    }
+
+    /// Scrolls to `position`, or to the last position if it is beyond.
+    pub fn scroll_to(mut self, _ position: usize) {
+        let last = self.max_position()
+        self.position = if position < last { position } else { last }
+    }
+
+    /// Scrolls by `delta` units: forward, toward the end, if it is
+    /// positive, and back if it is negative.
+    pub fn scroll_by(mut self, _ delta: isize) {
+        if delta >= 0 {
+            let forward: usize = delta.downcast_unchecked()
+            self.scroll_to(self.position.saturating_add(forward))
+        } else {
+            // `-delta` overflows for the least `isize`; its successor does not.
+            let back: usize = (-(delta + 1)).downcast_unchecked()
+            self.scroll_to(self.position.saturating_sub(back + 1))
+        }
+    }
+
+    /// Scrolls back by a viewport.
+    pub fn page_up(mut self) {
+        self.scroll_to(self.position.saturating_sub(self.viewport))
+    }
+
+    /// Scrolls forward by a viewport.
+    pub fn page_down(mut self) {
+        self.scroll_to(self.position.saturating_add(self.viewport))
+    }
+
+    /// Scrolls to the start.
+    pub fn to_start(mut self) {
+        self.position = 0
+    }
+
+    /// Scrolls to the end: the last position.
+    pub fn to_end(mut self) {
+        self.position = self.max_position()
+    }
+
+    /// Scrolls as little as shows the unit at `index`: to it if it is
+    /// before the viewport, and so it is the last one shown if it is after.
+    /// A viewport of no units shows none, so nothing scrolls.
+    pub fn ensure_visible(mut self, _ index: usize) {
+        if self.viewport == 0 {
+            return
+        }
+        if index < self.position {
+            self.scroll_to(index)
+        } else if index - self.position >= self.viewport {
+            self.scroll_to(index - (self.viewport - 1))
+        }
+    }
+}
+
+fn state(position: usize, viewport: usize, content: usize) -> ScrollState {
+    var s = ScrollState::new()
+    s.set_lengths(content, viewport)
+    s.scroll_to(position)
+    s
+}
+
+#[test]
+fn a_new_state_is_at_the_start_of_nothing() {
+    var s = ScrollState::new()
+    assert(s.position() == 0 && s.viewport() == 0 && s.content() == 0)
+    assert(s.is_at_start() && s.is_at_end() && s.max_position() == 0)
+    s.scroll_by(5)
+    s.page_down()
+    s.to_end()
+    s.ensure_visible(9)
+    assert(s.position() == 0)
+    let d: ScrollState = Default::default()
+    assert(d == ScrollState::new())
+}
+
+#[test]
+fn positions_clamp_to_the_last_screenful() {
+    var s = state(position: 0, viewport: 10, content: 25)
+    assert(s.max_position() == 15)
+    s.scroll_to(12)
+    assert(s.position() == 12 && s.visible_end() == 22)
+    s.scroll_to(99)
+    assert(
+        s.position() == 15 && s.is_at_end() && s.visible_end() == 25,
+    )
+    s.scroll_by(-3)
+    assert(s.position() == 12)
+    s.scroll_by(-100)
+    assert(s.position() == 0 && s.is_at_start())
+    s.scroll_by(4)
+    assert(s.position() == 4 && !s.is_at_start() && !s.is_at_end())
+    s.to_end()
+    assert(s.position() == 15)
+    s.to_start()
+    assert(s.position() == 0)
+}
+
+#[test]
+fn extreme_deltas_saturate() {
+    var s = state(position: 3, viewport: 2, content: 10)
+    s.scroll_by(-9223372036854775807 - 1)
+    assert(s.position() == 0)
+    s.scroll_by(9223372036854775807)
+    assert(s.position() == 8)
+    var far = state(
+        position: 0,
+        viewport: 18446744073709551615,
+        content: 18446744073709551615,
+    )
+    far.scroll_by(1)
+    assert(
+        far.position() == 0 && far.visible_end() == 18446744073709551615,
+    )
+}
+
+#[test]
+fn content_that_fits_does_not_scroll() {
+    var s = state(position: 0, viewport: 10, content: 4)
+    s.scroll_by(1)
+    s.page_down()
+    s.ensure_visible(3)
+    assert(
+        s.position() == 0 && s.is_at_end() && s.max_position() == 0,
+    )
+    assert(s.is_visible(3) && !s.is_visible(4))
+}
+
+#[test]
+fn pages_move_by_a_viewport() {
+    var s = state(position: 0, viewport: 4, content: 10)
+    s.page_down()
+    assert(s.position() == 4)
+    s.page_down()
+    assert(s.position() == 6)
+    s.page_up()
+    assert(s.position() == 2)
+    s.page_up()
+    assert(s.position() == 0)
+}
+
+#[test]
+fn ensure_visible_scrolls_as_little_as_it_can() {
+    var s = state(position: 5, viewport: 3, content: 20)
+    // Already shown: nothing moves.
+    for i in [5, 6, 7] {
+        s.ensure_visible(i)
+        assert(s.position() == 5)
+    }
+    // After the viewport: the index becomes the last shown.
+    s.ensure_visible(8)
+    assert(s.position() == 6)
+    s.ensure_visible(15)
+    assert(
+        s.position() == 13 && s.is_visible(15) && !s.is_visible(16),
+    )
+    // Before it: the index becomes the first shown.
+    s.ensure_visible(10)
+    assert(s.position() == 10)
+    // Beyond the content: the last position.
+    s.ensure_visible(40)
+    assert(s.position() == 17)
+    s.ensure_visible(18446744073709551615)
+    assert(s.position() == 17)
+}
+
+#[test]
+fn recorded_lengths_clamp_the_position() {
+    var s = state(position: 15, viewport: 5, content: 20)
+    assert(s.position() == 15)
+    // The content shrinks: the position follows its end.
+    s.set_lengths(content: 12, viewport: 5)
+    assert(s.position() == 7)
+    // The viewport grows past the content: back to the start.
+    s.set_lengths(content: 12, viewport: 30)
+    assert(s.position() == 0 && s.visible_end() == 12)
+    // Both grow: the position stays.
+    s.scroll_to(0)
+    s.set_lengths(content: 100, viewport: 10)
+    s.scroll_to(60)
+    s.set_lengths(content: 200, viewport: 50)
+    assert(s.position() == 60)
+}
