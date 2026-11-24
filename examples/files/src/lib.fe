@@ -1,0 +1,616 @@
+//! A two-pane file browser: the entries of a directory on the left,
+//! directories first, and the first lines of the selected file on the
+//! right.
+//!
+//! Up and Down, Home and End, PageUp and PageDown or a click select; Enter
+//! or Right opens a directory, Backspace or Left goes to the parent, and `q`
+//! or Esc quits. The wheel scrolls the pane under the mouse. A failure, such
+//! as a directory that cannot be read, shows in the status line until the
+//! next key; a file that is not UTF-8 text is described, not shown.
+//!
+//! The file system is a capability of `update` alone. `Browser`'s effect
+//! row is `(fs: Fs)`: `update` reads directories and files, and `main`
+//! provides `fs` along with the terminal and the clock `run` needs. `view`
+//! has no access to the file system by construction: `App::view` declares
+//! the frame as its only effect, so the compiler rejects a read there, and
+//! the view draws only what `update` loaded into the model.
+use std::env::{Args, Env}
+use std::fs::{FileType, Fs}
+use std::io::{Display, Error, Read}
+use std::process::{Command, Spawn}
+use std::term::Tty
+use std::time::Clock
+use tui::prelude::*
+use tui::text::valid_up_to
+use tui::widgets::WHEEL_ROWS
+
+// The bytes of a file the preview reads: more than a screen shows.
+const PREVIEW_BYTES: usize = 8192
+
+/// An entry of the directory shown.
+pub struct Entry {
+    /// The file name, which need not be UTF-8.
+    pub name: MemBuffer,
+    /// The type of the file, or of the file a symbolic link leads to; a
+    /// link that leads nowhere is a `Symlink`.
+    pub kind: FileType,
+}
+
+impl Entry {
+    /// Whether the entry is a directory, or a link to one.
+    pub fn is_dir(self) -> bool {
+        match self.kind {
+            FileType::Dir => true,
+            _ => false,
+        }
+    }
+
+    // Whether this entry sorts before `other`: directories first, then by
+    // the bytes of the name.
+    fn before(self, _ other: Entry) -> bool {
+        if self.is_dir() != other.is_dir() {
+            self.is_dir()
+        } else {
+            self.name < other.name
+        }
+    }
+}
+
+/// The name, with a `/` after a directory's.
+impl Display for Entry {
+    fn fmt(self, _ out: mut MemBuffer) {
+        out.extend_from(self.name.span())
+        if self.is_dir() {
+            out.push(b'/')
+        }
+    }
+}
+
+/// The model: the directory shown, its entries and what is selected, and
+/// the preview `update` loaded for the selected entry.
+pub struct Browser {
+    /// The absolute path of the directory shown, without symbolic links.
+    pub dir: MemBuffer,
+    /// Its entries, directories first, each group by name.
+    pub entries: MemVec<Entry>,
+    pub list: ListState,
+    /// What the right pane shows of the selected entry.
+    pub preview: MemBuffer,
+    pub preview_scroll: ScrollState,
+    /// The area the preview was last drawn in, for the wheel.
+    pub preview_area: Rect,
+    /// The last failure, shown until the next key.
+    pub error: Option<MemBuffer>,
+}
+
+impl Browser {
+    /// A browser of the directory at `path`, with its first entry selected.
+    /// If it cannot be read, the browser shows no entries and the failure.
+    pub fn open<P: Display>(_ path: P) -> Self uses (fs: Fs) {
+        var browser = Browser {
+            dir: format!(path),
+            entries: MemVec::new(),
+            list: ListState::new(),
+            preview: MemBuffer::empty(),
+            preview_scroll: ScrollState::new(),
+            preview_area: Rect::ZERO,
+            error: Option::None,
+        }
+        match fs.canonicalize(path) {
+            Result::Ok(dir) => {
+                let _ = browser.change_dir(dir, select: Option::None)
+            },
+            Result::Err(error) => browser.error = Option::Some(format!(path, ": ", error)),
+        }
+        browser
+    }
+
+    // Shows the directory at the absolute path `dir` and selects its entry
+    // named `select`, or the first. If `dir` cannot be read, keeps what is
+    // shown and records the failure.
+    fn change_dir(mut self, _ dir: own MemBuffer, select: own Option<MemBuffer>) -> Flow
+    uses (fs: Fs)
+    {
+        match read_entries(dir) {
+            Result::Ok(entries) => {
+                self.entries = entries
+                self.dir = dir
+                // A new state: the old one's lengths are the old entries'.
+                self.list = ListState::new()
+                var index: usize = 0
+                if let Option::Some(name) = select {
+                    for (i, ref entry) in self.entries.enumerate() {
+                        if entry.name == name {
+                            index = i
+                        }
+                    }
+                }
+                if !self.entries.is_empty() {
+                    self.list.select(index)
+                }
+                self.load_preview()
+            },
+            Result::Err(error) => self.error = Option::Some(format!(dir, ": ", error)),
+        }
+        Flow::Redraw
+    }
+
+    // Opens the selected entry if it is a directory.
+    fn descend(mut self) -> Flow uses (fs: Fs) {
+        let index = match self.selected() {
+            Option::Some(index) => index,
+            Option::None => {
+                return Flow::Unchanged
+            },
+        }
+        if !self.entries[index].is_dir() {
+            return Flow::Unchanged
+        }
+        let path = join(self.dir.span(), self.entries[index].name.span())
+        self.change_dir(path, select: Option::None)
+    }
+
+    // Goes to the parent directory, selecting the one left.
+    fn ascend(mut self) -> Flow uses (fs: Fs) {
+        let slash = self.last_slash()
+        // The root is its own parent.
+        if slash + 1 == self.dir.len() {
+            return Flow::Unchanged
+        }
+        let name = MemBuffer::from_span(self.dir.span().tail(slash + 1))
+        let parent = MemBuffer::from_span(self.dir.span().head(if slash == 0 { 1 } else { slash }))
+        self.change_dir(parent, select: Option::Some(name))
+    }
+
+    // The index of the last `/` of `dir`, which is absolute, so has one.
+    fn last_slash(self) -> usize {
+        var slash = self.dir.len() - 1
+        while slash > 0 && self.dir[slash] != b'/' {
+            slash -= 1
+        }
+        slash
+    }
+
+    // The index of the selected entry, if it is one of the entries: the
+    // state's lengths are the last render's.
+    fn selected(self) -> Option<usize> {
+        let index = self.list.selected()?
+        if index < self.entries.len() {
+            Option::Some(index)
+        } else {
+            Option::None
+        }
+    }
+
+    // Loads the preview of the selected entry, or records why it cannot.
+    fn load_preview(mut self) uses (fs: Fs) {
+        self.preview = MemBuffer::empty()
+        self.preview_scroll = ScrollState::new()
+        let index = match self.selected() {
+            Option::Some(index) => index,
+            Option::None => {
+                return
+            },
+        }
+        let path = join(self.dir.span(), self.entries[index].name.span())
+        let loaded = match self.entries[index].kind {
+            FileType::Dir => match fs.read_dir(path) {
+                Result::Ok(entries) => Result::Ok(
+                    if entries.len() == 1 {
+                        format!("1 entry")
+                    } else {
+                        format!(entries.len(), " entries")
+                    },
+                ),
+                Result::Err(error) => Result::Err(error),
+            },
+            FileType::File => read_head(path),
+            FileType::Symlink => Result::Ok(format!("(a link to nothing)")),
+            FileType::Other => Result::Ok(format!("(a device, pipe or socket)")),
+        }
+        match loaded {
+            Result::Ok(text) => self.preview = text,
+            Result::Err(error) => {
+                self.error = Option::Some(format!(self.entries[index].name, ": ", error))
+            },
+        }
+    }
+}
+
+impl App for Browser {
+    uses E = (fs: Fs)
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        match event {
+            Event::Key(key) => {
+                self.error = Option::None
+                if self.list.handle_key(key) {
+                    self.load_preview()
+                    return Flow::Redraw
+                }
+                if key.kind != KeyKind::Press || !key.mods.is_empty() {
+                    return Flow::Redraw
+                }
+                match key.code {
+                    KeyCode::Enter | KeyCode::Right => self.descend(),
+                    KeyCode::Backspace | KeyCode::Left => self.ascend(),
+                    KeyCode::Char(b'q') | KeyCode::Esc => Flow::Quit,
+                    _ => Flow::Redraw,
+                }
+            },
+            Event::Mouse(mouse) => {
+                if self.list.handle_mouse(mouse).is_some() {
+                    self.load_preview()
+                } else if self.preview_area.contains(mouse.pos) {
+                    match mouse.kind {
+                        MouseKind::ScrollDown => self.preview_scroll.scroll_by(WHEEL_ROWS as isize),
+                        MouseKind::ScrollUp => self.preview_scroll
+                            .scroll_by(-(WHEEL_ROWS as isize)),
+                        _ => {},
+                    }
+                }
+                Flow::Redraw
+            },
+            _ => Flow::Unchanged,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let (body, status) = area.rows((Fill(1), Length(1)))
+        let (left, right) = body.columns((Percent(40), Fill(1)))
+        // The directory's name, or `/` for the root.
+        let slash = self.last_slash()
+        let start = if slash + 1 == self.dir.len() {
+            0
+        } else {
+            slash + 1
+        }
+        let names = Block::bordered().render_titled(left, self.dir.span().tail(start))
+        List::new()
+            .highlight_symbol("> ")
+            .placeholder("(empty)")
+            .render(names, self.entries, mut self.list)
+        self.preview_area = Block::bordered().render_titled(right, "Preview")
+        Paragraph::new().render_scrolled(self.preview_area, self.preview, mut self.preview_scroll)
+        let theme = theme()
+        match self.error {
+            Option::Some(ref error) => print(status.pos(), error, theme.error),
+            Option::None => print(
+                status.pos(),
+                "Enter open  Backspace up  q quit",
+                theme.muted,
+            ),
+        }
+    }
+}
+
+pub fn main() -> i32 uses (tty: mut Tty, clock: Clock, fs: Fs, args: Args) {
+    var browser = if args.count() > 1 {
+        Browser::open(args.get(1))
+    } else {
+        Browser::open(".")
+    }
+    match run(mut browser, Options::new().mouse(MouseTracking::Clicks)) {
+        Result::Ok(()) => 0,
+        Result::Err(_) => 1,
+    }
+}
+
+// The entries of the directory at `dir`, directories first, each group by
+// name.
+fn read_entries(_ dir: MemBuffer) -> Result<Error, MemVec<Entry>>
+uses (fs: Fs)
+{
+    var entries: MemVec<Entry> = MemVec::new()
+    for ref found in fs.read_dir(dir)? {
+        let name = MemBuffer::from_span(found.name())
+        let kind = match found.file_type() {
+            FileType::Symlink => match fs.metadata(join(dir.span(), name.span())) {
+                Result::Ok(metadata) => metadata.file_type(),
+                Result::Err(_) => FileType::Symlink,
+            },
+            kind => kind,
+        }
+        // Insert in order: a directory holds few enough entries.
+        entries.push(Entry { name, kind })
+        var i = entries.len() - 1
+        while i > 0 && entries[i].before(entries[i - 1]) {
+            entries.swap(i - 1, i)
+            i -= 1
+        }
+    }
+    Result::Ok(entries)
+}
+
+// The path of `name` in the directory `dir`.
+fn join(_ dir: MemSpan, _ name: MemSpan) -> MemBuffer {
+    var path = MemBuffer::from_span(dir)
+    if path.is_empty() || path[path.len() - 1] != b'/' {
+        path.push(b'/')
+    }
+    path.extend_from(name)
+    path
+}
+
+// The text of the first bytes of the file at `path`, or a description of
+// them if they are not UTF-8 text.
+fn read_head(_ path: MemBuffer) -> Result<Error, MemBuffer> uses (fs: Fs) {
+    var file = fs.open(path)?
+    var bytes = MemBuffer::new(PREVIEW_BYTES)
+    var filled: usize = 0
+    while filled < PREVIEW_BYTES {
+        let count = file.read(mut bytes.span().tail(filled))?
+        if count == 0 { break }
+        filled += count
+    }
+    bytes.truncate(filled)
+    Result::Ok(printable(bytes, cut: filled == PREVIEW_BYTES))
+}
+
+// What the preview shows of `bytes`, a file's first bytes and the whole
+// file unless `cut`: the text with tabs as spaces and without carriage
+// returns, or a description if it is not UTF-8 text.
+fn printable(_ bytes: MemBuffer, cut: bool) -> MemBuffer {
+    if bytes.is_empty() {
+        return format!("(empty)")
+    }
+    let valid = valid_up_to(bytes.span())
+    // The read may have cut the last scalar.
+    let text = if cut && bytes.len() - valid < 4 {
+        valid
+    } else {
+        bytes.len()
+    }
+    var shown = MemBuffer::empty()
+    for byte in bytes.span().head(text) {
+        match byte {
+            0 => {
+                return format!("(binary, not text)")
+            },
+            b'\t' => write!(mut shown, "    "),
+            b'\r' => {},
+            byte => shown.push(byte),
+        }
+    }
+    if valid < text {
+        return format!("(not UTF-8 text)")
+    }
+    shown
+}
+
+// A fresh, empty directory for the test `name`, under the scratch
+// directory of the TUI project: never `/tmp`, which is memory here.
+fn scratch_dir<N: Display>(_ name: N) -> MemBuffer
+uses (env: Env, fs: mut Fs, proc: mut Spawn)
+{
+    let home = env.lookup("HOME").unwrap()
+    let root = format!(home, "/.cache/fe-tui/f1/files-test/", name)
+    remove(root)
+    fs.create_dir_all(root).unwrap()
+    fs.canonicalize(root).unwrap()
+}
+
+// Removes the tree at `path`: `std::fs` has no removal, so `rm` does it.
+fn remove(_ path: MemBuffer) uses (proc: mut Spawn) {
+    assert(
+        proc.output(Command::new("rm").arg("-rf").arg(path)).unwrap().status.success(),
+    )
+}
+
+// Builds a tree in `root`: two directories, a text file with a tab and a
+// carriage return, a binary file, a file that is not UTF-8, an empty file
+// and a symbolic link to nothing.
+fn build_tree(_ root: MemBuffer) uses (fs: mut Fs, proc: mut Spawn) {
+    fs.create_dir_all(format!(root, "/docs")).unwrap()
+    fs.create_dir_all(format!(root, "/empty")).unwrap()
+    fs.write(
+        format!(root, "/docs/a.txt"),
+        format!("inside docs\n").span(),
+    ).unwrap()
+    fs.write(
+        format!(root, "/notes.txt"),
+        format!("first line\n\tindented\r\nthird\n").span(),
+    )
+        .unwrap()
+    var blob = MemBuffer::empty()
+    write!(mut blob, "ELF")
+    blob.push(0)
+    blob.push(1)
+    fs.write(format!(root, "/blob.bin"), blob.span()).unwrap()
+    var latin1 = MemBuffer::empty()
+    write!(mut latin1, "caf")
+    latin1.push(0xe9)
+    fs.write(format!(root, "/latin1.txt"), latin1.span()).unwrap()
+    fs.write(format!(root, "/zero.txt"), MemBuffer::empty().span()).unwrap()
+    let linked = proc
+        .output(
+            Command::new("ln").arg("-s").arg("missing").arg(format!(root, "/link")),
+        )
+    assert(linked.unwrap().status.success())
+}
+
+#[test]
+fn directories_come_first_and_the_selection_is_previewed()
+uses (env: Env, fs: mut Fs, proc: mut Spawn)
+{
+    let root = scratch_dir("listing")
+    build_tree(root)
+    var harness = Harness::new(Browser::open(root), Size::new(width: 44, height: 9))
+    assert(
+        harness.screen()
+            == "┌listing────────┐┌Preview──────────────────┐\n│> docs/        ││1 entry                  │\n│  empty/       ││                         │\n│  blob.bin     ││                         │\n│  latin1.txt   ││                         │\n│  link         ││                         │\n│  notes.txt    ││                         │\n└───────────────┘└─────────────────────────┘\nEnter open  Backspace up  q quit",
+    )
+    harness.key(KeyCode::Down)
+    assert(harness.app().preview == "0 entries")
+    harness.key(KeyCode::Down)
+    assert(harness.app().preview == "(binary, not text)")
+    harness.key(KeyCode::Down)
+    assert(harness.app().preview == "(not UTF-8 text)")
+    harness.key(KeyCode::Down)
+    assert(harness.app().preview == "(a link to nothing)")
+    harness.key(KeyCode::Down)
+    // Tabs become spaces, and carriage returns go.
+    assert(
+        harness.screen()
+            == "┌listing────────┐┌Preview──────────────────┐\n│  docs/        ││first line               │\n│  empty/       ││    indented             │\n│  blob.bin     ││third                    │\n│  latin1.txt   ││                         │\n│  link         ││                         │\n│> notes.txt    ││                         │\n└───────────────┘└─────────────────────────┘\nEnter open  Backspace up  q quit",
+    )
+    // The last entry scrolls into view.
+    harness.key(KeyCode::End)
+    assert(
+        harness.app().preview == "(empty)" && harness.app().list.scroll().position() == 1,
+    )
+    assert(harness.app().error.is_none())
+    remove(root)
+}
+
+#[test]
+fn enter_descends_and_backspace_returns_to_the_directory_left()
+uses (env: Env, fs: mut Fs, proc: mut Spawn)
+{
+    let root = scratch_dir("descend")
+    build_tree(root)
+    var harness = Harness::new(Browser::open(root), Size::new(width: 44, height: 9))
+    harness.key(KeyCode::Enter)
+    assert(
+        harness.screen()
+            == "┌docs───────────┐┌Preview──────────────────┐\n│> a.txt        ││inside docs              │\n│               ││                         │\n│               ││                         │\n│               ││                         │\n│               ││                         │\n│               ││                         │\n└───────────────┘└─────────────────────────┘\nEnter open  Backspace up  q quit",
+    )
+    // Enter on a file does nothing.
+    harness.key(KeyCode::Enter)
+    assert(harness.app().entries.len() == 1)
+    harness.key(KeyCode::Backspace)
+    harness.key(KeyCode::Down)
+    harness.key(KeyCode::Right)
+    // An empty directory shows its placeholder.
+    assert(
+        harness.app().entries.is_empty() && harness.app().preview.is_empty(),
+    )
+    harness.key(KeyCode::Left)
+    assert(
+        harness.app().dir == root && harness.app().list.selected() == Option::Some(1),
+    )
+    harness.key(KeyCode::Char(b'q'))
+    assert(harness.quit_requested())
+    remove(root)
+}
+
+#[test]
+fn the_root_is_its_own_parent() uses (fs: Fs) {
+    var harness = Harness::new(Browser::open("/"), Size::new(width: 30, height: 6))
+    harness.key(KeyCode::Backspace)
+    assert(harness.app().dir == "/" && harness.app().error.is_none())
+}
+
+#[test]
+fn failures_show_in_the_status_line_until_the_next_key()
+uses (env: Env, fs: mut Fs, proc: mut Spawn)
+{
+    let root = scratch_dir("failures")
+    build_tree(root)
+    let missing = format!(root, "/missing")
+    var opened = Harness::new(Browser::open(missing), Size::new(width: 44, height: 4))
+    let reason = fs.canonicalize(missing).err().unwrap()
+    assert(
+        opened.app().error == Option::Some(format!(missing, ": ", reason)),
+    )
+    assert(opened.app().entries.is_empty())
+
+    // A directory that goes away after it is listed.
+    var harness = Harness::new(Browser::open(root), Size::new(width: 80, height: 6))
+    let gone = format!(root, "/docs")
+    remove(gone)
+    harness.key(KeyCode::Enter)
+    let reason = fs.read_dir(gone).err().unwrap()
+    let message = format!(gone, ": ", reason)
+    assert(harness.app().error == Option::Some(message))
+    // What was shown stays.
+    assert(
+        harness.app().dir == root && harness.app().entries.len() == 7,
+    )
+    harness.key(KeyCode::Down)
+    assert(harness.app().error.is_none())
+    remove(root)
+}
+
+// A mouse event of `kind` at column `x` and row `y`.
+fn mouse(_ kind: MouseKind, x: u16, y: u16) -> Event {
+    Event::Mouse(Mouse::new(kind, Pos::new(x, y), Modifiers::NONE))
+}
+
+#[test]
+fn clicks_select_and_the_wheel_scrolls()
+uses (env: Env, fs: mut Fs, proc: mut Spawn)
+{
+    let root = scratch_dir("mouse")
+    build_tree(root)
+    var lines = MemBuffer::empty()
+    for i in 1 .. 11 {
+        write!(mut lines, "line ", i, "\n")
+    }
+    fs.write(format!(root, "/lines.txt"), lines.span()).unwrap()
+    let options = Options::new().mouse(MouseTracking::Clicks)
+    let size = Size::new(width: 44, height: 6)
+    var harness = Harness::with_options(Browser::open(root), size, options)
+    // The list shows three rows; a click on the third selects `blob.bin`.
+    harness.send(mouse(MouseKind::Down(MouseButton::Left), x: 3, y: 3))
+    assert(harness.app().list.selected() == Option::Some(2))
+    assert(harness.app().preview == "(binary, not text)")
+    // The wheel scrolls the view and leaves the selection.
+    harness.send(mouse(MouseKind::ScrollDown, x: 3, y: 2))
+    assert(harness.app().list.scroll().position() == 3)
+    assert(harness.app().list.selected() == Option::Some(2))
+    harness.send(mouse(MouseKind::Down(MouseButton::Left), x: 3, y: 2))
+    assert(
+        harness.app().list.selected() == Option::Some(4) && harness.app().preview == lines,
+    )
+    // The wheel over the preview scrolls it.
+    harness.send(mouse(MouseKind::ScrollDown, x: 20, y: 2))
+    assert(harness.app().preview_scroll.position() == 3)
+    assert(
+        harness.screen()
+            == "┌mouse──────────┐┌Preview──────────────────┐\n│  latin1.txt   ││line 4                   │\n│> lines.txt    ││line 5                   │\n│  link         ││line 6                   │\n└───────────────┘└─────────────────────────┘\nEnter open  Backspace up  q quit",
+    )
+    remove(root)
+}
+
+#[test]
+fn names_that_are_not_utf8_are_shown_replaced()
+uses (env: Env, fs: mut Fs, proc: mut Spawn)
+{
+    let root = scratch_dir("names")
+    var path = format!(root, "/caf")
+    path.push(0xe9)
+    fs.write(path, format!("text\n").span()).unwrap()
+    var harness = Harness::new(Browser::open(root), Size::new(width: 30, height: 4))
+    assert(
+        harness.screen()
+            == "┌names─────┐┌Preview─────────┐\n│> caf�    ││text            │\n└──────────┘└────────────────┘\nEnter open  Backspace up  q qu",
+    )
+    remove(root)
+}
+
+#[test]
+fn tiny_screens_do_not_panic() uses (env: Env, fs: mut Fs, proc: mut Spawn) {
+    let root = scratch_dir("tiny")
+    build_tree(root)
+    var harness = Harness::new(Browser::open(root), Size::new(width: 44, height: 9))
+    harness.resize(Size::new(width: 3, height: 2))
+    harness.key(KeyCode::Down)
+    harness.resize(Size::new(width: 0, height: 0))
+    harness.key(KeyCode::Enter)
+    harness.resize(Size::new(width: 20, height: 4))
+    assert(
+        harness.screen()
+            == "┌empty─┐┌Preview───┐\n│(empty││          │\n└──────┘└──────────┘\nEnter open  Backspac",
+    )
+    remove(root)
+}
+
+#[test]
+fn a_cut_scalar_at_the_end_of_a_read_is_text() {
+    var bytes = MemBuffer::empty()
+    write!(mut bytes, "caf")
+    bytes.push(0xc3)
+    assert(printable(bytes, cut: true) == "caf")
+    assert(printable(bytes, cut: false) == "(not UTF-8 text)")
+}
