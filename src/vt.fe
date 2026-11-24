@@ -274,6 +274,7 @@ impl Vt {
         }
     }
 
+    /// The columns and rows of the screen.
     pub fn size(self) -> Size {
         self.size
     }

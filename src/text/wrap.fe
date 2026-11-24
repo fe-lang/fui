@@ -60,6 +60,7 @@ pub struct Wrap { width: usize, mode: WrapMode }
 impl Copy for Wrap {}
 
 impl Wrap {
+    /// The wrap of text to `width` columns, breaking lines as `mode` says.
     pub fn new(width: usize, mode: WrapMode) -> Self {
         Wrap { width, mode }
     }

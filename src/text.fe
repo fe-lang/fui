@@ -28,6 +28,7 @@ const VS16: u32 = 0xfe0f
 
 /// A Unicode scalar decoded from UTF-8, and the bytes it took.
 pub struct Scalar {
+    /// The scalar, or U+FFFD for an invalid sequence.
     pub value: u32,
     /// Its bytes: 1 to 4.
     pub len: usize,
