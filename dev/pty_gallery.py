@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""End-to-end checks of the `gallery` and `panic` examples on a pseudo-terminal.
+"""End-to-end checks of the `gallery`, `panic` and `listen` examples on a
+pseudo-terminal.
 
-Usage: dev/pty_gallery.py <gallery executable> <panic executable>
+Usage: dev/pty_gallery.py <gallery executable> <panic executable> <listen executable>
 
 Runs each program under a pty as `pty_check.py` runs the counter, with its
 terminal emulator. For the gallery: the first frame turns on mouse reports,
@@ -10,17 +11,22 @@ a row and another a tab, a window size change redraws at the new size, and
 `q` ends it with the terminal restored. For the panic example: a panic while
 the app holds the terminal restores it (modes and attributes) before the
 panic report, which shows after the restore sequence on the main screen.
+For the listen example, which runs its own loop on a poller: a TCP
+connection to the port in its title is listed, keys still work, and `q`
+ends it with the terminal restored.
 Prints a PASS or FAIL line per check and exits non-zero if any failed.
 Standard library only.
 """
 
 import os
+import re
+import socket
 import sys
 import termios
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pty_check  # noqa: E402
-from pty_check import CSI, Run, check_exit, in_session, report, row_of  # noqa: E402
+from pty_check import CSI, TIMEOUT, Run, check_exit, in_session, report, row_of  # noqa: E402
 
 
 def click(run, x, y):
@@ -95,12 +101,35 @@ def check_panic(path):
         run.close()
 
 
+def check_listen(path):
+    run = Run(path, 50, 8)
+    try:
+        report(run.until(lambda: row_of(run.vt, "No connections yet") is not None), "listen: the first frame is drawn")
+        title = re.search(r"127\.0\.0\.1:(\d+)", run.vt.screen.text())
+        report(title is not None, "listen: the title shows the port")
+        for _ in range(2):
+            socket.create_connection(("127.0.0.1", int(title.group(1))), timeout=TIMEOUT).close()
+        report(run.until(lambda: row_of(run.vt, "2 accepted") is not None and row_of(run.vt, "No connections") is None),
+               "listen: the connections are listed")
+        run.send(CSI + b"B")
+        report(run.until(lambda: row_of(run.vt, "> 127.0.0.1") is not None),
+               "listen: keys reach the list")
+        run.settle()
+        run.set_mark()
+        run.send(b"q")
+        check_exit(run, "listen: q")
+    finally:
+        run.close()
+
+
 def main():
-    if len(sys.argv) != 3:
-        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+    if len(sys.argv) != 4:
+        print(__doc__.strip().splitlines()[3], file=sys.stderr)
         return 2
-    gallery, panic = (os.path.abspath(p) for p in sys.argv[1:])
-    failed = in_session(check_gallery, gallery) + in_session(check_panic, panic)
+    gallery, panic, listen = (os.path.abspath(p) for p in sys.argv[1:])
+    failed = (
+        in_session(check_gallery, gallery) + in_session(check_panic, panic) + in_session(check_listen, listen)
+    )
     print("all checks passed" if failed == 0 else f"{failed} checks failed", flush=True)
     return 1 if failed else 0
 
