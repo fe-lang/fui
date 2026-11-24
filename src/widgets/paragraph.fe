@@ -4,11 +4,11 @@ use ingot::buffer::cell_at
 use ingot::frame::{Frame, StyledText, frame_of, set_style, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Style}
-use ingot::text::{Alignment, Line, Text, Wrap, WrapMode, WrappedLine}
+use ingot::text::{Alignment, Line, Lines, Wrap, WrapMode, WrappedLine}
 use super::scroll::ScrollState
 
 /// Text in an area: plain text, a styled `text::Line`, or the lines of a
-/// `text::Text`, wrapped to the area's width or cut at it, and aligned.
+/// `text::Lines`, wrapped to the area's width or cut at it, and aligned.
 ///
 /// ```fe
 /// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
@@ -19,7 +19,7 @@ use super::scroll::ScrollState
 /// ```
 ///
 /// `render` takes anything `Display` and draws it in the paragraph's style;
-/// `render_styled` takes `StyledText`, so each run of a `Line` or `Text`
+/// `render_styled` takes `StyledText`, so each run of a `Line` or `Lines`
 /// keeps its style, across the breaks wrapping makes, applied over the
 /// paragraph's. Byte spans are `StyledText` too, so text already in memory
 /// is drawn where it is.
@@ -28,7 +28,7 @@ use super::scroll::ScrollState
 /// With wrapping each line breaks into rows as `text::Wrap` breaks it, and
 /// each row is aligned on its own. Without, each line takes one row, cut
 /// after its last cluster that fits, and `scroll_x` shifts every line left
-/// by that many columns. Every empty line of a `Text` or `Line` takes a
+/// by that many columns. Every empty line of a `Lines` or `Line` takes a
 /// row, and empty bytes take none. Controls are not drawn (see `buffer`),
 /// though `Wrap` counts a tab as a column: replace tabs before drawing.
 ///
@@ -314,7 +314,7 @@ fn rows_align_on_their_own() {
 
 #[test]
 fn texts_draw_each_line_and_empty_lines_take_rows() {
-    var text = Text::new()
+    var text = Lines::new()
     text.push_line(Line::styled("ab", Style::new().fg(Color::RED)))
     text.push_line(Line::new())
     text.push_line(Line::styled("cd", Style::new().fg(Color::BLUE)))
@@ -346,7 +346,7 @@ fn empty_text_and_a_final_line_break_start_no_row() {
     assert(ended.content() == 2)
     assert(frame.buffer().to_text() == "a\nb\n")
     let paragraph = Paragraph::new()
-    assert(paragraph.rows(Text::from("x\n\ny\n"), width: 5) == 3)
+    assert(paragraph.rows(Lines::from("x\n\ny\n"), width: 5) == 3)
     assert(paragraph.rows(Line::new(), width: 5) == 1)
 }
 

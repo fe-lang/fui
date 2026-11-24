@@ -14,7 +14,7 @@
 use core::{MemBuffer, MemSpan}
 use tables::PROPERTIES
 
-pub use styled::{Alignment, Line, Run, Text}
+pub use styled::{Alignment, Line, Run, Lines}
 pub use tables::UNICODE_VERSION
 pub use wrap::{Wrap, WrapMode, WrapState, WrappedLine}
 

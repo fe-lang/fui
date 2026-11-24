@@ -65,7 +65,7 @@ impl Copy for Stored {}
 /// run.end - run.start), run.style) }`.
 ///
 /// A line holds no line breaks: an LF in it is a control, which takes no
-/// column. `Text::from` splits text into lines.
+/// column. `Lines::from` splits text into lines.
 pub struct Line { text: MemBuffer, runs: MemVec<Stored> }
 
 impl Line {
@@ -172,12 +172,12 @@ impl Display for Line {
 }
 
 /// Lines of styled text, top to bottom.
-pub struct Text { lines: MemVec<Line> }
+pub struct Lines { lines: MemVec<Line> }
 
-impl Text {
+impl Lines {
     /// A text without lines.
     pub fn new() -> Self {
-        Text { lines: MemVec::new() }
+        Lines { lines: MemVec::new() }
     }
 
     /// The lines of `value`'s text with no style, split at each LF and
@@ -187,7 +187,7 @@ impl Text {
         var bytes = MemBuffer::empty()
         value.fmt(mut bytes)
         let all = bytes.span()
-        var text = Text::new()
+        var text = Lines::new()
         var start: usize = 0
         var offset: usize = 0
         while offset < all.len() {

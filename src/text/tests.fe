@@ -5,7 +5,7 @@ use super::{
     Cluster,
     Line,
     REPLACEMENT_CHARACTER,
-    Text,
+    Lines,
     Wrap,
     WrapMode,
     WrappedLine,
@@ -512,14 +512,14 @@ fn lines_from_values() {
 
 #[test]
 fn texts_split_into_lines() {
-    let text = Text::from("a\nbc\r\n\n中文d")
+    let text = Lines::from("a\nbc\r\n\n中文d")
     assert(text.height() == 4 && text.width() == 5)
     assert(
         text.lines()[1].text() == "bc" && text.lines()[2].is_empty(),
     )
-    assert(Text::from("").height() == 0)
-    assert(Text::from("a\n").height() == 1)
-    var built = Text::new()
+    assert(Lines::from("").height() == 0)
+    assert(Lines::from("a\n").height() == 1)
+    var built = Lines::new()
     built.push_line(Line::from("xyz"))
     assert(built.height() == 1 && built.width() == 3)
     built.clear()

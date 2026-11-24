@@ -44,7 +44,16 @@ use std::io::Display
 use super::buffer::{Buffer, cell_at}
 use super::geom::{Pos, Rect, Size}
 use super::style::{Color, Modifier, Style}
-use super::text::{Alignment, Line, Run, Text, next_cluster, truncate, truncate_with_ellipsis, width}
+use super::text::{
+    Alignment,
+    Line,
+    Run,
+    Lines,
+    next_cluster,
+    truncate,
+    truncate_with_ellipsis,
+    width,
+}
 use super::theme::Theme
 
 /// The surface view code draws on: a buffer, the clip rectangle drawing
@@ -377,7 +386,7 @@ impl Frame {
 
 /// Styled text a frame draws: lines of bytes, each in runs of styles that
 /// cover its bytes in order, the last run taking any bytes after the
-/// others. `Line` is one line, `Text` holds its lines, and bytes
+/// others. `Line` is one line, `Lines` holds its lines, and bytes
 /// (`MemSpan`) are one line in no style. Widgets such as `Paragraph` lay a
 /// line out as `text::Wrap` reads it, so line breaks in a line's bytes end
 /// its rows there.
@@ -415,7 +424,7 @@ impl StyledText for Line {
 }
 
 /// Its lines, top to bottom.
-impl StyledText for Text {
+impl StyledText for Lines {
     fn line_count(self) -> usize {
         self.height()
     }
@@ -965,7 +974,7 @@ fn cut_lines_may_end_in_an_ellipsis() {
 fn lines_may_be_bytes_or_the_first_line_of_a_text() {
     var frame = frame_of(width: 5, height: 3)
     let bytes = format!("abcdefg")
-    let text = Text::from("first\nsecond")
+    let text = Lines::from("first\nsecond")
     assert(
         frame
                 .print_line_with_ellipsis(
