@@ -1,0 +1,511 @@
+//! What a `Session` needs from a terminal, and two terminals that give it.
+//!
+//! `TermBackend` is the process's terminal, `std::term::Terminal`, and the
+//! host's monotonic clock. `TestBackend` is a scripted terminal for tests:
+//! what a program writes goes to a `Vt`, which shows the screen a terminal
+//! would, and its input, signals, resizes and hangup come at the times a
+//! script gives them, on a clock of its own that only waiting moves.
+use core::{MemBuffer, MemSpan, MemVec, Option, Result}
+use std::io::{Error, ErrorKind, Write}
+use std::term::{Ready, Signal, Terminal, Tty}
+use std::time::{Clock, Duration, Instant}
+use ingot::geom::Size
+use ingot::vt::Vt
+
+/// A terminal as a `Session` uses it: its size, output, input and signals,
+/// raw mode, job control, and a clock.
+///
+/// The methods mirror `std::term::Terminal`'s, and only `now` takes
+/// effects: `E`, the effects the backend's clock needs. So a session
+/// declares none of the host's capabilities itself, and one over a
+/// `TestBackend` needs none at all.
+pub trait Backend {
+    /// The effects `now` needs: `TermBackend`'s are `(clock: Clock)`.
+    uses E
+
+    /// The window's size in cells. A terminal that doesn't know it, such as
+    /// a new pseudo-terminal, has zero columns and rows.
+    fn size(self) -> Result<Error, Size>
+
+    /// Writes all of `bytes` to the terminal.
+    fn write_all(mut self, _ bytes: MemSpan) -> Result<Error, ()>
+
+    /// Waits until the terminal has input or has hung up, or a signal is
+    /// waiting, or `timeout` has passed if there is one.
+    fn wait(mut self, _ timeout: Option<Duration>) -> Result<Error, Ready>
+
+    /// Appends the input that has come to `buf` without waiting: the number
+    /// of bytes, zero if none has. Once the terminal has hung up and has no
+    /// more input, an `UnexpectedEof` error.
+    fn read_available(mut self, _ buf: mut MemBuffer) -> Result<Error, usize>
+
+    /// Takes the next signal that is waiting, or `None`.
+    fn next_signal(mut self) -> Result<Error, Option<Signal>>
+
+    /// Sets the bytes that leaving raw mode writes, on any path, to
+    /// `restore`, then enters raw mode.
+    fn enter_raw(mut self, _ restore: MemSpan) -> Result<Error, ()>
+
+    /// Leaves raw mode, writing the restore bytes first. Nothing if not in
+    /// raw mode.
+    fn leave_raw(mut self) -> Result<Error, ()>
+
+    /// Leaves raw mode, stops the process as Ctrl-Z does outside raw mode,
+    /// and once it continues enters raw mode again. The screen then needs
+    /// its setup and its contents again.
+    fn suspend(mut self) -> Result<Error, ()>
+
+    /// The time since the backend began, by a clock that never goes back.
+    fn now(self) -> Duration uses E
+}
+
+/// The process's terminal and the host's monotonic clock.
+pub struct TermBackend { terminal: Terminal, origin: Instant }
+
+impl TermBackend {
+    /// Opens the process's terminal; see `Tty::open`.
+    pub fn open() -> Result<Error, Self> uses (tty: mut Tty, clock: Clock) {
+        Result::Ok(
+            TermBackend { terminal: tty.open()?, origin: clock.instant() },
+        )
+    }
+
+    /// A backend over a terminal the program opened.
+    pub fn new(_ terminal: own Terminal) -> Self uses (clock: Clock) {
+        TermBackend { terminal, origin: clock.instant() }
+    }
+
+    /// The terminal.
+    pub fn terminal(mut? self) -> mut? Terminal {
+        mut? self.terminal
+    }
+}
+
+impl Backend for TermBackend {
+    uses E = (clock: Clock)
+
+    fn size(self) -> Result<Error, Size> {
+        let size = self.terminal.size()?
+        Result::Ok(Size::new(width: size.columns, height: size.rows))
+    }
+
+    fn write_all(mut self, _ bytes: MemSpan) -> Result<Error, ()> {
+        self.terminal.write_all(bytes)
+    }
+
+    fn wait(mut self, _ timeout: Option<Duration>) -> Result<Error, Ready> {
+        self.terminal.wait(timeout)
+    }
+
+    fn read_available(mut self, _ buf: mut MemBuffer) -> Result<Error, usize> {
+        self.terminal.read_available(mut buf)
+    }
+
+    fn next_signal(mut self) -> Result<Error, Option<Signal>> {
+        self.terminal.next_signal()
+    }
+
+    fn enter_raw(mut self, _ restore: MemSpan) -> Result<Error, ()> {
+        self.terminal.set_restore_bytes(restore)
+        self.terminal.enter_raw()
+    }
+
+    fn leave_raw(mut self) -> Result<Error, ()> {
+        self.terminal.leave_raw()
+    }
+
+    fn suspend(mut self) -> Result<Error, ()> {
+        self.terminal.suspend()
+    }
+
+    fn now(self) -> Duration uses E {
+        clock.instant().duration_since(self.origin)
+    }
+}
+
+// What a script makes happen.
+enum Step {
+    Input(MemBuffer),
+    Signal(Signal),
+    Resize(Size),
+    Hangup,
+}
+
+/// A scripted terminal for tests.
+///
+/// Output goes to a `Vt`, so a test reads the screen a terminal would show
+/// (`vt()`), and is kept as written (`output()`). Input, signals, resizes
+/// and a hangup are scripted: `push_input`, `push_signal`, `push_resize`
+/// and `push_hangup` add a step at the script's time, which starts at zero
+/// and which `pause` moves on. The backend's clock, `now`, moves only by
+/// waiting: `wait` moves it to the next step's time, or by its whole
+/// timeout if no step comes sooner. A step's input, signal or resize
+/// arrives once the clock reaches its time, and a step added while the
+/// clock is past the script's time comes at the clock's time.
+///
+/// A `wait` without a timeout when the script has no step left hangs the
+/// terminal up, as a real one would never return: so a loop over a
+/// finished script ends with `Event::Terminate`.
+///
+/// Raw mode, restore bytes and stops are modelled: leaving raw mode and
+/// `suspend` write the restore bytes to the `Vt`, and `stops()` counts the
+/// times the process would have stopped.
+pub struct TestBackend {
+    vt: Vt,
+    output: MemBuffer,
+    writes: usize,
+    // The size `size()` reports, which may differ from the `Vt`'s while a
+    // resize is applied.
+    size: Size,
+    now: Duration,
+    // The script's time: when the next step added comes.
+    script_at: Duration,
+    steps: MemVec<Step>,
+    times: MemVec<Duration>,
+    // The first step that has not come.
+    next: usize,
+    // Input that has come and not been read, and signals that wait.
+    input: MemBuffer,
+    signals: MemVec<Signal>,
+    hung_up: bool,
+    raw: bool,
+    restore: MemBuffer,
+    stops: usize,
+    restored_at_stops: bool,
+}
+
+impl TestBackend {
+    /// A terminal of `size` showing a blank screen, with nothing scripted.
+    pub fn new(_ size: Size) -> Self {
+        TestBackend {
+            vt: Vt::new(size),
+            output: MemBuffer::empty(),
+            writes: 0,
+            size,
+            now: Duration::from_nanos(0),
+            script_at: Duration::from_nanos(0),
+            steps: MemVec::new(),
+            times: MemVec::new(),
+            next: 0,
+            input: MemBuffer::empty(),
+            signals: MemVec::new(),
+            hung_up: false,
+            raw: false,
+            restore: MemBuffer::empty(),
+            stops: 0,
+            restored_at_stops: true,
+        }
+    }
+
+    /// Moves the script's time on by `duration`: steps added later come
+    /// that much after those added before.
+    pub fn pause(mut self, _ duration: Duration) {
+        self.script_at = self.script_at + duration
+    }
+
+    /// Adds input: the terminal sends `bytes`.
+    pub fn push_input(mut self, _ bytes: MemSpan) {
+        self.push(Step::Input(MemBuffer::from_span(bytes)))
+    }
+
+    /// Adds a signal to the process.
+    pub fn push_signal(mut self, _ signal: Signal) {
+        self.push(Step::Signal(signal))
+    }
+
+    /// Adds a resize of the window to `size`, which sends `Signal::Resize`.
+    pub fn push_resize(mut self, _ size: Size) {
+        self.push(Step::Resize(size))
+    }
+
+    /// Adds a hangup: the terminal goes away, and its input ends after what
+    /// came before.
+    pub fn push_hangup(mut self) {
+        self.push(Step::Hangup)
+    }
+
+    /// The screen.
+    pub fn vt(self) -> ref Vt {
+        ref self.vt
+    }
+
+    /// Every byte written, in order.
+    pub fn output(self) -> ref MemSpan {
+        self.output.span()
+    }
+
+    /// Empties `output()`.
+    pub fn clear_output(mut self) {
+        self.output.clear()
+    }
+
+    /// The number of `write_all` calls.
+    pub fn writes(self) -> usize {
+        self.writes
+    }
+
+    /// Whether the terminal is in raw mode.
+    pub fn is_raw(self) -> bool {
+        self.raw
+    }
+
+    /// The bytes leaving raw mode writes.
+    pub fn restore_bytes(self) -> ref MemSpan {
+        self.restore.span()
+    }
+
+    /// The number of times `suspend` stopped the process.
+    pub fn stops(self) -> usize {
+        self.stops
+    }
+
+    /// Whether the screen was restored, as `is_restored` tells, each time
+    /// the process stopped.
+    pub fn restored_at_stops(self) -> bool {
+        self.restored_at_stops
+    }
+
+    /// Whether the screen is in the state a shell expects: the main screen,
+    /// the cursor shown, no mouse, focus, paste or synchronized output mode
+    /// on, and no kitty keyboard flags pushed.
+    pub fn is_restored(self) -> bool {
+        let vt = ref self.vt
+        vt.cursor_visible()
+            && !vt.alternate_screen()
+            && vt.keyboard_depth() == 0
+            && vt.keyboard_flags() == 0
+            && !vt.mode(1000)
+            && !vt.mode(1002)
+            && !vt.mode(1003)
+            && !vt.mode(1004)
+            && !vt.mode(1006)
+            && !vt.mode(2004)
+            && !vt.mode(2026)
+    }
+
+    fn push(mut self, _ step: own Step) {
+        if self.now > self.script_at {
+            self.script_at = self.now
+        }
+        self.steps.push(step)
+        self.times.push(self.script_at)
+    }
+
+    // Makes the steps whose time has come happen.
+    fn arrive(mut self) {
+        while self.next < self.steps.len() && self.times[self.next] <= self.now {
+            let step = self.steps.replace(self.next, Step::Hangup)
+            self.next += 1
+            match step {
+                Step::Input(bytes) => self.input.extend_from(bytes.span()),
+                Step::Signal(signal) => self.raise(signal),
+                Step::Resize(size) => {
+                    self.size = size
+                    self.vt.resize(size)
+                    self.raise(Signal::Resize)
+                },
+                Step::Hangup => self.hung_up = true,
+            }
+        }
+    }
+
+    // Queues `signal`, once however often it comes before it is taken.
+    fn raise(mut self, _ signal: Signal) {
+        for waiting in self.signals {
+            if waiting == signal {
+                return
+            }
+        }
+        self.signals.push(signal)
+    }
+
+    fn ready(self) -> Ready {
+        Ready {
+            input: !self.input.is_empty(),
+            hangup: self.hung_up,
+            signal: !self.signals.is_empty(),
+        }
+    }
+
+    // Writes the restore bytes and leaves raw mode.
+    fn restore_screen(mut self) {
+        self.raw = false
+        self.vt.feed(self.restore.span())
+        self.output.extend_from(self.restore.span())
+    }
+}
+
+impl Backend for TestBackend {
+    uses E = ()
+
+    fn size(self) -> Result<Error, Size> {
+        Result::Ok(self.size)
+    }
+
+    fn write_all(mut self, _ bytes: MemSpan) -> Result<Error, ()> {
+        self.vt.feed(bytes)
+        self.output.extend_from(bytes)
+        self.writes += 1
+        Result::Ok(())
+    }
+
+    fn wait(mut self, _ timeout: Option<Duration>) -> Result<Error, Ready> {
+        self.arrive()
+        if self.ready().timed_out() {
+            let step = if self.next < self.steps.len() {
+                Option::Some(self.times[self.next])
+            } else {
+                Option::None
+            }
+            match (step, timeout) {
+                (Option::Some(at), Option::None) => self.now = at,
+                (Option::Some(at), Option::Some(timeout)) => self.now = if at
+                    <= self.now + timeout {
+                    at
+                } else {
+                    self.now + timeout
+                },
+                (Option::None, Option::Some(timeout)) => self.now = self.now + timeout,
+                (Option::None, Option::None) => self.hung_up = true,
+            }
+            self.arrive()
+        }
+        Result::Ok(self.ready())
+    }
+
+    fn read_available(mut self, _ buf: mut MemBuffer) -> Result<Error, usize> {
+        self.arrive()
+        let count = self.input.len()
+        if count == 0 && self.hung_up {
+            return Result::Err(Error::new(ErrorKind::UnexpectedEof))
+        }
+        buf.extend_from(self.input.span())
+        self.input.clear()
+        Result::Ok(count)
+    }
+
+    fn next_signal(mut self) -> Result<Error, Option<Signal>> {
+        self.arrive()
+        if self.signals.is_empty() {
+            return Result::Ok(Option::None)
+        }
+        // The first that came: move it to the end, then take it.
+        for i in 1 .. self.signals.len() {
+            self.signals.swap(i - 1, i)
+        }
+        Result::Ok(self.signals.pop())
+    }
+
+    fn enter_raw(mut self, _ restore: MemSpan) -> Result<Error, ()> {
+        self.restore = MemBuffer::from_span(restore)
+        self.raw = true
+        Result::Ok(())
+    }
+
+    fn leave_raw(mut self) -> Result<Error, ()> {
+        if self.raw {
+            self.restore_screen()
+        }
+        Result::Ok(())
+    }
+
+    fn suspend(mut self) -> Result<Error, ()> {
+        let raw = self.raw
+        if raw {
+            self.restore_screen()
+        }
+        self.stops += 1
+        self.restored_at_stops = self.restored_at_stops && self.is_restored()
+        // The stop's own signals are not reported, as `Terminal` drops them.
+        self.raw = raw
+        Result::Ok(())
+    }
+
+    fn now(self) -> Duration uses E {
+        self.now
+    }
+}
+
+#[test]
+fn a_test_backend_follows_its_script() {
+    let ms = |n: u64| Duration::from_millis(n)
+    var backend = TestBackend::new(Size::new(width: 4, height: 2))
+    backend.push_input(format!("ab").span())
+    backend.pause(ms(10))
+    backend.push_signal(Signal::Resize)
+    backend.push_signal(Signal::Resize)
+    backend.push_signal(Signal::Terminate)
+    backend.pause(ms(10))
+    backend.push_resize(Size::new(width: 2, height: 1))
+    // What is due has come without a wait.
+    var buf = MemBuffer::empty()
+    assert(
+        backend.read_available(mut buf).unwrap() == 2 && buf == "ab",
+    )
+    assert(backend.read_available(mut buf).unwrap() == 0)
+    assert(backend.next_signal().unwrap().is_none())
+    // A wait ends at the next step, or at its timeout if that is sooner.
+    assert(backend.wait(Option::Some(ms(4))).unwrap().timed_out())
+    assert(backend.now() == ms(4))
+    let ready = backend.wait(Option::None).unwrap()
+    assert(
+        ready.signal && !ready.input && !ready.hangup && backend.now() == ms(10),
+    )
+    // A signal that came twice waits once, in the order they came.
+    assert(
+        backend.next_signal().unwrap() == Option::Some(Signal::Resize),
+    )
+    assert(
+        backend.next_signal().unwrap() == Option::Some(Signal::Terminate),
+    )
+    assert(backend.next_signal().unwrap().is_none())
+    assert(
+        backend.wait(Option::Some(ms(100))).unwrap().signal && backend.now() == ms(20),
+    )
+    assert(backend.size().unwrap() == Size::new(width: 2, height: 1))
+    assert(backend.vt().size() == Size::new(width: 2, height: 1))
+    assert(
+        backend.next_signal().unwrap() == Option::Some(Signal::Resize),
+    )
+    // A step added now comes now, not at the script's past time.
+    backend.push_input(format!("c").span())
+    assert(backend.wait(Option::Some(ms(0))).unwrap().input)
+    assert(backend.read_available(mut buf).unwrap() == 1)
+    // Nothing left: a wait without a timeout hangs up.
+    assert(backend.wait(Option::None).unwrap().hangup)
+    assert(backend.read_available(mut buf).is_err())
+}
+
+#[test]
+fn a_test_backend_writes_restore_bytes_when_it_leaves_raw_mode() {
+    var backend = TestBackend::new(Size::new(width: 4, height: 1))
+    var restore = MemBuffer::empty()
+    restore.push(0x1b)
+    write!(mut restore, "[?1049l")
+    var setup = MemBuffer::empty()
+    setup.push(0x1b)
+    write!(mut setup, "[?1049hx")
+    backend.enter_raw(restore.span()).unwrap()
+    backend.write_all(setup.span()).unwrap()
+    assert(
+        backend.is_raw() && backend.vt().alternate_screen() && !backend.is_restored(),
+    )
+    backend.suspend().unwrap()
+    assert(
+        backend.stops() == 1 && backend.restored_at_stops() && backend.is_raw(),
+    )
+    backend.write_all(setup.span()).unwrap()
+    backend.leave_raw().unwrap()
+    assert(!backend.is_raw() && backend.is_restored())
+    assert(backend.writes() == 2)
+    backend.leave_raw().unwrap()
+    assert(
+        backend.output().len() == 2 * setup.len() + 2 * restore.len(),
+    )
+    // A stop with the screen not restored is recorded.
+    var bare = TestBackend::new(Size::new(width: 4, height: 1))
+    bare.enter_raw(MemBuffer::empty().span()).unwrap()
+    bare.write_all(setup.span()).unwrap()
+    bare.suspend().unwrap()
+    assert(!bare.restored_at_stops())
+}

@@ -1,6 +1,7 @@
 //! Terminal user interfaces for native Fe programs.
 pub use geom::{Pos, Rect, Size}
 pub use style::{Color, Modifier, Style}
+pub use backend::{Backend, TermBackend, TestBackend}
 pub use geom
 pub use style
 pub use text
@@ -12,3 +13,4 @@ pub use event
 pub use input
 pub use vt
 pub use render
+pub use backend
