@@ -22,6 +22,7 @@ use ingot::text::width
 use ingot::theme::Theme
 
 pub use block::{Block, BorderSymbols, BorderType, Borders, Padding}
+pub use tabs::{Tabs, TabsState}
 
 /// Where content narrower than its area sits in it.
 pub enum Alignment {
