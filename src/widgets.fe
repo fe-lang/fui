@@ -1,46 +1,88 @@
 //! Widgets: what views draw with.
 //!
-//! A widget is a small `Copy` value that holds its configuration, built by
-//! methods that each return a changed copy:
-//! `Block::bordered().rounded().border_style(style)`. What it shows is
-//! passed to its render call as a view, so nothing is copied, and the state
-//! that outlives a frame, such as a selection or a scroll offset, is a `mut`
-//! parameter that lives in the program's model. A render may write what it
-//! laid out into that state, such as the area it drew, for event handling
-//! to use later.
+//! ```fe
+//! fn view(_ area: Rect, _ names: MemSlice<MemBuffer>, _ files: mut ListState) uses (frame: mut Frame) {
+//!     let (body, bar) = Block::bordered().render_titled(area, "Files").columns((Fill(1), Length(1)))
+//!     List::new().highlight_symbol("> ").render(body, names, mut files)
+//!     Scrollbar::vertical().render_for(bar, files.scroll())
+//! }
 //!
-//! Every render draws through the `Frame` effect, only inside the area it
-//! is given: an empty or tiny area draws what fits, or nothing, and never
-//! panics. Widgets take their styles from the frame's theme, and a style set
-//! on a widget applies over the theme's.
+//! fn update(_ files: mut ListState, _ event: Event) -> bool {
+//!     match event {
+//!         Event::Key(key) => files.handle_key(key),
+//!         Event::Mouse(mouse) => files.handle_mouse(mouse).is_some(),
+//!         _ => false,
+//!     }
+//! }
+//! ```
+//!
+//! Every widget has the same shape:
+//!
+//! - Configuration by value. A widget is a small `Copy` value, built by
+//!   methods that each return a changed copy:
+//!   `Block::bordered().rounded().border_style(style)`.
+//! - Data by view. What a widget shows is a parameter of its render, a view
+//!   of the caller's data, so nothing is copied: the items of a list, the
+//!   rows of a table, a title.
+//! - State by `mut`. What outlives a frame, such as a selection, a scroll
+//!   position or a cursor, is a state value in the program's model, passed
+//!   to the render as `mut`. The render records what it laid out in it, and
+//!   the state's `handle_key` and `handle_mouse` use that between frames.
+//! - Drawing by effect. A render draws through `uses (frame: mut Frame)`,
+//!   only inside the area it is given: a tiny or empty area draws what
+//!   fits, or nothing, and never panics. Styles come from the frame's
+//!   theme, by role, and a style set on a widget applies over the theme's.
+//! - Closures for custom rows. `List::render_with` and `Table::render_with`
+//!   draw each row or cell by calling a closure, with the frame clipped to
+//!   it, so a row can hold any drawing.
+//!
+//! The widgets are `Block` (borders and titles), `Paragraph` (text,
+//! wrapped or cut), `List` and `ListState`, `Table` and `TableState`,
+//! `Tabs` and `TabsState`, `TextInput` and `TextInputState`, `Gauge` and
+//! `LineGauge` (progress), `Sparkline` (a bar chart of recent values),
+//! `Spinner` (work in progress), `Scrollbar`, and `clear` and `popup` (for
+//! what is drawn over other widgets). `ScrollState` is the scroll position
+//! that lists, tables and paragraphs share.
+//!
+//! The states use one set of names: `select` and `selected`,
+//! `select_next` and `select_previous`, `handle_key`, which returns whether
+//! the key is one the widget takes, `handle_mouse`, which returns what a
+//! left click selected, and `area`, the area of the last render.
 use std::io::Display
-use ingot::buffer::Buffer
 use ingot::frame::Frame
-use ingot::geom::{Rect, Size}
-use ingot::text::width
-use ingot::theme::Theme
+use ingot::geom::Rect
 
 pub use block::{Block, BorderSymbols, BorderType, Borders, Padding}
 pub use clear::{clear, popup}
 pub use gauge::{Gauge, LineGauge}
 pub use list::{List, ListRow, ListState}
 pub use paragraph::Paragraph
-pub use scroll::ScrollState
+pub use scroll::{ScrollState, WHEEL_ROWS}
 pub use scrollbar::{Orientation, Scrollbar}
 pub use sparkline::Sparkline
 pub use spinner::Spinner
-pub use table::{Column, MAX_COLUMNS, Table, TableCell, TableHit, TableRow, TableState, WHEEL_ROWS}
-pub use tabs::{Tabs, TabsState}
+pub use table::{Column, MAX_COLUMNS, Table, TableCell, TableHit, TableRow, TableState}
+pub use tabs::{MAX_TABS, Tabs, TabsState}
 pub use text_input::{TextInput, TextInputState, TextLimit}
 
 pub use ingot::text::Alignment
 
-// The columns the `Display` text of `text` takes. The text is left in
-// `scratch`, to draw from.
-pub(ingot) fn measure<T: Display>(_ text: T, _ scratch: mut MemBuffer) -> usize {
-    scratch.clear()
-    text.fmt(mut scratch)
-    width(scratch.span())
+// Draws the `Display` text of `text` on the top row of `area`, placed by
+// `alignment` and cut to the area, with an ellipsis if `ellipsis`; see
+// `Frame::print_line`. The cells keep their styles.
+pub(ingot) fn print_cut<T: Display>(
+    _ area: Rect,
+    _ text: T,
+    _ alignment: Alignment,
+    ellipsis: bool,
+) -> u16
+uses (frame: mut Frame)
+{
+    var bytes = frame.take_scratch()
+    text.fmt(mut bytes)
+    let written = frame.print_line_cut(area, bytes.span(), alignment, ellipsis)
+    frame.restore_scratch(bytes)
+    written
 }
 
 // `value` as a `u16`, or 65535 if it is larger.
@@ -50,33 +92,6 @@ pub(ingot) fn clamp_u16(_ value: usize) -> u16 {
     } else {
         value.downcast_truncate()
     }
-}
-
-/// For tests: the buffer `draw` leaves in a frame of `width` by `height`
-/// empty cells with the dark theme. `draw` gets the frame, to provide to
-/// what it draws, and the frame's area:
-///
-/// ```fe
-/// let text = drawn(width: 5, height: 3, |frame, area| {
-///     with (frame) { Block::bordered().render(area) }
-/// }).to_text()
-/// assert(text == "┌───┐\n│   │\n└───┘")
-/// ```
-pub(ingot) fn drawn<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> Buffer
-uses F::E
-{
-    var frame = Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
-    let area = frame.area()
-    draw(mut frame, area)
-    frame.into_buffer()
-}
-
-/// For tests: the text of the buffer `drawn` gives, row by row; see
-/// `Buffer::to_text`.
-pub(ingot) fn drawn_text<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> MemBuffer
-uses F::E
-{
-    drawn(width, height, draw).to_text()
 }
 
 #[test]
@@ -90,11 +105,8 @@ fn alignments_place_content_in_the_room_left() {
 }
 
 #[test]
-fn measures_display_text() {
-    var scratch = MemBuffer::empty()
-    assert(measure("abc", mut scratch) == 3)
-    assert(scratch == "abc")
-    assert(measure(1234 as u32, mut scratch) == 4)
-    assert(measure("", mut scratch) == 0)
-    assert(clamp_u16(70000) == 65535 && clamp_u16(7) == 7)
+fn values_clamp_to_u16() {
+    assert(
+        clamp_u16(70000) == 65535 && clamp_u16(65535) == 65535 && clamp_u16(7) == 7,
+    )
 }

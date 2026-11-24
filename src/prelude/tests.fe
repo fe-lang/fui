@@ -1,0 +1,144 @@
+// A program's view and update written against the prelude alone.
+use ingot::prelude::*
+use ingot::frame::frame_of
+
+struct File { name: MemBuffer, size: u64 }
+
+impl TableRow for File {
+    fn cell(self, _ column: usize, _ out: mut MemBuffer) {
+        match column {
+            0 => write!(mut out, self.name),
+            _ => write!(mut out, self.size),
+        }
+    }
+}
+
+struct Model {
+    tabs: TabsState,
+    files: MemVec<File>,
+    table: TableState,
+    log: ListState,
+    search: TextInputState,
+    copied: u64,
+}
+
+impl Model {
+    fn new() -> Self {
+        var files: MemVec<File> = MemVec::new()
+        files.push(File { name: format!("a.txt"), size: 10 })
+        files.push(File { name: format!("notes.md"), size: 2048 })
+        files.push(File { name: format!("bin"), size: 7 })
+        Model {
+            tabs: TabsState::new(),
+            files,
+            table: TableState::new().vi_keys(),
+            log: ListState::new(),
+            search: TextInputState::new(),
+            copied: 1,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let (head, body, foot) = area.rows((Length(1), Fill(1), Length(1)))
+        Tabs::new().render(head, ["Files", "Log"], mut self.tabs)
+        print_line(
+            Rect::new(x: head.right() - 1, y: head.y, width: 1, height: 1),
+            Line::styled("!", Style::new().fg(Color::RED).with(Modifier::BOLD)),
+            Alignment::Left,
+        )
+        let files = self.tabs.selected() == 0
+        let inner = Block::bordered()
+            .rounded()
+            .render_titled(body, if files { "Files" } else { "Log" })
+        if files {
+            let (table, bar) = inner.columns((Fill(1), Length(1)))
+            let columns = [
+                Column::new("Name", Fill(1)),
+                Column::new("Size", Length(5)).alignment(Alignment::Right),
+            ]
+            Table::new().highlight_symbol(">").render(table, columns, self.files, mut self.table)
+            Scrollbar::vertical().render_for(bar, self.table.scroll())
+        } else {
+            let (gauge, log) = inner.split_top(1)
+            Gauge::new().render(gauge, done: self.copied, total: 2)
+            List::new().placeholder("No log").render(log, ["started"], mut self.log)
+            let dialog = popup(body, width: 11, height: 3)
+            Paragraph::new()
+                .centered()
+                .render_styled(Block::bordered().render(dialog), Lines::from("copying"))
+        }
+        clear(foot)
+        with (Frame = themed(Theme::plain())) {
+            TextInput::new().placeholder("Search").render(foot, mut self.search)
+        }
+        let hint: u16 = measure("q quit").downcast_truncate()
+        print(
+            Pos::new(x: foot.right() - hint, y: foot.y),
+            "q quit",
+            theme().muted,
+        )
+    }
+
+    fn update(mut self, _ event: Event) -> bool {
+        match event {
+            Event::Key(key) => if key.pressed(KeyCode::Char(b'f'), Modifiers::CTRL) {
+                self.search.clear()
+                true
+            } else {
+                self.tabs.handle_key(key)
+                    || self.table.handle_key(key)
+                    || self.search.handle_key(key)
+            },
+            Event::Mouse(mouse) => match self.table.handle_mouse(mouse) {
+                Option::Some(TableHit::Row(_, _)) => true,
+                _ => mouse.kind == MouseKind::Down(MouseButton::Left),
+            },
+            _ => false,
+        }
+    }
+}
+
+#[test]
+fn a_view_written_against_the_prelude_draws() {
+    var model = Model::new()
+    var frame = frame_of(width: 30, height: 7)
+    let area = frame.area()
+    with (frame) {
+        model.view(area)
+    }
+    assert(
+        frame.buffer().to_text()
+            == " Files │ Log                 !\n╭Files───────────────────────╮\n│ Name                  Size█│\n│ a.txt                   10█│\n│ notes.md              2048││\n╰────────────────────────────╯\nSearch                  q quit",
+    )
+    assert(
+        model.update(
+                Event::Key(Key::new(KeyCode::Char(b'j'), Modifiers::NONE)),
+            ),
+    )
+    assert(model.table.selected() == Option::Some(0))
+    with (frame) {
+        model.view(area)
+    }
+    let buffer = ref frame.buffer()
+    assert(
+        buffer.get(Pos::new(x: 1, y: 3)).unwrap().modifier() == Modifier::REVERSED,
+    )
+    assert(
+        buffer.get(Pos::new(x: 29, y: 0)).unwrap().fg() == Color::RED,
+    )
+    assert(
+        buffer.get(Pos::new(x: 0, y: 6)).unwrap().modifier() == Modifier::DIM,
+    )
+    assert(
+        model.update(Event::Key(Key::new(KeyCode::Right, Modifiers::NONE))),
+    )
+    assert(model.tabs.selected() == 1)
+    frame.buffer().clear()
+    with (frame) {
+        model.view(area)
+    }
+    assert(
+        frame.buffer().to_text()
+            == " Files │ Log                 !\n╭Log─────────────────────────╮\n│████████┌─────────┐         │\n│started │ copying │         │\n│        └─────────┘         │\n╰────────────────────────────╯\nSearch                  q quit",
+    )
+}

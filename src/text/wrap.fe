@@ -30,7 +30,14 @@ impl Eq for WrapMode {
 
 /// A line of wrapped text: the bytes `start..end` of the text, and the
 /// columns they take.
-pub struct WrappedLine { pub start: usize, pub end: usize, pub width: usize }
+pub struct WrappedLine {
+    /// The offset of its first byte.
+    pub start: usize,
+    /// The offset after its last byte.
+    pub end: usize,
+    /// The columns its bytes take.
+    pub width: usize,
+}
 
 impl Copy for WrappedLine {}
 

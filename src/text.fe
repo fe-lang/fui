@@ -14,7 +14,7 @@
 use core::{MemBuffer, MemSpan}
 use tables::PROPERTIES
 
-pub use styled::{Alignment, Line, Run, Text}
+pub use styled::{Alignment, Line, Run, Lines}
 pub use tables::UNICODE_VERSION
 pub use wrap::{Wrap, WrapMode, WrapState, WrappedLine}
 
@@ -125,6 +125,15 @@ pub fn valid_up_to(_ text: MemSpan) -> usize {
 /// Whether `text` is valid UTF-8.
 pub fn is_valid(_ text: MemSpan) -> bool {
     valid_up_to(text) == text.len()
+}
+
+/// For tests: the UTF-8 of `scalars`, each as `encode` writes it.
+pub(ingot) fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    for c in scalars {
+        encode(c, mut out)
+    }
+    out
 }
 
 /// Whether `value` is a C0 or C1 control, or DEL.

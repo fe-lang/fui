@@ -41,10 +41,19 @@
 use core::MemSpan
 use core::mem::replace
 use std::io::Display
-use super::buffer::Buffer
+use super::buffer::{Buffer, cell_at}
 use super::geom::{Pos, Rect, Size}
 use super::style::{Color, Modifier, Style}
-use super::text::{Alignment, ELLIPSIS, Line, Run, Text, column_offset, next_cluster, width}
+use super::text::{
+    Alignment,
+    Line,
+    Run,
+    Lines,
+    next_cluster,
+    truncate,
+    truncate_with_ellipsis,
+    width,
+}
 use super::theme::Theme
 
 /// The surface view code draws on: a buffer, the clip rectangle drawing
@@ -87,6 +96,7 @@ impl Frame {
         self.clip
     }
 
+    /// The theme widgets draw with.
     pub fn theme(self) -> Theme {
         self.theme
     }
@@ -150,53 +160,64 @@ impl Frame {
             )
     }
 
-    /// Draws `line` on the top row of `area`, each run in its style applied
-    /// over the cells' styles, placed in the row by `alignment`. A line
-    /// wider than the area is cut after its last whole cluster that fits,
-    /// so a wide cluster is never split: one that would cross the area's
-    /// right edge leaves its column as it was. Returns the columns written.
-    pub fn print_line(mut self, _ area: Rect, _ line: Line, _ alignment: Alignment) -> u16 {
-        self.print_line_cut(area, line, alignment, ellipsis: false)
-    }
-
-    /// Draws `line` as `print_line` does, except that a line wider than the
-    /// area ends in `text::ELLIPSIS`, in the style of the text it stands
-    /// for, after its last whole cluster that leaves a column for it.
-    pub fn print_line_with_ellipsis(
+    /// Draws the first line of `text`, such as a `Line`, on the top row of
+    /// `area`, each run in its style applied over the cells' styles, placed
+    /// in the row by `alignment`. A line wider than the area is cut after
+    /// its last whole cluster that fits, as `text::truncate` cuts it, so a
+    /// wide cluster is never split: one that would cross the area's right
+    /// edge leaves its column as it was. Returns the columns written.
+    pub fn print_line<S: StyledText>(
         mut self,
         _ area: Rect,
-        _ line: Line,
+        _ text: S,
         _ alignment: Alignment,
     ) -> u16 {
-        self.print_line_cut(area, line, alignment, ellipsis: true)
+        self.print_line_cut(area, text, alignment, ellipsis: false)
     }
 
-    fn print_line_cut(
+    /// Draws the first line of `text` as `print_line` does, except that a
+    /// line wider than the area is cut as `text::truncate_with_ellipsis`
+    /// cuts it and ends in `text::ELLIPSIS`, in the style of the text it
+    /// stands for.
+    pub fn print_line_with_ellipsis<S: StyledText>(
         mut self,
         _ area: Rect,
-        _ line: Line,
+        _ text: S,
+        _ alignment: Alignment,
+    ) -> u16 {
+        self.print_line_cut(area, text, alignment, ellipsis: true)
+    }
+
+    // Draws the first line of `text` as `print_line` does, or as
+    // `print_line_with_ellipsis` does if `ellipsis`.
+    pub(ingot) fn print_line_cut<S: StyledText>(
+        mut self,
+        _ area: Rect,
+        _ text: S,
         _ alignment: Alignment,
         ellipsis: bool,
     ) -> u16 {
-        if area.is_empty() {
+        if area.is_empty() || text.line_count() == 0 {
             return 0
         }
-        let available = area.width as usize
-        let full = line.width()
-        let cut = full > available
-        let elide = cut && ellipsis
-        let (len, shown) = if !cut {
-            (line.len(), full)
+        let room = area.width as usize
+        let bytes = text.line_text(0)
+        let len = if ellipsis {
+            truncate_with_ellipsis(bytes, room)
         } else {
-            column_offset(line.text(), if elide { available - 1 } else { available })
+            truncate(bytes, room)
         }
-        let total = if elide { shown + 1 } else { shown }
-        let x: u16 = (area.x as usize + alignment.offset(width: total, available))
-            .downcast_truncate()
+        let elide = ellipsis && len < bytes.len()
+        let shown = width(bytes.slice(offset: 0, len))
+        let lead = alignment.offset(
+                width: if elide { shown + 1 } else { shown },
+                available: room,
+            )
+        let x: u16 = (area.x as usize + lead).downcast_truncate()
         let (row, _) = area.split_top(1)
         var written = self
             .draw_styled(
-                line,
+                text,
                 line: 0,
                 start: 0,
                 end: len,
@@ -204,14 +225,16 @@ impl Frame {
                 skip: 0,
                 within: row,
             )
-        if elide {
+        let clip = self.clip.intersect(row)
+        if elide && area.y >= clip.y && area.y < clip.bottom() {
             let at: u16 = (x as usize + shown).downcast_truncate()
-            written += self.print_clipped(
-                Pos::new(x: at, y: area.y),
-                ELLIPSIS,
-                style_at(line, line: 0, offset: len),
-                self.clip.intersect(row),
-            )
+            written += self.buffer
+                .draw_ellipsis(
+                    Pos::new(x: at, y: area.y),
+                    style_at(text, line: 0, offset: len),
+                    from: clip.x,
+                    to: clip.right(),
+                )
         }
         written
     }
@@ -297,9 +320,21 @@ impl Frame {
     }
 
     // Intersects the clip with `area` until `restore_clip` restores the one
-    // this returns. Where a `with (Frame = clipped(area))` cannot provide
-    // the frame, around a call of a generic callable whose row takes the
-    // caller's frame, this clips that frame in place.
+    // this returns. A widget that draws rows or cells by a closure clips the
+    // closure's drawing this way, around each call:
+    //
+    //     let clip = frame.clip_to(row)
+    //     draw(item, row)
+    //     frame.restore_clip(clip)
+    //
+    // A `with (Frame = clipped(row)) { draw(item, row) }` there would not
+    // clip, since a callable whose row the widget forwards (`uses F::E`)
+    // draws into the frame the widget's caller provides (Fe issue
+    // with-block-ignored-by-forwarded-row-call). A function that does the
+    // three steps, `draw_clipped(row, item, row, draw)`, would be the safe
+    // form; the compiler rejects its call when the closure comes from a
+    // function that has the frame as an effect (Fe issue
+    // own-effect-and-row-component-rejected).
     pub(ingot) fn clip_to(mut self, _ area: Rect) -> Rect {
         let old = self.clip
         self.clip = old.intersect(area)
@@ -352,7 +387,7 @@ impl Frame {
 
 /// Styled text a frame draws: lines of bytes, each in runs of styles that
 /// cover its bytes in order, the last run taking any bytes after the
-/// others. `Line` is one line, `Text` holds its lines, and bytes
+/// others. `Line` is one line, `Lines` holds its lines, and bytes
 /// (`MemSpan`) are one line in no style. Widgets such as `Paragraph` lay a
 /// line out as `text::Wrap` reads it, so line breaks in a line's bytes end
 /// its rows there.
@@ -390,7 +425,7 @@ impl StyledText for Line {
 }
 
 /// Its lines, top to bottom.
-impl StyledText for Text {
+impl StyledText for Lines {
     fn line_count(self) -> usize {
         self.height()
     }
@@ -474,19 +509,24 @@ uses (frame: mut Frame)
     frame.print_in(area, text, style)
 }
 
-/// Draws `line` on the top row of `area`; see `Frame::print_line`.
-pub fn print_line(_ area: Rect, _ line: Line, _ alignment: Alignment) -> u16
+/// Draws the first line of `text` on the top row of `area`; see
+/// `Frame::print_line`.
+pub fn print_line<S: StyledText>(_ area: Rect, _ text: S, _ alignment: Alignment) -> u16
 uses (frame: mut Frame)
 {
-    frame.print_line(area, line, alignment)
+    frame.print_line(area, text, alignment)
 }
 
-/// Draws `line` on the top row of `area`, with an ellipsis if it is cut;
-/// see `Frame::print_line_with_ellipsis`.
-pub fn print_line_with_ellipsis(_ area: Rect, _ line: Line, _ alignment: Alignment) -> u16
+/// Draws the first line of `text` on the top row of `area`, with an
+/// ellipsis if it is cut; see `Frame::print_line_with_ellipsis`.
+pub fn print_line_with_ellipsis<S: StyledText>(
+    _ area: Rect,
+    _ text: S,
+    _ alignment: Alignment,
+) -> u16
 uses (frame: mut Frame)
 {
-    frame.print_line_with_ellipsis(area, line, alignment)
+    frame.print_line_with_ellipsis(area, text, alignment)
 }
 
 /// Applies `style` over the style of each cell of `area`; see
@@ -517,8 +557,40 @@ pub fn theme() -> Theme uses (frame: Frame) {
     frame.theme
 }
 
-fn frame_of(width: u16, height: u16) -> Frame {
+/// For tests: a frame of `width` by `height` empty cells with the dark
+/// theme.
+pub(ingot) fn frame_of(width: u16, height: u16) -> Frame {
     Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
+}
+
+/// For tests: the buffer `draw` leaves in a frame of `width` by `height`
+/// empty cells with the dark theme. `draw` gets the frame, to provide to
+/// what it draws, and the frame's area:
+///
+/// ```fe
+/// #[test]
+/// fn borders_fill_the_frame() {
+///     let text = drawn(width: 5, height: 3, |frame, area| {
+///         with (frame) { Block::bordered().render(area) }
+///     }).to_text()
+///     assert(text == "┌───┐\n│   │\n└───┘")
+/// }
+/// ```
+pub(ingot) fn drawn<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> Buffer
+uses F::E
+{
+    var frame = frame_of(width, height)
+    let area = frame.area()
+    draw(mut frame, area)
+    frame.into_buffer()
+}
+
+/// For tests: the text of the buffer `drawn` gives, row by row; see
+/// `Buffer::to_text`.
+pub(ingot) fn drawn_text<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> MemBuffer
+uses F::E
+{
+    drawn(width, height, draw).to_text()
 }
 
 fn clip() -> Rect uses (frame: Frame) {
@@ -573,7 +645,7 @@ fn prints_in_an_area_keep_to_its_top_row() {
     assert(frame.buffer().to_text() == "\n  hel\n      he")
 }
 
-fn draw_clipped() uses (frame: mut Frame) {
+fn draw_in_clip() uses (frame: mut Frame) {
     with (Frame = clipped(Rect::new(x: 2, y: 0, width: 3, height: 2))) {
         // Starts left of the clip: only the columns in it are drawn.
         print(Pos::new(x: 0, y: 0), "abcdefg", Style::new())
@@ -597,7 +669,7 @@ fn drawing_stays_in_the_clip() {
     var frame = frame_of(width: 6, height: 3)
     frame.fill(frame.area(), ".", Style::new())
     with (frame) {
-        draw_clipped()
+        draw_in_clip()
     }
     assert(frame.clip() == frame.area())
     assert(frame.buffer().to_text() == "..cde.\n..###.\n......")
@@ -610,6 +682,52 @@ fn drawing_stays_in_the_clip() {
     )
     frame.clear(Rect::new(x: 4, y: 0, width: 9, height: 2))
     assert(frame.buffer().to_text() == "..cd\n..##\n......")
+}
+
+// Calls `draw` for each of `items` on a row of `area`, clipped to the row,
+// as a widget with a row closure does.
+fn rows_with<F: Fn(u8, Rect)>(_ area: Rect, _ items: [u8; 3], _ draw: F)
+uses (frame: mut Frame, F::E)
+{
+    for (i, item) in items.enumerate() {
+        let row = Rect {
+            x: area.x,
+            y: area.y + i.downcast_truncate(),
+            width: area.width,
+            height: 1,
+        }
+        let clip = frame.clip_to(row)
+        draw(item, row)
+        frame.restore_clip(clip)
+    }
+}
+
+#[test]
+fn closures_draw_only_in_the_clip_around_their_call() {
+    var frame = frame_of(width: 5, height: 4)
+    frame.fill(frame.area(), ".", Style::new())
+    with (frame) {
+        rows_with(
+            Rect::new(x: 1, y: 1, width: 3, height: 3),
+            [1, 2, 3],
+            |item, row| {
+                // From the frame's left edge past the row's right one, and
+                // over the whole top row.
+                print(
+                    Pos::new(x: 0, y: row.y),
+                    format!(item, item, item, item, item),
+                    Style::new(),
+                )
+                fill(
+                    Rect::new(x: 0, y: 0, width: 5, height: 1),
+                    "#",
+                    Style::new(),
+                )
+            },
+        )
+    }
+    assert(frame.clip() == frame.area())
+    assert(frame.buffer().to_text() == ".....\n.111.\n.222.\n.333.")
 }
 
 fn nested() -> bool uses (frame: mut Frame) {
@@ -678,6 +796,13 @@ fn scopes_restore_on_every_way_out() {
 }
 
 #[test]
+fn display_text_measures_in_columns() {
+    var frame = frame_of(width: 1, height: 1)
+    assert(frame.measure("abc") == 3 && frame.measure("漢字") == 4)
+    assert(frame.measure(1234 as u32) == 4 && frame.measure("") == 0)
+}
+
+#[test]
 fn the_cursor_shows_only_in_the_clip() {
     var frame = frame_of(width: 4, height: 4)
     assert(frame.cursor().is_none())
@@ -707,10 +832,6 @@ fn empty_frames_draw_nothing() {
     assert(frame.into_buffer().to_text().is_empty())
 }
 
-fn fg_at(_ frame: Frame, x: u16, y: u16) -> Color {
-    frame.buffer().get(Pos::new(x, y)).unwrap().fg()
-}
-
 fn two_runs() -> Line {
     var line = Line::styled("ab", Style::new().fg(Color::RED))
     line.push("cdef", Style::new().fg(Color::BLUE))
@@ -730,14 +851,16 @@ fn lines_draw_each_run_in_its_style() {
                 ) == 4,
     )
     assert(frame.buffer().to_text() == " abcd\n")
-    assert(fg_at(frame, x: 0, y: 0) == Color::RESET)
+    assert(cell_at(frame.buffer(), x: 0, y: 0).fg() == Color::RESET)
     assert(
-        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 2, y: 0) == Color::RED,
+        cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::RED,
     )
     assert(
-        fg_at(frame, x: 3, y: 0) == Color::BLUE && fg_at(frame, x: 4, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 3, y: 0).fg() == Color::BLUE
+            && cell_at(frame.buffer(), x: 4, y: 0).fg() == Color::BLUE,
     )
-    assert(fg_at(frame, x: 5, y: 0) == Color::RESET)
+    assert(cell_at(frame.buffer(), x: 5, y: 0).fg() == Color::RESET)
 }
 
 #[test]
@@ -795,7 +918,8 @@ fn lines_never_split_a_wide_cluster() {
     )
     assert(frame.buffer().to_text() == "a漢.\n.a漢\n....")
     assert(
-        fg_at(frame, x: 1, y: 0) == Color::BLUE && fg_at(frame, x: 2, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::BLUE
+            && cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::BLUE,
     )
 }
 
@@ -815,7 +939,8 @@ fn cut_lines_may_end_in_an_ellipsis() {
     )
     // The ellipsis takes the style of the text it stands for.
     assert(
-        fg_at(frame, x: 2, y: 0) == Color::RED && fg_at(frame, x: 3, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 3, y: 0).fg() == Color::BLUE,
     )
     // A line that fits has none.
     assert(
@@ -850,6 +975,38 @@ fn cut_lines_may_end_in_an_ellipsis() {
 }
 
 #[test]
+fn lines_may_be_bytes_or_the_first_line_of_a_text() {
+    var frame = frame_of(width: 5, height: 3)
+    let bytes = format!("abcdefg")
+    let text = Lines::from("first\nsecond")
+    assert(
+        frame
+                .print_line_with_ellipsis(
+                    Rect::new(x: 0, y: 0, width: 5, height: 1),
+                    bytes.span(),
+                    Alignment::Left,
+                )
+            == 5,
+    )
+    frame.print_line(
+            Rect::new(x: 0, y: 1, width: 5, height: 1),
+            text,
+            Alignment::Right,
+        )
+    // Empty bytes are no line.
+    assert(
+        frame
+                .print_line(
+                    Rect::new(x: 0, y: 2, width: 5, height: 1),
+                    bytes.slice(offset: 0, len: 0),
+                    Alignment::Left,
+                )
+            == 0,
+    )
+    assert(frame.buffer().to_text() == "abcd…\nfirst\n")
+}
+
+#[test]
 fn clusters_take_the_style_of_the_run_they_start_in() {
     var frame = frame_of(width: 4, height: 1)
     // An "e" and a combining acute accent, in two runs: one cluster.
@@ -859,7 +1016,8 @@ fn clusters_take_the_style_of_the_run_they_start_in() {
     assert(frame.print_line(frame.area(), line, Alignment::Left) == 3)
     assert(frame.buffer().to_text() == "xéy")
     assert(
-        fg_at(frame, x: 1, y: 0) == Color::RED && fg_at(frame, x: 2, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 2, y: 0).fg() == Color::BLUE,
     )
 }
 
@@ -923,7 +1081,8 @@ fn skipped_columns_hide_the_start_of_a_range() {
             == 5,
     )
     assert(
-        fg_at(frame, x: 0, y: 0) == Color::RED && fg_at(frame, x: 1, y: 0) == Color::BLUE,
+        cell_at(frame.buffer(), x: 0, y: 0).fg() == Color::RED
+            && cell_at(frame.buffer(), x: 1, y: 0).fg() == Color::BLUE,
     )
     assert(
         frame

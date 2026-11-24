@@ -3,14 +3,12 @@
 //! view.
 use core::{MemBuffer, MemSpan}
 use core::mem::replace
-use std::io::Display
-use ingot::buffer::Buffer
 use ingot::event::{Key, KeyCode, KeyKind, Modifiers, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, theme}
-use ingot::geom::{Pos, Rect, Size}
+use ingot::frame::{Frame, frame_of, theme}
+use ingot::geom::{Pos, Rect}
 use ingot::style::{Modifier, Style}
-use ingot::text::{column_offset, decode, encode, is_control, next_cluster, width}
-use ingot::theme::Theme
+use ingot::text::{column_offset, decode, encode, is_control, next_cluster, utf8, width}
+use super::clamp_u16
 
 /// The most text a `TextInputState` holds.
 pub enum TextLimit {
@@ -130,6 +128,11 @@ impl TextInputState {
     /// Whether there is no text.
     pub fn is_empty(self) -> bool {
         self.text.is_empty()
+    }
+
+    /// The row the last render drew the field in.
+    pub fn area(self) -> Rect {
+        self.area
     }
 
     /// The cursor, as a byte offset into the text.
@@ -545,12 +548,20 @@ impl TextInputState {
 /// A single-line text field, which draws a `TextInputState`:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-///     TextInput::new().focused(self.focus == Focus::Search).render(
-///         area,
-///         mut self.search,
-///         placeholder: "Search",
-///     )
+/// fn view(_ area: Rect, _ search: mut TextInputState, focused: bool) uses (frame: mut Frame) {
+///     TextInput::new().placeholder("Search").focused(focused).render(area, mut search)
+/// }
+///
+/// fn update(_ search: mut TextInputState, _ event: Event) -> bool {
+///     match event {
+///         Event::Key(key) => search.handle_key(key),
+///         Event::Paste(ref text) => {
+///             search.insert(text.span())
+///             true
+///         },
+///         Event::Mouse(mouse) => search.handle_mouse(mouse),
+///         _ => false,
+///     }
 /// }
 /// ```
 ///
@@ -568,12 +579,13 @@ impl TextInputState {
 ///
 /// The field's style applies over the theme's `text` style to its row, the
 /// placeholder style over the theme's `muted` style to the placeholder, and
-/// the selection style over the theme's `highlight` style to the selected
+/// the highlight style over the theme's `highlight` style to the selected
 /// text.
 pub struct TextInput {
     style: Style,
+    placeholder: String<31>,
     placeholder_style: Style,
-    selection_style: Style,
+    highlight_style: Style,
     mask: Option<String<4>>,
     focused: bool,
 }
@@ -581,12 +593,13 @@ pub struct TextInput {
 impl Copy for TextInput {}
 
 impl TextInput {
-    /// A focused field without a mask.
+    /// A focused field without a placeholder or a mask.
     pub fn new() -> Self {
         TextInput {
             style: Style::NONE,
+            placeholder: "",
             placeholder_style: Style::NONE,
-            selection_style: Style::NONE,
+            highlight_style: Style::NONE,
             mask: Option::None,
             focused: true,
         }
@@ -595,6 +608,12 @@ impl TextInput {
     /// This field, with `style` over the theme's `text` style for its row.
     pub fn style(var own self, _ style: Style) -> Self {
         self.style = style
+        self
+    }
+
+    /// This field, showing `text` when it has none.
+    pub fn placeholder(var own self, _ text: String<31>) -> Self {
+        self.placeholder = text
         self
     }
 
@@ -607,8 +626,8 @@ impl TextInput {
 
     /// This field, with `style` over the theme's `highlight` style for the
     /// selected text.
-    pub fn selection_style(var own self, _ style: Style) -> Self {
-        self.selection_style = style
+    pub fn highlight_style(var own self, _ style: Style) -> Self {
+        self.highlight_style = style
         self
     }
 
@@ -625,15 +644,16 @@ impl TextInput {
         self
     }
 
-    /// Draws the text of `state` in the top row of `area`, or `placeholder`
-    /// if it has none, and records the area and the scroll in `state`.
-    pub fn render<P: Display>(self, _ area: Rect, _ state: mut TextInputState, placeholder: P)
+    /// Draws the text of `state` in the top row of `area`, or the
+    /// placeholder if it has none, and records the area and the scroll in
+    /// `state`.
+    pub fn render(self, _ area: Rect, _ state: mut TextInputState)
     uses (frame: mut Frame)
     {
         let (row, _) = area.split_top(1)
         let mask: usize = match self.mask {
             Option::Some(symbol) => {
-                let columns = width(format!(symbol).span())
+                let columns = frame.measure(symbol)
                 if columns > 0 { columns } else { 1 }
             },
             Option::None => 0,
@@ -647,7 +667,7 @@ impl TextInput {
             state.scroll = 0
             frame.print_in(
                     row,
-                    placeholder,
+                    self.placeholder,
                     theme.muted.patch(self.placeholder_style),
                 )
             if self.focused {
@@ -696,7 +716,7 @@ impl TextInput {
         let tail = text.slice(offset: from, len: text.len() - from)
         match self.mask {
             Option::Some(symbol) => {
-                let columns: u16 = clamp(clusters(tail) * mask)
+                let columns: u16 = clamp_u16(clusters(tail) * mask)
                 frame
                     .fill(
                         Rect {
@@ -728,19 +748,19 @@ impl TextInput {
                     frame
                         .set_style(
                             Rect {
-                                x: row.x + clamp(left - scroll),
+                                x: row.x + clamp_u16(left - scroll),
                                 y: row.y,
-                                width: clamp(right - left),
+                                width: clamp_u16(right - left),
                                 height: 1,
                             },
-                            theme.highlight.patch(self.selection_style),
+                            theme.highlight.patch(self.highlight_style),
                         )
                 }
             },
             Option::None => {},
         }
         if self.focused {
-            frame.set_cursor(Pos { x: row.x + clamp(cursor - scroll), y: row.y })
+            frame.set_cursor(Pos { x: row.x + clamp_u16(cursor - scroll), y: row.y })
         }
     }
 }
@@ -817,28 +837,12 @@ fn locate(_ text: MemSpan, _ column: usize, mask: usize) -> (usize, usize) {
     (at, columns)
 }
 
-fn clamp(_ value: usize) -> u16 {
-    if value > 65535 {
-        65535
-    } else {
-        value.downcast_truncate()
-    }
-}
-
 fn min(_ a: usize, _ b: usize) -> usize {
     if a < b { a } else { b }
 }
 
 fn max(_ a: usize, _ b: usize) -> usize {
     if a > b { a } else { b }
-}
-
-fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
-    var out = MemBuffer::empty()
-    for c in scalars {
-        encode(c, mut out)
-    }
-    out
 }
 
 fn typed(_ text: MemSpan) -> TextInputState {
@@ -852,17 +856,12 @@ fn press(_ code: KeyCode, _ mods: Modifiers) -> Key {
 }
 
 // A one-row frame `width` wide, with the dark theme, after `input` draws
-// `state` across it with the placeholder `placeholder`.
-fn drawn<P: Display>(
-    _ input: TextInput,
-    width: u16,
-    _ state: mut TextInputState,
-    placeholder: P,
-) -> Frame {
-    var frame = Frame::new(Buffer::new(Size::new(width, height: 1)), Theme::dark())
+// `state` across it.
+fn rendered(_ input: TextInput, width: u16, _ state: mut TextInputState) -> Frame {
+    var frame = frame_of(width, height: 1)
     let area = frame.area()
     with (frame) {
-        input.render(area, mut state, placeholder)
+        input.render(area, mut state)
     }
     frame
 }
@@ -1156,10 +1155,10 @@ fn keys_edit_as_readline_does() {
 #[test]
 fn the_field_scrolls_as_little_as_shows_the_cursor() {
     var state = typed(format!("abcdefghij").span())
-    var frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    var frame = rendered(TextInput::new(), width: 5, mut state)
     assert(frame.buffer().to_text() == "ghij" && cursor_x(frame) == 4)
     state.home()
-    frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    frame = rendered(TextInput::new(), width: 5, mut state)
     assert(
         frame.buffer().to_text() == "abcde" && cursor_x(frame) == 0,
     )
@@ -1168,44 +1167,44 @@ fn the_field_scrolls_as_little_as_shows_the_cursor() {
     let right = ["abcde", "abcde", "abcde", "abcde", "bcdef", "cdefg"]
     for expected in right {
         state.move_right()
-        frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+        frame = rendered(TextInput::new(), width: 5, mut state)
         assert(frame.buffer().to_text() == expected)
     }
     assert(cursor_x(frame) == 4)
     let left = ["cdefg", "cdefg", "cdefg", "cdefg", "bcdef", "abcde"]
     for expected in left {
         state.move_left()
-        frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+        frame = rendered(TextInput::new(), width: 5, mut state)
         assert(frame.buffer().to_text() == expected)
     }
     assert(cursor_x(frame) == 0)
     // Removing text scrolls back to show what is left.
     state.end()
-    drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    rendered(TextInput::new(), width: 5, mut state)
     state.delete_to_start()
     state.insert(format!("xy").span())
-    frame = drawn(TextInput::new(), width: 5, mut state, placeholder: "")
+    frame = rendered(TextInput::new(), width: 5, mut state)
     assert(frame.buffer().to_text() == "xy" && cursor_x(frame) == 2)
 }
 
 #[test]
 fn wide_clusters_cut_by_an_edge_leave_spaces() {
     var state = typed(format!("a界b界c").span())
-    var frame = drawn(TextInput::new(), width: 4, mut state, placeholder: "")
+    var frame = rendered(TextInput::new(), width: 4, mut state)
     assert(frame.buffer().to_text() == "界c" && cursor_x(frame) == 3)
     state.home()
-    frame = drawn(TextInput::new(), width: 4, mut state, placeholder: "")
+    frame = rendered(TextInput::new(), width: 4, mut state)
     assert(frame.buffer().to_text() == "a界b" && cursor_x(frame) == 0)
     // The cursor on the second 界 shows it whole; the first is cut.
     state.move_right()
     state.move_right()
     state.move_right()
-    frame = drawn(TextInput::new(), width: 4, mut state, placeholder: "")
+    frame = rendered(TextInput::new(), width: 4, mut state)
     assert(frame.buffer().to_text() == " b界" && cursor_x(frame) == 2)
     // Cut by the right edge.
     var right = typed(format!("abc界").span())
     right.home()
-    frame = drawn(TextInput::new(), width: 4, mut right, placeholder: "")
+    frame = rendered(TextInput::new(), width: 4, mut right)
     assert(frame.buffer().to_text() == "abc")
     assert(
         frame.buffer().get(Pos::new(x: 3, y: 0)).unwrap().width() == 1,
@@ -1213,43 +1212,34 @@ fn wide_clusters_cut_by_an_edge_leave_spaces() {
     // A field narrower than the cluster shows the cursor's column.
     var narrow = typed(format!("界").span())
     narrow.home()
-    frame = drawn(TextInput::new(), width: 1, mut narrow, placeholder: "")
+    frame = rendered(TextInput::new(), width: 1, mut narrow)
     assert(
         frame.buffer().to_text().is_empty() && cursor_x(frame) == 0,
     )
     narrow.end()
-    frame = drawn(TextInput::new(), width: 1, mut narrow, placeholder: "")
+    frame = rendered(TextInput::new(), width: 1, mut narrow)
     assert(
         frame.buffer().to_text().is_empty() && cursor_x(frame) == 0,
     )
     // The cursor on a zero-width cluster, U+200B, still takes a column.
     var space = typed(utf8([0x61, 0x62, 0x63, 0x64, 0x200b]).span())
     space.move_left()
-    frame = drawn(TextInput::new(), width: 4, mut space, placeholder: "")
+    frame = rendered(TextInput::new(), width: 4, mut space)
     assert(frame.buffer().to_text() == "bcd" && cursor_x(frame) == 3)
 }
 
 #[test]
 fn the_cursor_shows_only_when_focused() {
     var state = typed(format!("ab").span())
-    var frame = Frame::new(Buffer::new(Size::new(width: 8, height: 4)), Theme::dark())
+    var frame = frame_of(width: 8, height: 4)
     with (frame) {
-        TextInput::new()
-            .render(
-                Rect::new(x: 2, y: 1, width: 5, height: 2),
-                mut state,
-                placeholder: "",
-            )
+        TextInput::new().render(Rect::new(x: 2, y: 1, width: 5, height: 2), mut state)
     }
     assert(frame.cursor() == Option::Some(Pos::new(x: 4, y: 1)))
     assert(frame.buffer().to_text() == "\n  ab\n\n")
+    assert(state.area() == Rect::new(x: 2, y: 1, width: 5, height: 1))
     state.move_left()
-    let unfocused = drawn(
-        TextInput::new().focused(false),
-        width: 4,
-        mut state,
-        placeholder: "",
-    )
+    let unfocused = rendered(TextInput::new().focused(false), width: 4, mut state)
     assert(
         unfocused.cursor().is_none() && unfocused.buffer().to_text() == "ab",
     )
@@ -1258,31 +1248,16 @@ fn the_cursor_shows_only_when_focused() {
 #[test]
 fn masks_hide_every_cluster() {
     var state = typed(format!("secret").span())
-    var frame = drawn(
-        TextInput::new().mask("*"),
-        width: 10,
-        mut state,
-        placeholder: "",
-    )
+    var frame = rendered(TextInput::new().mask("*"), width: 10, mut state)
     assert(
         frame.buffer().to_text() == "******" && cursor_x(frame) == 6,
     )
     var mixed = typed(utf8([0x754c, 0x65, 0x301]).span())
-    frame = drawn(
-        TextInput::new().mask("•"),
-        width: 10,
-        mut mixed,
-        placeholder: "",
-    )
+    frame = rendered(TextInput::new().mask("•"), width: 10, mut mixed)
     assert(frame.buffer().to_text() == "••" && cursor_x(frame) == 2)
     // A wide mask, scrolled to an odd column: each cluster takes two.
     var long = typed(format!("abcdef").span())
-    frame = drawn(
-        TextInput::new().mask("＊"),
-        width: 4,
-        mut long,
-        placeholder: "",
-    )
+    frame = rendered(TextInput::new().mask("＊"), width: 4, mut long)
     assert(frame.buffer().to_text() == " ＊" && cursor_x(frame) == 3)
     // A click goes to the masked cluster under it.
     let down = MouseKind::Down(MouseButton::Left)
@@ -1299,23 +1274,14 @@ fn masks_hide_every_cluster() {
 #[test]
 fn an_empty_field_shows_its_placeholder() {
     var state = TextInputState::new()
-    let frame = drawn(
-        TextInput::new(),
-        width: 4,
-        mut state,
-        placeholder: "Search",
-    )
+    let input = TextInput::new().placeholder("Search")
+    let frame = rendered(input, width: 4, mut state)
     assert(frame.buffer().to_text() == "Sear" && cursor_x(frame) == 0)
     assert(
         frame.buffer().get(Pos::new(x: 0, y: 0)).unwrap().modifier() == Modifier::DIM,
     )
     state.insert(format!("x").span())
-    let typed = drawn(
-        TextInput::new(),
-        width: 4,
-        mut state,
-        placeholder: "Search",
-    )
+    let typed = rendered(input, width: 4, mut state)
     assert(typed.buffer().to_text() == "x" && cursor_x(typed) == 1)
     assert(
         typed.buffer().get(Pos::new(x: 0, y: 0)).unwrap().modifier().is_empty(),
@@ -1327,7 +1293,7 @@ fn the_selection_is_highlighted() {
     var state = typed(format!("abcdef").span())
     state.handle_key(press(KeyCode::Left, Modifiers::SHIFT))
     state.handle_key(press(KeyCode::Left, Modifiers::SHIFT))
-    let frame = drawn(TextInput::new(), width: 8, mut state, placeholder: "")
+    let frame = rendered(TextInput::new(), width: 8, mut state)
     for x in [0, 1, 2, 3, 6, 7] {
         assert(
             frame.buffer().get(Pos::new(x, y: 0)).unwrap().modifier().is_empty(),
@@ -1344,10 +1310,10 @@ fn the_selection_is_highlighted() {
 #[test]
 fn clicks_place_the_cursor_and_drags_select() {
     var state = typed(format!("a界bcdefgh").span())
-    var frame = Frame::new(Buffer::new(Size::new(width: 8, height: 2)), Theme::dark())
+    var frame = frame_of(width: 8, height: 2)
     let area = Rect::new(x: 2, y: 1, width: 4, height: 1)
     with (frame) {
-        TextInput::new().render(area, mut state, placeholder: "")
+        TextInput::new().render(area, mut state)
     }
     // Scrolled to show "fgh" and the cursor: columns 7 to 10.
     assert(frame.buffer().to_text() == "\n  fgh")
@@ -1401,7 +1367,7 @@ fn clicks_place_the_cursor_and_drags_select() {
     // Past the end of the text goes to the end.
     state.set_text(format!("a界").span())
     with (frame) {
-        TextInput::new().render(area, mut state, placeholder: "")
+        TextInput::new().render(area, mut state)
     }
     assert(
         state.handle_mouse(
@@ -1423,14 +1389,9 @@ fn empty_areas_draw_nothing() {
     let sizes: [(u16, u16); 3] = [(0, 0), (0, 1), (3, 0)]
     for size in sizes {
         let (width, height) = size
-        var frame = Frame::new(Buffer::new(Size::new(width: 4, height: 2)), Theme::dark())
+        var frame = frame_of(width: 4, height: 2)
         with (frame) {
-            TextInput::new()
-                .render(
-                    Rect::new(x: 1, y: 1, width, height),
-                    mut state,
-                    placeholder: "x",
-                )
+            TextInput::new().render(Rect::new(x: 1, y: 1, width, height), mut state)
         }
         assert(
             frame.buffer().to_text() == "\n" && frame.cursor().is_none(),

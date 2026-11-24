@@ -1,9 +1,8 @@
 //! An animation that shows work in progress.
 use std::io::Display
-use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, print_in, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
-use super::{drawn, drawn_text}
 
 // The kinds of frames a spinner cycles through.
 enum Frames {
@@ -22,9 +21,9 @@ const ARC: [String<3>; 6] = ["◜", "◠", "◝", "◞", "◡", "◟"]
 /// an optional label after it:
 ///
 /// ```fe
-/// fn view(self, _ area: Rect) uses (frame: mut Frame) {
+/// fn view(_ area: Rect, _ elapsed_ms: u64) uses (frame: mut Frame) {
 ///     let spinner = Spinner::dots()
-///     spinner.render_labeled(area, tick: spinner.tick_at(self.elapsed_ms), label: "Loading")
+///     spinner.render_labeled(area, tick: spinner.tick_at(elapsed_ms), label: "Loading")
 /// }
 /// ```
 ///

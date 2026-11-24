@@ -13,14 +13,19 @@ pub struct Theme {
     pub muted: Style,
     /// Borders and separators.
     pub border: Style,
-    /// Titles of blocks, tabs and tables.
+    /// Titles of blocks and the headers of tables.
     pub title: Style,
-    /// The selected or focused item.
+    /// What is selected: the selected row of a list or a table, the
+    /// selected tab, selected text.
     pub highlight: Style,
-    /// What should stand out: keys, links, the active tab.
+    /// What should stand out without being selected: keys, links, the bars
+    /// of gauges and sparklines, spinners.
     pub accent: Style,
+    /// Errors.
     pub error: Style,
+    /// Warnings.
     pub warning: Style,
+    /// Success.
     pub success: Style,
 }
 

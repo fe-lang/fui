@@ -3,72 +3,76 @@ use core::MemVec
 use core::ops::{Index, Len}
 use std::abi::DynString
 use std::io::Display
-use ingot::buffer::Buffer
 use ingot::event::{Key, KeyCode, KeyKind, Modifiers, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, measure, print_in, set_style, theme}
-use ingot::geom::{Pos, Rect, Size, min}
+use ingot::frame::{Frame, frame_of, measure, print_in, set_style, theme}
+use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Modifier, Style}
-use ingot::theme::Theme
+use ingot::text::Alignment
 use super::paragraph::Paragraph
-use super::scroll::ScrollState
-
-// The rows a notch of the mouse wheel scrolls.
-const WHEEL_ROWS: u16 = 3
+use super::print_cut
+use super::scroll::{ScrollState, WHEEL_ROWS}
 
 /// A list of items, one row (or `item_height` rows) each, scrolled so the
-/// selected item is shown.
+/// selected item is shown:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-///     let inner = Block::bordered().title("Files").render(area)
-///     List::new().highlight_symbol("> ").render(inner, self.names, mut self.files)
-/// }
-///
-/// fn update(mut self, _ event: Event) -> Flow {
-///     match event {
-///         Event::Key(key) => if self.files.handle_key(key) { return Flow::Redraw },
-///         Event::Mouse(mouse) => if let Option::Some(i) = self.files.handle_mouse(mouse) { self.open(i) },
-///         _ => {},
-///     }
-///     Flow::Continue
+/// fn view(_ area: Rect, _ names: MemSlice<MemBuffer>, _ files: mut ListState) uses (frame: mut Frame) {
+///     let inner = Block::bordered().render_titled(area, "Files")
+///     List::new().highlight_symbol("> ").render(inner, names, mut files)
 /// }
 /// ```
 ///
-/// `render` draws items that are `Display`: a `MemVec` or `MemSlice` of
-/// them, or an array such as `["one", "two"]`. `render_with` draws each row
-/// with a closure, which draws through the frame in the row it is given,
-/// clipped to it, so a row can be anything:
+/// `render` draws items that are `Display`, from any collection indexed by
+/// position: a `MemVec` or `MemSlice` of them, or an array such as
+/// `["one", "two"]`. An item wider than the area ends in an ellipsis unless
+/// `ellipsis(false)`. `render_with` draws each row with a closure instead,
+/// with the frame clipped to the row, so a row can be anything:
 ///
 /// ```fe
-/// List::new().render_with(area, self.entries, mut self.list, |entry, row| {
-///     let (name, size) = row.area.columns((Fill(1), Length(8)))
-///     print_in(name, entry.name, Style::new())
-///     Paragraph::new().right().render(size, entry.size)
-/// })
+/// struct Entry { name: MemBuffer, size: u64 }
+///
+/// fn entries(_ area: Rect, _ entries: MemSlice<Entry>, _ list: mut ListState) uses (frame: mut Frame) {
+///     List::new().render_with(area, entries, mut list, |entry, row| {
+///         let (name, size) = row.area.columns((Fill(1), Length(8)))
+///         print_in(name, entry.name, Style::new())
+///         Paragraph::new().right().render(size, entry.size)
+///     })
+/// }
 /// ```
 ///
 /// The data is viewed, not stored, and the selection and scroll position
 /// are a `ListState` in the program's model, which the render updates: it
 /// records the items, the area and the rows, clamps a selection beyond the
 /// last item (the items may have shrunk), and scrolls as little as shows
-/// the selected item. The selected row is drawn in the theme's highlight
-/// style, patched by `highlight_style`, across its whole width, after the
-/// row's own drawing, and starts with the highlight symbol; every other row
-/// starts with as many blank columns, so text does not shift as the
-/// selection moves.
+/// the selected item. The list's style applies over the theme's `text`
+/// style to the whole area. The selected row is drawn in the theme's
+/// `highlight` style, patched by `highlight_style`, across its whole width,
+/// after the row's own drawing, and starts with the highlight symbol;
+/// every other row starts with as many blank columns, so text does not
+/// shift as the selection moves. With no items, the list draws its
+/// placeholder in the theme's `muted` style.
 pub struct List {
     style: Style,
     highlight_style: Style,
     highlight_symbol: String<31>,
     item_height: u16,
     placeholder: String<31>,
+    placeholder_style: Style,
+    ellipsis: bool,
 }
 
 impl Copy for List {}
 
 /// What `List::render_with` draws a row in: the item's index, its area
 /// after the highlight symbol's columns, and whether it is selected.
-pub struct ListRow { pub index: usize, pub area: Rect, pub selected: bool }
+pub struct ListRow {
+    /// The item's index in the items.
+    pub index: usize,
+    /// The rows of the item, after the highlight symbol's columns.
+    pub area: Rect,
+    /// Whether the item is selected.
+    pub selected: bool,
+}
 
 impl Copy for ListRow {}
 
@@ -82,65 +86,56 @@ impl List {
             highlight_symbol: "",
             item_height: 1,
             placeholder: "",
+            placeholder_style: Style::NONE,
+            ellipsis: true,
         }
     }
 
     /// Applies `style` over the theme's text style, in the whole area.
-    pub fn style(own self, _ style: Style) -> Self {
-        List {
-            style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: self.item_height,
-            placeholder: self.placeholder,
-        }
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
     }
 
     /// Applies `style` over the theme's highlight style for the selected
     /// row.
-    pub fn highlight_style(own self, _ style: Style) -> Self {
-        List {
-            style: self.style,
-            highlight_style: style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: self.item_height,
-            placeholder: self.placeholder,
-        }
+    pub fn highlight_style(var own self, _ style: Style) -> Self {
+        self.highlight_style = style
+        self
     }
 
     /// Starts the selected row with `symbol`, such as `"> "`, and every
     /// other row with as many blank columns.
-    pub fn highlight_symbol(own self, _ symbol: String<31>) -> Self {
-        List {
-            style: self.style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: symbol,
-            item_height: self.item_height,
-            placeholder: self.placeholder,
-        }
+    pub fn highlight_symbol(var own self, _ symbol: String<31>) -> Self {
+        self.highlight_symbol = symbol
+        self
     }
 
     /// Gives each item `rows` rows, at least one. An item the area's
     /// bottom cuts is drawn as far as it fits.
-    pub fn item_height(own self, _ rows: u16) -> Self {
-        List {
-            style: self.style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: if rows == 0 { 1 } else { rows },
-            placeholder: self.placeholder,
-        }
+    pub fn item_height(var own self, _ rows: u16) -> Self {
+        self.item_height = if rows == 0 { 1 } else { rows }
+        self
     }
 
-    /// Draws `text` in the theme's muted style when there are no items.
-    pub fn placeholder(own self, _ text: String<31>) -> Self {
-        List {
-            style: self.style,
-            highlight_style: self.highlight_style,
-            highlight_symbol: self.highlight_symbol,
-            item_height: self.item_height,
-            placeholder: text,
-        }
+    /// Ends an item `render` cuts at the area's right edge with an
+    /// ellipsis, as a list does unless `ellipsis(false)`, or cuts it there
+    /// plainly.
+    pub fn ellipsis(var own self, _ show: bool) -> Self {
+        self.ellipsis = show
+        self
+    }
+
+    /// Draws `text` when there are no items.
+    pub fn placeholder(var own self, _ text: String<31>) -> Self {
+        self.placeholder = text
+        self
+    }
+
+    /// Applies `style` over the theme's muted style for the placeholder.
+    pub fn placeholder_style(var own self, _ style: Style) -> Self {
+        self.placeholder_style = style
+        self
     }
 
     /// Draws the `Display` text of each item in `area`, on the first row
@@ -153,19 +148,20 @@ impl List {
     )
     uses (frame: mut Frame, C::E)
     {
+        let ellipsis = self.ellipsis
         self.render_with(
             area,
             items,
             mut state,
             |item, row| {
-                print_in(row.area, item, Style::NONE)
+                print_cut(row.area, item, Alignment::Left, ellipsis)
             },
         )
     }
 
     /// Draws the items of `items` in `area`, each by calling `draw` with
     /// the item and its row, with the frame clipped to the row.
-    pub fn render_with<T, C: Len + Index<usize, Output = T>, F: Fn(T, ListRow)>(
+    pub fn render_with<C: Len + Index<usize>, F: Fn(C::Output, ListRow)>(
         self,
         _ area: Rect,
         _ items: C,
@@ -180,7 +176,11 @@ impl List {
         let theme = theme()
         set_style(area, theme.text.patch(self.style))
         if len == 0 {
-            print_in(area, self.placeholder, theme.muted)
+            print_in(
+                area,
+                self.placeholder,
+                theme.muted.patch(self.placeholder_style),
+            )
             return
         }
         let highlight = theme.highlight.patch(self.highlight_style)
@@ -200,9 +200,8 @@ impl List {
             if selected {
                 print_in(row, self.highlight_symbol, Style::NONE)
             }
-            // A `with (Frame = clipped(content))` here would not reach
-            // `draw`, whose row takes this function's own frame: clip that
-            // frame in place.
+            // `with (Frame = clipped(content))` would not reach `draw`; see
+            // `Frame::clip_to`.
             let clip = frame.clip_to(content)
             draw(items[index], ListRow { index, area: content, selected })
             frame.restore_clip(clip)
@@ -224,13 +223,18 @@ impl Default for List {
 
 /// The state of a `List` that outlives a frame: the selected item, the
 /// scroll position, and what the last render laid out, which key and
-/// mouse handling use.
+/// mouse handling use. `TableState` keeps its rows in one.
 ///
-/// Moving the selection clamps to the items the last render drew, and
-/// makes the view follow the selection: each render scrolls as little as
-/// shows it. Scrolling the view itself, by `scroll_by` or the mouse wheel,
-/// stops that until the selection moves again, so the selected item may
-/// scroll out of view.
+/// Moving the selection clamps to the items the last render drew and
+/// scrolls as little as shows the selected item, and each render does the
+/// same after clamping the selection to the items there are (no items, no
+/// selection), so the view follows the selection. Scrolling the view
+/// itself, by `scroll_by`, `scroll_to` or the mouse wheel, leaves the
+/// selection where it is and stops the following until the selection moves
+/// again, so the selected item may scroll out of view.
+///
+/// Without a selection, the keys that move it start from the view: Down
+/// and PageDown select the first item shown, Up and PageUp the last.
 pub struct ListState {
     selected: Option<usize>,
     scroll: ScrollState,
@@ -267,18 +271,16 @@ impl ListState {
 
     /// This state with `j`, `k`, `g` and `G` moving the selection as Down,
     /// Up, Home and End do in `handle_key`.
-    pub fn vi_keys(own self) -> Self {
-        var state = self
-        state.vi_keys = true
-        state
+    pub fn vi_keys(var own self) -> Self {
+        self.vi_keys = true
+        self
     }
 
     /// This state with the selection moving from the last item to the
     /// first with `select_next`, and back with `select_previous`.
-    pub fn wrap_around(own self) -> Self {
-        var state = self
-        state.wrap_around = true
-        state
+    pub fn wrap_around(var own self) -> Self {
+        self.wrap_around = true
+        self
     }
 
     /// The selected item's index.
@@ -297,21 +299,22 @@ impl ListState {
     }
 
     /// The scroll position in items, with the items and the items the area
-    /// shows whole: what a scrollbar shows.
+    /// shows whole: what a scrollbar shows (`Scrollbar::render_for`).
     pub fn scroll(self) -> ScrollState {
         self.scroll
     }
 
-    /// The area the last render drew in.
+    /// The area the last render drew the items in.
     pub fn area(self) -> Rect {
         self.area
     }
 
-    /// Selects the item at `index`. The next render clamps an index beyond
-    /// the last item to it.
+    /// Selects the item at `index` and scrolls as little as shows it. The
+    /// next render clamps an index beyond the last item to it.
     pub fn select(mut self, _ index: usize) {
         self.selected = Option::Some(index)
         self.follow = true
+        self.scroll.ensure_visible(index)
     }
 
     /// Selects no item.
@@ -319,9 +322,9 @@ impl ListState {
         self.selected = Option::None
     }
 
-    /// Selects the item after the selected one, or the first if none is.
-    /// From the last item it stays, or moves to the first if the state
-    /// wraps around.
+    /// Selects the item after the selected one, or the first one shown if
+    /// none is. From the last item it stays, or moves to the first if the
+    /// state wraps around.
     pub fn select_next(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -329,14 +332,14 @@ impl ListState {
             Option::Some(i) => if i < len - 1 {
                 i + 1
             } else if self.wrap_around { 0 } else { len - 1 },
-            Option::None => 0,
+            Option::None => self.scroll.position(),
         }
         self.select(next)
     }
 
-    /// Selects the item before the selected one, or the last if none is.
-    /// From the first item it stays, or moves to the last if the state
-    /// wraps around.
+    /// Selects the item before the selected one, or the last one shown if
+    /// none is. From the first item it stays, or moves to the last if the
+    /// state wraps around.
     pub fn select_previous(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -346,7 +349,7 @@ impl ListState {
             } else if i > 0 {
                 i - 1
             } else if self.wrap_around { len - 1 } else { 0 },
-            Option::None => len - 1,
+            Option::None => self.last_shown(),
         }
         self.select(previous)
     }
@@ -368,7 +371,7 @@ impl ListState {
 
     /// Moves the view and the selection down by the items the area shows,
     /// so the selection keeps its place in the view until the end of the
-    /// list. Without a selection, selects the first item.
+    /// list. Without a selection, selects the first item shown.
     pub fn page_down(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -379,13 +382,13 @@ impl ListState {
                 let next = i.saturating_add(page)
                 self.select(if next < len { next } else { len - 1 })
             },
-            Option::None => self.select(0),
+            Option::None => self.select_next(),
         }
     }
 
     /// Moves the view and the selection up by the items the area shows,
     /// so the selection keeps its place in the view until the start of the
-    /// list. Without a selection, selects the last item.
+    /// list. Without a selection, selects the last item shown.
     pub fn page_up(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -396,13 +399,22 @@ impl ListState {
                 let last = if i < len { i } else { len - 1 }
                 self.select(last.saturating_sub(page))
             },
-            Option::None => self.select(len - 1),
+            Option::None => self.select_previous(),
         }
     }
 
-    /// Scrolls the view by `delta` items, leaving the selection where it is.
+    /// Scrolls the view by `delta` items, forward if it is positive,
+    /// leaving the selection where it is.
     pub fn scroll_by(mut self, _ delta: isize) {
         self.scroll.scroll_by(delta)
+        self.follow = false
+    }
+
+    /// Scrolls the view to show item `position` first, or as near as the
+    /// items allow, leaving the selection where it is: to follow a dragged
+    /// scrollbar (`Scrollbar::position_at`).
+    pub fn scroll_to(mut self, _ position: usize) {
+        self.scroll.scroll_to(position)
         self.follow = false
     }
 
@@ -419,11 +431,11 @@ impl ListState {
         }
     }
 
-    /// Moves the selection for a key press: Up and Down by an item, Home
-    /// and End to the first and last, PageUp and PageDown by a page, and
-    /// with `vi_keys` also `k`, `j`, `g` and `G`. Returns whether the key
-    /// is one of these, which the list takes even where the selection
-    /// cannot move.
+    /// Moves the selection for a key press without modifiers: Up and Down
+    /// by an item, Home and End to the first and last, PageUp and PageDown
+    /// by a page, and with `vi_keys` also `k`, `j`, `g` and `G`. Returns
+    /// whether the key is one of these, which the list takes even where the
+    /// selection cannot move, so it does not reach what handles keys next.
     pub fn handle_key(mut self, _ key: Key) -> bool {
         let vi = self.vi_keys
         if key.is(KeyCode::Up) || (vi && key.is_char(b'k')) {
@@ -444,29 +456,37 @@ impl ListState {
         true
     }
 
-    /// Handles a mouse event over the area the last render drew in: the
-    /// wheel scrolls the view, and a left click on an item selects it and
-    /// returns its index. Events elsewhere do nothing.
+    /// Handles a mouse event over the area the last render drew in: each
+    /// notch of the wheel scrolls the view by `WHEEL_ROWS` rows, at least an
+    /// item, and a left click on an item selects it and returns its index.
+    /// Events elsewhere do nothing.
     pub fn handle_mouse(mut self, _ mouse: Mouse) -> Option<usize> {
         if !self.area.contains(mouse.pos) {
             return Option::None
         }
+        if !self.wheel(mouse.kind) && mouse.kind == MouseKind::Down(MouseButton::Left) {
+            let index = self.index_at(mouse.pos)?
+            self.select(index)
+            return Option::Some(index)
+        }
+        Option::None
+    }
+
+    // Scrolls for a notch of the wheel, if `kind` is one: whether it is.
+    pub(ingot) fn wheel(mut self, _ kind: MouseKind) -> bool {
         let step = (if WHEEL_ROWS > self.item_height {
             WHEEL_ROWS / self.item_height
         } else {
             1
         }) as isize
-        match mouse.kind {
+        match kind {
             MouseKind::ScrollDown => self.scroll_by(step),
             MouseKind::ScrollUp => self.scroll_by(-step),
-            MouseKind::Down(MouseButton::Left) => {
-                let index = self.index_at(mouse.pos)?
-                self.select(index)
-                return Option::Some(index)
+            _ => {
+                return false
             },
-            _ => {},
         }
-        Option::None
+        true
     }
 
     // The items the area shows whole, at least one.
@@ -475,10 +495,16 @@ impl ListState {
         if viewport > 0 { viewport } else { 1 }
     }
 
+    // The last item shown.
+    fn last_shown(self) -> usize {
+        let end = self.scroll.position().saturating_add(self.page())
+        (if end < self.len() { end } else { self.len() }) - 1
+    }
+
     // Records what a render lays out: `len` items in `area`, `item_height`
     // rows each. Clamps the selection to the items and the scroll position
     // to the rows, then follows the selection.
-    fn lay_out(mut self, _ len: usize, _ area: Rect, _ item_height: u16) {
+    pub(ingot) fn lay_out(mut self, _ len: usize, _ area: Rect, _ item_height: u16) {
         self.area = area
         self.item_height = item_height
         match self.selected {
@@ -515,10 +541,6 @@ fn is_shift_g(_ key: Key) -> bool {
     key.is_char(b'G')
         || key.pressed(KeyCode::Char(b'G'), Modifiers::SHIFT)
         || key.pressed(KeyCode::Char(b'g'), Modifiers::SHIFT)
-}
-
-fn frame_of(width: u16, height: u16) -> Frame {
-    Frame::new(Buffer::new(Size::new(width, height)), Theme::dark())
 }
 
 fn letters() -> MemVec<MemBuffer> {
@@ -687,10 +709,35 @@ fn pages_move_the_view_and_the_selection_together() {
     )
     var fresh = ListState::new()
     press(mut fresh, KeyCode::Home)
+    // Without a selection, pages start from the view: PageUp selects the
+    // last item shown.
     fresh.deselect()
     assert(
-        press(mut fresh, KeyCode::PageUp) == 7 && fresh.selected() == Option::Some(9),
+        press(mut fresh, KeyCode::PageUp) == 0 && fresh.selected() == Option::Some(2),
     )
+}
+
+#[test]
+fn keys_without_a_selection_start_from_the_view() {
+    var state = ListState::new()
+    press(mut state, KeyCode::Home)
+    state.deselect()
+    state.scroll_by(4)
+    assert(
+        press(mut state, KeyCode::Down) == 4 && state.selected() == Option::Some(4),
+    )
+    state.deselect()
+    assert(
+        press(mut state, KeyCode::Up) == 4 && state.selected() == Option::Some(6),
+    )
+    state.deselect()
+    state.scroll_to(7)
+    assert(
+        press(mut state, KeyCode::PageDown) == 7 && state.selected() == Option::Some(7),
+    )
+    // A selection scrolls into view as it is made, before a render.
+    state.select(1)
+    assert(state.scroll().position() == 1)
 }
 
 #[test]
@@ -767,11 +814,15 @@ fn an_empty_list_shows_its_placeholder() {
     var state = ListState::new()
     let none: [String<1>; 0] = []
     with (frame) {
-        List::new().placeholder("No items").render(area, none, mut state)
+        List::new()
+            .placeholder("No items")
+            .placeholder_style(Style::new().fg(Color::RED))
+            .render(area, none, mut state)
     }
     assert(frame.buffer().to_text() == "No items\n")
+    let cell = frame.buffer().get(Pos::new(x: 0, y: 0)).unwrap()
     assert(
-        frame.buffer().get(Pos::new(x: 0, y: 0)).unwrap().modifier() == Modifier::DIM,
+        cell.modifier() == Modifier::DIM && cell.fg() == Color::RED,
     )
     state.select_next()
     state.page_down()
@@ -849,7 +900,7 @@ fn the_wheel_scrolls_the_view_until_the_selection_moves() {
 struct Entry { name: MemBuffer, size: u64 }
 
 #[test]
-fn rows_can_be_drawn_by_a_closure() {
+fn rows_can_be_drawn_by_a_closure_clipped_to_them() {
     var entries: MemVec<Entry> = MemVec::new()
     entries.push(Entry { name: format!("a.txt"), size: 10 })
     entries.push(Entry { name: format!("bin"), size: 2048 })
@@ -869,7 +920,7 @@ fn rows_can_be_drawn_by_a_closure() {
                     let (name, size) = row.area.split_right(5)
                     print_in(name, format!(row.index, ":", entry.name), Style::NONE)
                     Paragraph::new().right().render(size, entry.size)
-                    // Drawing stays in the row.
+                    // Outside the row: clipped away.
                     print_in(
                         Rect::new(x: 0, y: 0, width: 12, height: 2),
                         "!",
@@ -956,18 +1007,20 @@ fn tiny_areas_draw_what_fits() {
 }
 
 #[test]
-fn wide_items_are_cut_at_the_edge() {
+fn wide_items_are_cut_at_the_edge_with_an_ellipsis() {
     var frame = frame_of(width: 3, height: 2)
     frame.fill(frame.area(), ".", Style::new())
     let area = frame.area()
     var state = ListState::new()
     with (frame) {
-        List::new().render(area, ["ab漢", "漢字"], mut state)
+        List::new().ellipsis(false).render(area, ["ab漢", "漢字"], mut state)
     }
-    // A wide cluster that would cross the edge leaves a space in its one
-    // column.
-    assert(frame.buffer().to_text() == "ab\n漢")
-    assert(
-        frame.buffer().get(Pos::new(x: 2, y: 1)).unwrap().width() == 1,
-    )
+    // A wide cluster that would cross the edge is left out, and its one
+    // column left as it was.
+    assert(frame.buffer().to_text() == "ab.\n漢.")
+    // With an ellipsis unless asked not to.
+    with (frame) {
+        List::new().render(area, ["ab漢", "漢字", "abc"], mut state)
+    }
+    assert(frame.buffer().to_text() == "ab…\n漢…")
 }

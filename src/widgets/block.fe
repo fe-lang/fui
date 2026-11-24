@@ -1,11 +1,10 @@
 //! Borders and titles around an area.
-use core::MemSpan
 use core::ops::{BitAnd, BitOr, Eq}
 use std::io::Display
-use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
 use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Modifier, Style}
-use super::{Alignment, clamp_u16, drawn, drawn_text, measure}
+use super::{Alignment, clamp_u16, print_cut}
 
 /// A set of the sides of a `Block` that have a border:
 /// `Borders::TOP | Borders::BOTTOM`.
@@ -32,13 +31,20 @@ impl BitAnd for Borders {
 }
 
 impl Borders {
+    /// No side.
     pub const NONE: Borders = Borders { bits: 0 }
+    /// The top side.
     pub const TOP: Borders = Borders { bits: 1 }
+    /// The right side.
     pub const RIGHT: Borders = Borders { bits: 2 }
+    /// The bottom side.
     pub const BOTTOM: Borders = Borders { bits: 4 }
+    /// The left side.
     pub const LEFT: Borders = Borders { bits: 8 }
+    /// Every side.
     pub const ALL: Borders = Borders { bits: 15 }
 
+    /// Whether the set has no side.
     pub fn is_empty(self) -> bool {
         self.bits == 0
     }
@@ -80,17 +86,24 @@ impl Eq for BorderType {
 
 /// The symbols of a border: its two lines and four corners, each one cell.
 pub struct BorderSymbols {
+    /// The top and bottom lines.
     pub horizontal: String<3>,
+    /// The left and right lines.
     pub vertical: String<3>,
+    /// The corner where the top and left borders meet.
     pub top_left: String<3>,
+    /// The corner where the top and right borders meet.
     pub top_right: String<3>,
+    /// The corner where the bottom and left borders meet.
     pub bottom_left: String<3>,
+    /// The corner where the bottom and right borders meet.
     pub bottom_right: String<3>,
 }
 
 impl Copy for BorderSymbols {}
 
 impl BorderType {
+    /// The symbols this type draws with.
     pub fn symbols(self) -> BorderSymbols {
         match self {
             BorderType::Plain => BorderSymbols {
@@ -138,7 +151,16 @@ impl BorderType {
 }
 
 /// Empty cells between a block's borders and its inner area, on each side.
-pub struct Padding { pub top: u16, pub right: u16, pub bottom: u16, pub left: u16 }
+pub struct Padding {
+    /// Rows below the top border.
+    pub top: u16,
+    /// Columns before the right border.
+    pub right: u16,
+    /// Rows above the bottom border.
+    pub bottom: u16,
+    /// Columns after the left border.
+    pub left: u16,
+}
 
 impl Copy for Padding {}
 
@@ -152,8 +174,10 @@ impl Eq for Padding {
 }
 
 impl Padding {
+    /// No padding.
     pub const ZERO: Padding = Padding { top: 0, right: 0, bottom: 0, left: 0 }
 
+    /// `top`, `right`, `bottom` and `left` cells on those sides.
     pub fn new(top: u16, right: u16, bottom: u16, left: u16) -> Self {
         Padding { top, right, bottom, left }
     }
@@ -186,8 +210,8 @@ impl Padding {
 ///
 /// A border runs along each side in `borders`, with a corner where two
 /// meet. A title sits in its border between the corners, or, without that
-/// border, takes the row itself; it is cut at the corners if it does not
-/// fit. Borders take the theme's `border` style and titles its `title`
+/// border, takes the row itself; one that does not fit is cut at the
+/// corners and ends in an ellipsis unless `ellipsis(false)`. Borders take the theme's `border` style and titles its `title`
 /// style, each with the block's own style for them over it. The block's
 /// `style` applies first, to the whole area, such as a background color;
 /// the cells inside keep their symbols.
@@ -200,6 +224,7 @@ pub struct Block {
     padding: Padding,
     title_alignment: Alignment,
     bottom_title_alignment: Alignment,
+    ellipsis: bool,
 }
 
 impl Copy for Block {}
@@ -217,6 +242,7 @@ impl Block {
             padding: Padding::ZERO,
             title_alignment: Alignment::Left,
             bottom_title_alignment: Alignment::Left,
+            ellipsis: true,
         }
     }
 
@@ -225,11 +251,13 @@ impl Block {
         Block::new().borders(Borders::ALL)
     }
 
+    /// This block with a border on each side in `borders`.
     pub fn borders(var own self, _ borders: Borders) -> Self {
         self.borders = borders
         self
     }
 
+    /// This block with its borders drawn in the lines of `border_type`.
     pub fn border_type(var own self, _ border_type: BorderType) -> Self {
         self.border_type = border_type
         self
@@ -258,6 +286,7 @@ impl Block {
         self
     }
 
+    /// This block with `padding` between its borders and its inner area.
     pub fn padding(var own self, _ padding: Padding) -> Self {
         self.padding = padding
         self
@@ -272,6 +301,13 @@ impl Block {
     /// Where the bottom title sits: on the left unless set.
     pub fn bottom_title_alignment(var own self, _ alignment: Alignment) -> Self {
         self.bottom_title_alignment = alignment
+        self
+    }
+
+    /// Ends a title cut at the corners with an ellipsis, as a block does
+    /// unless `ellipsis(false)`, or cuts it there plainly.
+    pub fn ellipsis(var own self, _ show: bool) -> Self {
+        self.ellipsis = show
         self
     }
 
@@ -323,24 +359,23 @@ impl Block {
                 border,
             )
         }
-        var scratch = MemBuffer::empty()
-        let top_width = measure(top, mut scratch)
+        let top_width = measure(top)
         self.edge(
             area,
             y: area.y,
             line: self.borders.contains(Borders::TOP),
             corners: (symbols.top_left, symbols.top_right),
-            title: scratch.span(),
+            title: top,
             title_width: top_width,
             alignment: self.title_alignment,
         )
-        let bottom_width = measure(bottom, mut scratch)
+        let bottom_width = measure(bottom)
         self.edge(
             area,
             y: area.bottom() - 1,
             line: self.borders.contains(Borders::BOTTOM),
             corners: (symbols.bottom_left, symbols.bottom_right),
-            title: scratch.span(),
+            title: bottom,
             title_width: bottom_width,
             alignment: self.bottom_title_alignment,
         )
@@ -349,13 +384,13 @@ impl Block {
 
     // Draws row `y` of `area`, the top or the bottom one: the border line
     // if `line`, its corners where a side border meets it, and the title.
-    fn edge(
+    fn edge<T: Display>(
         self,
         _ area: Rect,
         y: u16,
         line: bool,
         corners: (String<3>, String<3>),
-        title: MemSpan,
+        title: T,
         title_width: usize,
         alignment: Alignment,
     )
@@ -396,11 +431,9 @@ impl Block {
             }
         }
         if width > 0 {
-            print_in(
-                Rect { x: at, y, width, height: 1 },
-                title,
-                theme().title.patch(self.title_style),
-            )
+            let cells = Rect { x: at, y, width, height: 1 }
+            frame.set_style(cells, theme().title.patch(self.title_style))
+            print_cut(cells, title, Alignment::Left, ellipsis: self.ellipsis)
         }
     }
 
@@ -567,16 +600,32 @@ fn titles_align_between_the_corners() {
 fn long_titles_are_cut_at_the_corners() {
     let text = drawn_text(
         width: 8,
-        height: 2,
+        height: 3,
         |frame, area| {
             with (frame) {
+                let (top, bottom) = area.split_top(2)
                 Block::bordered()
                     .title_alignment(Alignment::Center)
-                    .render_titles(area, top: "Directory listing", bottom: "exactly6")
+                    .render_titles(top, top: "Directory listing", bottom: "exactly6")
+                Block::new()
+                    .borders(Borders::TOP)
+                    .ellipsis(false)
+                    .render_titled(bottom, "Directory listing")
             }
         },
     )
-    assert(text == "┌Direct┐\n└exactl┘")
+    // With an ellipsis unless asked not to; a title that fits has none.
+    assert(text == "┌Direc…┐\n└exact…┘\nDirector")
+    let text = drawn_text(
+        width: 8,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Block::new().borders(Borders::LEFT | Borders::RIGHT).render_titled(area, "exactly6")
+            }
+        },
+    )
+    assert(text == "│exact…│")
     let text = drawn_text(
         width: 2,
         height: 2,
@@ -596,7 +645,7 @@ fn long_titles_are_cut_at_the_corners() {
             }
         },
     )
-    assert(text == "│Fi")
+    assert(text == "│F…")
 }
 
 #[test]
@@ -690,7 +739,7 @@ fn blocks_draw_only_in_their_area() {
             }
         },
     )
-    assert(text == ".......\n.┌abc┐.\n.│...│.\n.└───┘.\n.......")
+    assert(text == ".......\n.┌ab…┐.\n.│...│.\n.└───┘.\n.......")
     let text = drawn_text(
         width: 3,
         height: 3,

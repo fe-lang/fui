@@ -8,8 +8,11 @@ use super::width
 
 /// Where content narrower than its area sits in it.
 pub enum Alignment {
+    /// At the left edge.
     Left,
+    /// In the middle, leaning left by half a column when it cannot be exact.
     Center,
+    /// At the right edge.
     Right,
 }
 
@@ -43,7 +46,14 @@ impl Alignment {
 }
 
 /// A part of a line in one style: the bytes `start..end` of its text.
-pub struct Run { pub start: usize, pub end: usize, pub style: Style }
+pub struct Run {
+    /// The offset of its first byte.
+    pub start: usize,
+    /// The offset after its last byte.
+    pub end: usize,
+    /// The style its bytes are drawn in.
+    pub style: Style,
+}
 
 impl Copy for Run {}
 
@@ -61,11 +71,21 @@ impl Copy for Stored {}
 /// One line of text in runs of styles: its bytes and, for each run, where
 /// it ends and its style. Adjacent pushes in one style make one run, and an
 /// empty push makes none. A line is a collection of its runs, in order:
-/// `for run in line { draw(line.text().slice(offset: run.start, len:
-/// run.end - run.start), run.style) }`.
+///
+/// ```fe
+/// fn columns_in(_ line: Line, _ style: Style) -> usize {
+///     var columns: usize = 0
+///     for run in line {
+///         if run.style == style {
+///             columns += width(line.text().slice(offset: run.start, len: run.end - run.start))
+///         }
+///     }
+///     columns
+/// }
+/// ```
 ///
 /// A line holds no line breaks: an LF in it is a control, which takes no
-/// column. `Text::from` splits text into lines.
+/// column. `Lines::from` splits text into lines.
 pub struct Line { text: MemBuffer, runs: MemVec<Stored> }
 
 impl Line {
@@ -172,12 +192,12 @@ impl Display for Line {
 }
 
 /// Lines of styled text, top to bottom.
-pub struct Text { lines: MemVec<Line> }
+pub struct Lines { lines: MemVec<Line> }
 
-impl Text {
+impl Lines {
     /// A text without lines.
     pub fn new() -> Self {
-        Text { lines: MemVec::new() }
+        Lines { lines: MemVec::new() }
     }
 
     /// The lines of `value`'s text with no style, split at each LF and
@@ -187,7 +207,7 @@ impl Text {
         var bytes = MemBuffer::empty()
         value.fmt(mut bytes)
         let all = bytes.span()
-        var text = Text::new()
+        var text = Lines::new()
         var start: usize = 0
         var offset: usize = 0
         while offset < all.len() {

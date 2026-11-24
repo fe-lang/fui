@@ -1,16 +1,16 @@
 //! Clearing an area, for what is drawn over other widgets.
-use ingot::frame::{Frame, fill}
+use ingot::frame::{Frame, drawn, drawn_text, fill}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Style}
-use super::{Block, drawn, drawn_text}
+use super::Block
 
 /// Makes every cell of `area` empty: a space in the terminal's default
 /// colors, without attributes. What was drawn there before no longer
 /// shows through what is drawn next:
 ///
 /// ```fe
-/// fn view(_ area: Rect) uses (frame: mut Frame) {
-///     List::new().render(area, ..)
+/// fn view(_ area: Rect, _ names: MemSlice<MemBuffer>, _ files: mut ListState) uses (frame: mut Frame) {
+///     List::new().render(area, names, mut files)
 ///     let dialog = area.centered(width: 30, height: 5)
 ///     clear(dialog)
 ///     Block::bordered().render_titled(dialog, "Quit?")
@@ -24,7 +24,11 @@ pub fn clear(_ area: Rect) uses (frame: mut Frame) {
 /// `area`, cleared, for a popup to draw in:
 ///
 /// ```fe
-/// let inner = Block::bordered().render_titled(popup(area, width: 30, height: 5), "Quit?")
+/// fn view(_ area: Rect, _ names: MemSlice<MemBuffer>, _ files: mut ListState) uses (frame: mut Frame) {
+///     List::new().render(area, names, mut files)
+///     let inner = Block::bordered().render_titled(popup(area, width: 30, height: 5), "Quit?")
+///     Paragraph::new().centered().render(inner, "y / n")
+/// }
 /// ```
 pub fn popup(_ area: Rect, width: u16, height: u16) -> Rect
 uses (frame: mut Frame)

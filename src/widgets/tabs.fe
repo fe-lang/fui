@@ -2,25 +2,72 @@
 use core::ops::{Index, Len}
 use std::abi::DynString
 use std::io::Display
-use ingot::frame::{Frame, fill, print_in, theme}
+use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
+use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
-use super::{clamp_u16, drawn, drawn_text, measure}
+use ingot::text::Alignment
+use super::{clamp_u16, print_cut}
 
-/// What a row of `Tabs` keeps between frames: the selected tab, and where
-/// the last render drew the tabs, which `Tabs::tab_at` maps positions by.
+/// The most tabs a `TabsState` records for hit-testing. A row may show
+/// more, and a click on a later one selects none.
+pub const MAX_TABS: usize = 32
+
+/// The state of a row of `Tabs` that outlives a frame: the selected tab,
+/// the first tab shown, and where the last render drew the tabs, which key
+/// and mouse handling use.
+///
+/// One tab is always selected, the first unless chosen. A render clamps a
+/// selection past the last tab to it, and with no tabs selects the first.
 pub struct TabsState {
-    /// The selected tab. A render makes it the last tab if it is past it.
-    pub selected: usize,
-    // The first tab shown.
+    selected: usize,
     first: usize,
+    len: usize,
     area: Rect,
+    // The cells of the first `shown` tabs drawn, from `first`.
+    tabs: [Rect; MAX_TABS],
+    shown: usize,
+    wrap_around: bool,
+}
+
+impl Copy for TabsState {}
+
+/// The first tab selected.
+impl Default for TabsState {
+    fn default() -> Self {
+        TabsState::new()
+    }
 }
 
 impl TabsState {
-    /// The state with tab `selected` selected.
-    pub fn new(_ selected: usize) -> Self {
-        TabsState { selected, first: 0, area: Rect::ZERO }
+    /// The state with the first tab selected, before the first render.
+    pub fn new() -> Self {
+        TabsState {
+            selected: 0,
+            first: 0,
+            len: 0,
+            area: Rect::ZERO,
+            tabs: [Rect::ZERO; MAX_TABS],
+            shown: 0,
+            wrap_around: false,
+        }
+    }
+
+    /// This state with the selection moving from the last tab to the first
+    /// with `select_next`, and back with `select_previous`.
+    pub fn wrap_around(var own self) -> Self {
+        self.wrap_around = true
+        self
+    }
+
+    /// The selected tab.
+    pub fn selected(self) -> usize {
+        self.selected
+    }
+
+    /// The number of tabs, as the last render drew them.
+    pub fn len(self) -> usize {
+        self.len
     }
 
     /// The row the last render drew the tabs in.
@@ -33,14 +80,77 @@ impl TabsState {
     pub fn first(self) -> usize {
         self.first
     }
+
+    /// Selects tab `index`. The next render clamps an index past the last
+    /// tab to it.
+    pub fn select(mut self, _ index: usize) {
+        self.selected = index
+    }
+
+    /// Selects the tab after the selected one. From the last tab it stays,
+    /// or moves to the first if the state wraps around.
+    pub fn select_next(mut self) {
+        if self.len == 0 { return }
+        self.selected = if self.selected < self.len - 1 {
+            self.selected + 1
+        } else if self.wrap_around { 0 } else { self.len - 1 }
+    }
+
+    /// Selects the tab before the selected one. From the first tab it
+    /// stays, or moves to the last if the state wraps around.
+    pub fn select_previous(mut self) {
+        if self.len == 0 { return }
+        self.selected = if self.selected >= self.len {
+            self.len - 1
+        } else if self.selected > 0 {
+            self.selected - 1
+        } else if self.wrap_around { self.len - 1 } else { 0 }
+    }
+
+    /// The tab drawn at `pos` by the last render, or `None` if `pos` is on a
+    /// divider or past the tabs.
+    pub fn index_at(self, _ pos: Pos) -> Option<usize> {
+        for (i, tab) in self.tabs.enumerate().take(self.shown) {
+            if tab.contains(pos) {
+                return Option::Some(self.first + i)
+            }
+        }
+        Option::None
+    }
+
+    /// Moves the selection for a key press without modifiers: Left and
+    /// Right by a tab. Returns whether the key is one of these, which the
+    /// tabs take even where the selection cannot move.
+    pub fn handle_key(mut self, _ key: Key) -> bool {
+        if key.is(KeyCode::Left) {
+            self.select_previous()
+        } else if key.is(KeyCode::Right) {
+            self.select_next()
+        } else {
+            return false
+        }
+        true
+    }
+
+    /// Handles a mouse event: a left click on a tab the last render drew
+    /// selects it and returns its index. Other events do nothing.
+    pub fn handle_mouse(mut self, _ mouse: Mouse) -> Option<usize> {
+        if mouse.kind != MouseKind::Down(MouseButton::Left) {
+            return Option::None
+        }
+        let index = self.index_at(mouse.pos)?
+        self.selected = index
+        Option::Some(index)
+    }
 }
 
 /// A row of titles with one selected, on the top row of its area:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+/// fn view(_ area: Rect, _ tabs: mut TabsState) uses (frame: mut Frame) {
 ///     let (head, body) = area.split_top(1)
-///     Tabs::new().render(head, ["Files", "Search", "Help"], mut self.tabs)
+///     Tabs::new().render(head, ["Files", "Search", "Help"], mut tabs)
+///     Paragraph::new().render(body, tabs.selected())
 /// }
 /// ```
 ///
@@ -48,18 +158,20 @@ impl TabsState {
 /// `MemSlice` or `MemVec` of `MemBuffer`s or `DynString`s. Each tab is its
 /// title with padding on both sides, and a divider stands between tabs.
 /// When the tabs do not fit, the row scrolls by whole tabs to show the
-/// selected one, as little as it can from where it was.
+/// selected one, as little as it can from where it was, and a title the
+/// row's right edge cuts ends in an ellipsis unless `ellipsis(false)`.
 ///
-/// Titles take the theme's `text` style and the selected tab its `accent`
-/// style, over the padding too; dividers take the `border` style. A style
-/// set on the tabs applies over the theme's.
+/// Titles take the theme's `text` style and the selected tab its
+/// `highlight` style over it, padding included; dividers take the `border`
+/// style. A style set on the tabs applies over the theme's.
 pub struct Tabs {
     divider: String<16>,
     padding_left: u16,
     padding_right: u16,
     style: Style,
-    selected_style: Style,
+    highlight_style: Style,
     divider_style: Style,
+    ellipsis: bool,
 }
 
 impl Copy for Tabs {}
@@ -72,8 +184,9 @@ impl Tabs {
             padding_left: 1,
             padding_right: 1,
             style: Style::NONE,
-            selected_style: Style::NONE,
+            highlight_style: Style::NONE,
             divider_style: Style::NONE,
+            ellipsis: true,
         }
     }
 
@@ -96,9 +209,9 @@ impl Tabs {
         self
     }
 
-    /// The style for the selected tab, over the theme's `accent` style.
-    pub fn selected_style(var own self, _ style: Style) -> Self {
-        self.selected_style = style
+    /// The style for the selected tab, over the theme's `highlight` style.
+    pub fn highlight_style(var own self, _ style: Style) -> Self {
+        self.highlight_style = style
         self
     }
 
@@ -108,15 +221,24 @@ impl Tabs {
         self
     }
 
-    /// Draws `titles` on the top row of `area`, with `state.selected`
-    /// selected, and records in `state` what it drew.
+    /// Ends a title the row's right edge cuts with an ellipsis, as tabs do
+    /// unless `ellipsis(false)`, or cuts it there plainly.
+    pub fn ellipsis(var own self, _ show: bool) -> Self {
+        self.ellipsis = show
+        self
+    }
+
+    /// Draws `titles` on the top row of `area`, with the tab `state`
+    /// selects selected, and records in `state` what it drew.
     pub fn render<C: Len + Index<usize>>(self, _ area: Rect, _ titles: C, _ state: mut TabsState)
     uses (frame: mut Frame, C::E)
     where C::Output: Display
     {
         let (row, _) = area.split_top(1)
         state.area = row
+        state.shown = 0
         let count = titles.len()
+        state.len = count
         if count == 0 {
             state.selected = 0
             state.first = 0
@@ -125,19 +247,16 @@ impl Tabs {
         if state.selected >= count {
             state.selected = count - 1
         }
-        var scratch = MemBuffer::empty()
         let selected = state.selected
-        state.first = self
-            .scroll(
+        state.first = self.scroll(
                 titles,
                 room: row.width as usize,
                 selected,
                 first: state.first,
-                mut scratch,
             )
-        let divider_width = measure(self.divider, mut scratch)
+        let divider_width = measure(self.divider)
         let text = theme().text.patch(self.style)
-        let highlight = text.patch(theme().accent).patch(self.selected_style)
+        let highlight = text.patch(theme().highlight).patch(self.highlight_style)
         let divider = theme().border.patch(self.divider_style)
         var x = row.x as usize
         for i in state.first .. count {
@@ -148,51 +267,23 @@ impl Tabs {
                 print_in(part(row, x, divider_width), self.divider, divider)
                 x += divider_width
             }
-            let title = measure(titles[i], mut scratch)
+            let title = measure(titles[i])
             let width = title + self.padding_width()
             let style = if i == selected { highlight } else { text }
-            fill(part(row, x, width), " ", style)
-            print_in(
+            let tab = part(row, x, width)
+            if state.shown < MAX_TABS {
+                state.tabs[state.shown] = tab
+                state.shown += 1
+            }
+            fill(tab, " ", style)
+            print_cut(
                 part(row, x + self.padding_left as usize, title),
-                scratch.span(),
-                Style::NONE,
+                titles[i],
+                Alignment::Left,
+                ellipsis: self.ellipsis,
             )
             x += width
         }
-    }
-
-    /// The tab at `pos`, as the last render with `state` drew `titles`, or
-    /// `None` if `pos` is on a divider or past the tabs. Pass the titles
-    /// that render drew.
-    pub fn tab_at<C: Len + Index<usize>>(
-        self,
-        _ titles: C,
-        _ state: TabsState,
-        _ pos: Pos,
-    ) -> Option<usize>
-    uses C::E
-    where C::Output: Display
-    {
-        if !state.area.contains(pos) {
-            return Option::None
-        }
-        var scratch = MemBuffer::empty()
-        let divider_width = measure(self.divider, mut scratch)
-        let column = pos.x as usize
-        var x = state.area.x as usize
-        for i in state.first .. titles.len() {
-            if i > state.first {
-                x += divider_width
-                if column < x {
-                    return Option::None
-                }
-            }
-            x += self.tab_width(titles[i], mut scratch)
-            if column < x {
-                return Option::Some(i)
-            }
-        }
-        Option::None
     }
 
     // The first tab to show in `room` columns so that tab `selected` shows
@@ -205,28 +296,27 @@ impl Tabs {
         room: usize,
         selected: usize,
         first: usize,
-        _ scratch: mut MemBuffer,
     ) -> usize
-    uses C::E
+    uses (frame: mut Frame, C::E)
     where C::Output: Display
     {
-        let divider = measure(self.divider, mut scratch)
+        let divider = measure(self.divider)
         var first = if first > selected { selected } else { first }
         // The columns from the start of tab `first` to the end of `selected`.
         var shown: usize = 0
         for i in first .. selected + 1 {
-            shown += self.tab_width(titles[i], mut scratch) + if i > first { divider } else { 0 }
+            shown += self.tab_width(titles[i]) + if i > first { divider } else { 0 }
         }
         while first < selected && shown > room {
-            shown -= self.tab_width(titles[first], mut scratch) + divider
+            shown -= self.tab_width(titles[first]) + divider
             first += 1
         }
         // From there to the end of the last tab.
         for i in selected + 1 .. titles.len() {
-            shown += divider + self.tab_width(titles[i], mut scratch)
+            shown += divider + self.tab_width(titles[i])
         }
         while first > 0 {
-            let before = self.tab_width(titles[first - 1], mut scratch) + divider
+            let before = self.tab_width(titles[first - 1]) + divider
             if shown + before > room {
                 break
             }
@@ -236,9 +326,9 @@ impl Tabs {
         first
     }
 
-    // The columns of a tab with `title`, which is left in `scratch`.
-    fn tab_width<T: Display>(self, _ title: T, _ scratch: mut MemBuffer) -> usize {
-        measure(title, mut scratch) + self.padding_width()
+    // The columns of a tab with `title`.
+    fn tab_width<T: Display>(self, _ title: T) -> usize uses (frame: mut Frame) {
+        measure(title) + self.padding_width()
     }
 
     fn padding_width(self) -> usize {
@@ -256,6 +346,13 @@ fn part(_ row: Rect, _ x: usize, _ width: usize) -> Rect {
     ).intersect(row)
 }
 
+// A state with tab `index` selected.
+fn selecting(_ index: usize) -> TabsState {
+    var state = TabsState::new()
+    state.select(index)
+    state
+}
+
 #[test]
 fn tabs_draw_titles_between_dividers() {
     let text = drawn_text(
@@ -263,7 +360,7 @@ fn tabs_draw_titles_between_dividers() {
         height: 2,
         |frame, area| {
             with (frame) {
-                var state = TabsState::new(1)
+                var state = selecting(1)
                 Tabs::new().render(area, ["One", "Two", "Three"], mut state)
                 assert(
                     state.area() == Rect::new(x: 0, y: 0, width: 20, height: 1),
@@ -277,7 +374,7 @@ fn tabs_draw_titles_between_dividers() {
         height: 1,
         |frame, area| {
             with (frame) {
-                var state = TabsState::new(0)
+                var state = selecting(0)
                 Tabs::new()
                     .divider(" / ")
                     .padding(left: 0, right: 0)
@@ -295,9 +392,9 @@ fn the_selected_tab_stands_out() {
         height: 1,
         |frame, area| {
             with (frame) {
-                var state = TabsState::new(1)
+                var state = selecting(1)
                 Tabs::new()
-                    .selected_style(Style::new().bold())
+                    .highlight_style(Style::new().bold())
                     .render(area, ["ab", "cd"], mut state)
             }
         },
@@ -305,9 +402,7 @@ fn the_selected_tab_stands_out() {
     // " ab │ cd ": the selected tab is columns 5 to 8, padding included.
     for x in [5, 6, 7, 8] {
         let cell = buffer.get(Pos::new(x, y: 0)).unwrap()
-        assert(
-            cell.fg() == Color::CYAN && cell.modifier() == Modifier::BOLD,
-        )
+        assert(cell.modifier() == Modifier::REVERSED | Modifier::BOLD)
     }
     let other = buffer.get(Pos::new(x: 1, y: 0)).unwrap()
     assert(other.fg() == Color::RESET && other.modifier().is_empty())
@@ -324,9 +419,9 @@ fn scrolled(_ selections: [usize; 6]) -> MemBuffer {
         height: 6,
         |frame, area| {
             with (frame) {
-                var state = TabsState::new(0)
+                var state = selecting(0)
                 for (y, selected) in selections.enumerate() {
-                    state.selected = selected
+                    state.select(selected)
                     let row = Rect::new(x: 0, y: y.downcast_truncate(), width: 12, height: 1)
                     Tabs::new().render(row, ["Alpha", "Beta", "Gamma", "Delta"], mut state)
                 }
@@ -340,7 +435,7 @@ fn tabs_scroll_to_show_the_selected_one() {
     // The tabs are 7, 6, 7 and 7 columns, with a divider between each two.
     assert(
         scrolled([0, 1, 2, 3, 2, 0])
-            == " Alpha │ Bet\n Beta │ Gamm\n Gamma │ Del\n Delta\n Gamma │ Del\n Alpha │ Bet",
+            == " Alpha │ Be…\n Beta │ Gam…\n Gamma │ De…\n Delta\n Gamma │ De…\n Alpha │ Be…",
     )
     // A selection past the last tab selects the last.
     drawn(
@@ -348,9 +443,9 @@ fn tabs_scroll_to_show_the_selected_one() {
         height: 1,
         |frame, area| {
             with (frame) {
-                var state = TabsState::new(9)
+                var state = selecting(9)
                 Tabs::new().render(area, ["Alpha", "Beta", "Gamma", "Delta"], mut state)
-                assert(state.selected == 3 && state.first() == 3)
+                assert(state.selected() == 3 && state.first() == 3)
                 // A wider row shows earlier tabs again.
                 Tabs::new()
                     .render(
@@ -375,8 +470,19 @@ fn tabs_scroll_to_show_the_selected_one() {
         height: 1,
         |frame, area| {
             with (frame) {
-                var state = TabsState::new(1)
+                var state = selecting(1)
                 Tabs::new().render(area, ["Alpha", "Beta"], mut state)
+            }
+        },
+    )
+    assert(text == " Be…")
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                var state = selecting(1)
+                Tabs::new().ellipsis(false).render(area, ["Alpha", "Beta"], mut state)
             }
         },
     )
@@ -392,40 +498,28 @@ fn positions_map_back_to_tabs() {
         |frame, _| {
             with (frame) {
                 let tabs = Tabs::new()
-                var state = TabsState::new(0)
+                var state = selecting(0)
                 tabs.render(
                     Rect::new(x: 1, y: 1, width: 12, height: 2),
                     titles,
                     mut state,
                 )
-                assert(
-                    tabs.tab_at(titles, state, Pos::new(x: 1, y: 1)) == Option::Some(0),
-                )
-                assert(
-                    tabs.tab_at(titles, state, Pos::new(x: 7, y: 1)) == Option::Some(0),
-                )
-                assert(tabs.tab_at(titles, state, Pos::new(x: 8, y: 1)).is_none())
-                assert(
-                    tabs.tab_at(titles, state, Pos::new(x: 9, y: 1)) == Option::Some(1),
-                )
-                assert(
-                    tabs.tab_at(titles, state, Pos::new(x: 12, y: 1)) == Option::Some(1),
-                )
-                assert(
-                    tabs.tab_at(titles, state, Pos::new(x: 13, y: 1)).is_none(),
-                )
-                assert(tabs.tab_at(titles, state, Pos::new(x: 0, y: 1)).is_none())
-                assert(tabs.tab_at(titles, state, Pos::new(x: 3, y: 2)).is_none())
-                state.selected = 3
+                assert(state.index_at(Pos::new(x: 1, y: 1)) == Option::Some(0))
+                assert(state.index_at(Pos::new(x: 7, y: 1)) == Option::Some(0))
+                assert(state.index_at(Pos::new(x: 8, y: 1)).is_none())
+                assert(state.index_at(Pos::new(x: 9, y: 1)) == Option::Some(1))
+                assert(state.index_at(Pos::new(x: 12, y: 1)) == Option::Some(1))
+                assert(state.index_at(Pos::new(x: 13, y: 1)).is_none())
+                assert(state.index_at(Pos::new(x: 0, y: 1)).is_none())
+                assert(state.index_at(Pos::new(x: 3, y: 2)).is_none())
+                state.select(3)
                 tabs.render(
                     Rect::new(x: 1, y: 1, width: 12, height: 2),
                     titles,
                     mut state,
                 )
-                assert(
-                    tabs.tab_at(titles, state, Pos::new(x: 1, y: 1)) == Option::Some(3),
-                )
-                assert(tabs.tab_at(titles, state, Pos::new(x: 8, y: 1)).is_none())
+                assert(state.index_at(Pos::new(x: 1, y: 1)) == Option::Some(3))
+                assert(state.index_at(Pos::new(x: 8, y: 1)).is_none())
             }
         },
     )
@@ -444,7 +538,7 @@ fn titles_may_be_buffers_or_strings() {
         height: 3,
         |frame, area| {
             with (frame) {
-                var state = TabsState::new(0)
+                var state = selecting(0)
                 let (first, rest) = area.split_top(1)
                 Tabs::new().render(first, buffers.as_slice(), mut state)
                 let (second, third) = rest.split_top(1)
@@ -454,7 +548,7 @@ fn titles_may_be_buffers_or_strings() {
         },
     )
     assert(
-        text == " log │ tab 2\n x │ a title longer than\n x │ a title longer than",
+        text == " log │ tab 2\n x │ a title longer tha…\n x │ a title longer tha…",
     )
 }
 
@@ -467,9 +561,9 @@ fn tabs_draw_nothing_without_room_or_titles() {
         |frame, area| {
             with (frame) {
                 fill(area, ".", Style::new())
-                var state = TabsState::new(2)
+                var state = selecting(2)
                 Tabs::new().render(area, empty, mut state)
-                assert(state.selected == 0)
+                assert(state.selected() == 0)
                 Tabs::new()
                     .render(
                         Rect::new(x: 1, y: 1, width: 0, height: 1),
@@ -488,11 +582,66 @@ fn tabs_draw_nothing_without_room_or_titles() {
                         ["a", "b"],
                         mut state,
                     )
-                assert(
-                    Tabs::new().tab_at(["a", "b"], state, Pos::new(x: 4, y: 1)).is_none(),
-                )
+                assert(state.index_at(Pos::new(x: 4, y: 1)).is_none())
             }
         },
     )
     assert(text == ".....\n. a .")
+}
+
+#[test]
+fn keys_and_clicks_select_tabs() {
+    drawn(
+        width: 20,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                let titles = ["One", "Two", "Three"]
+                var state = TabsState::new()
+                // Before a render there are no tabs to move to.
+                state.select_next()
+                assert(state.selected() == 0)
+                Tabs::new().render(area, titles, mut state)
+                assert(state.len() == 3)
+                let right = Key::new(KeyCode::Right, Modifiers::NONE)
+                let left = Key::new(KeyCode::Left, Modifiers::NONE)
+                assert(state.handle_key(right) && state.selected() == 1)
+                assert(state.handle_key(right) && state.handle_key(right))
+                assert(state.selected() == 2)
+                assert(state.handle_key(left) && state.selected() == 1)
+                assert(
+                    !state.handle_key(Key::new(KeyCode::Right, Modifiers::CTRL)),
+                )
+                assert(!state.handle_key(Key::new(KeyCode::Up, Modifiers::NONE)))
+                // " One │ Two │ Three": a click on "Three", on a divider, and
+                // with another button.
+                let click = |x: u16| Mouse::new(
+                    MouseKind::Down(MouseButton::Left),
+                    Pos::new(x, y: 0),
+                    Modifiers::NONE,
+                )
+                assert(state.handle_mouse(click(14)) == Option::Some(2))
+                assert(state.selected() == 2)
+                assert(state.handle_mouse(click(5)).is_none())
+                assert(
+                    state
+                        .handle_mouse(
+                            Mouse::new(
+                                MouseKind::Down(MouseButton::Right),
+                                Pos::new(x: 1, y: 0),
+                                Modifiers::NONE,
+                            ),
+                        )
+                        .is_none(),
+                )
+                assert(state.selected() == 2)
+                var wrapping = TabsState::new().wrap_around()
+                Tabs::new().render(area, titles, mut wrapping)
+                wrapping.select_previous()
+                assert(wrapping.selected() == 2)
+                wrapping.select_next()
+                assert(wrapping.selected() == 0)
+            }
+        },
+    )
 }

@@ -1,9 +1,9 @@
 //! A scrollbar: where a view is in content longer than it.
 use core::ops::Eq
-use ingot::frame::{Frame, fill, theme}
+use ingot::frame::{Frame, drawn, drawn_text, fill, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
-use super::{drawn, drawn_text}
+use super::scroll::ScrollState
 
 /// Which way a `Scrollbar` runs.
 pub enum Orientation {
@@ -30,16 +30,13 @@ impl Eq for Orientation {
 /// from `position`:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-///     let rows = area.height as usize
-///     Scrollbar::vertical().render(
-///         area,
-///         content_length: self.lines.len(),
-///         viewport_length: rows,
-///         position: self.top,
-///     )
+/// fn view(_ area: Rect, _ lines: usize, _ top: usize) uses (frame: mut Frame) {
+///     Scrollbar::vertical().render(area, content_length: lines, viewport_length: area.height as usize, position: top)
 /// }
 /// ```
+///
+/// `render_for` takes the three numbers from a `ScrollState`, such as a
+/// `ListState`'s: `Scrollbar::vertical().render_for(bar, list.scroll())`.
 ///
 /// A vertical scrollbar takes the right column of its area and a
 /// horizontal one the bottom row, so it can share the area of what it
@@ -142,6 +139,19 @@ impl Scrollbar {
             self.thumb_area(area, content_length, viewport_length, position),
             self.thumb,
             theme().text.patch(self.thumb_style),
+        )
+    }
+
+    /// Draws the scrollbar in `area` for the view `scroll` records, such as
+    /// a `ListState`'s: `Scrollbar::vertical().render_for(area, self.list.scroll())`.
+    pub fn render_for(self, _ area: Rect, _ scroll: ScrollState)
+    uses (frame: mut Frame)
+    {
+        self.render(
+            area,
+            content_length: scroll.content(),
+            viewport_length: scroll.viewport(),
+            position: scroll.position(),
         )
     }
 
@@ -455,6 +465,23 @@ fn scrollbars_draw_along_an_edge() {
     assert(
         buffer.get(Pos::new(x: 0, y: 1)).unwrap().modifier() == Modifier::DIM,
     )
+}
+
+#[test]
+fn scrollbars_draw_a_scroll_state() {
+    var scroll = ScrollState::new()
+    scroll.set_lengths(content: 8, viewport: 4)
+    scroll.scroll_to(2)
+    let text = drawn_text(
+        width: 3,
+        height: 4,
+        |frame, area| {
+            with (frame) {
+                Scrollbar::vertical().render_for(area, scroll)
+            }
+        },
+    )
+    assert(text == "  │\n  █\n  █\n  │")
 }
 
 #[test]

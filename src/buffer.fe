@@ -21,7 +21,7 @@
 use core::ops::Eq
 use super::geom::{Pos, Rect, Size, min}
 use super::style::{Color, Modifier, Style}
-use super::text::{Cluster, next_cluster}
+use super::text::{Cluster, decode, is_control, is_valid, next_cluster}
 
 // `Cell::len` of a symbol in the side table, whose word holds its offset in
 // the low 32 bits and its length in the high 32.
@@ -141,6 +141,8 @@ impl Glyph {
     const CONTINUATION: Glyph = Glyph { symbol: 0, len: 0, width: 0 }
     // U+FFFD, for a byte that is no UTF-8.
     const REPLACEMENT: Glyph = Glyph { symbol: 0xbdbfef, len: 3, width: 1 }
+    // `text::ELLIPSIS`, U+2026.
+    const ELLIPSIS: Glyph = Glyph { symbol: 0xa680e2, len: 3, width: 1 }
 }
 
 /// A grid of cells, row by row, with the side table that holds symbols
@@ -165,6 +167,7 @@ impl Buffer {
         }
     }
 
+    /// The columns and rows of cells.
     pub fn size(self) -> Size {
         self.size
     }
@@ -415,6 +418,16 @@ impl Buffer {
         written.downcast_truncate()
     }
 
+    // Draws `text::ELLIPSIS` at `pos` as `draw` would, if its column is in
+    // `from..to`. Returns the columns written.
+    pub(ingot) fn draw_ellipsis(mut self, _ pos: Pos, _ style: Style, from: u16, to: u16) -> u16 {
+        if pos.y >= self.size.height || pos.x < from || pos.x >= to || pos.x >= self.size.width {
+            return 0
+        }
+        self.put(self.index(pos), Glyph::ELLIPSIS, style)
+        1
+    }
+
     // Writes `glyph` into every cell of `area`, as `fill` does.
     fn fill_glyph(mut self, _ area: Rect, _ glyph: Glyph, _ style: Style) {
         let area = area.intersect(self.area())
@@ -439,18 +452,13 @@ impl Buffer {
 
     // The glyph of `cluster`, whose bytes are `bytes`: `None` for a
     // control or a cluster of width 0, U+FFFD for bytes that are no UTF-8.
+    // A control is a cluster alone, or CR LF.
     fn glyph(mut self, _ bytes: MemSpan, _ cluster: Cluster) -> Option<Glyph> {
-        if cluster.width == 0 {
+        if cluster.width == 0 || is_control(decode(bytes, 0).value) {
             return Option::None
         }
-        match kind(bytes) {
-            Kind::Control => {
-                return Option::None
-            },
-            Kind::Invalid => {
-                return Option::Some(Glyph::REPLACEMENT)
-            },
-            Kind::Text => {},
+        if !is_valid(bytes) {
+            return Option::Some(Glyph::REPLACEMENT)
         }
         let (symbol, len) = self.intern(bytes)
         Option::Some(
@@ -533,61 +541,6 @@ impl Buffer {
     }
 }
 
-// What the bytes of a cluster hold.
-enum Kind {
-    // UTF-8 without controls.
-    Text,
-    // A C0 control, DEL or a C1 control (U+0080 to U+009F).
-    Control,
-    // Bytes that are no UTF-8.
-    Invalid,
-}
-
-fn kind(_ bytes: MemSpan) -> Kind {
-    var i: usize = 0
-    while i < bytes.len() {
-        let lead = bytes[i]
-        if lead < 0x80 {
-            if lead < 0x20 || lead == 0x7f {
-                return Kind::Control
-            }
-            i += 1
-            continue
-        }
-        if lead < 0xc2 || lead > 0xf4 {
-            return Kind::Invalid
-        }
-        let len: usize = if lead < 0xe0 {
-            2
-        } else if lead < 0xf0 { 3 } else { 4 }
-        if len > bytes.len() - i {
-            return Kind::Invalid
-        }
-        // The second byte's range keeps the form shortest and within the
-        // scalars (Unicode table 3-7).
-        let second = bytes[i + 1]
-        let low: u8 = if lead == 0xe0 {
-            0xa0
-        } else if lead == 0xf0 { 0x90 } else { 0x80 }
-        let high: u8 = if lead == 0xed {
-            0x9f
-        } else if lead == 0xf4 { 0x8f } else { 0xbf }
-        if second < low || second > high {
-            return Kind::Invalid
-        }
-        for byte in bytes.slice(offset: i + 2, len: len - 2) {
-            if byte < 0x80 || byte > 0xbf {
-                return Kind::Invalid
-            }
-        }
-        if lead == 0xc2 && second < 0xa0 {
-            return Kind::Control
-        }
-        i += len
-    }
-    Kind::Text
-}
-
 // Removes the spaces that end `out` after `start`.
 fn trim_spaces(_ out: mut MemBuffer, _ start: usize) {
     var len = out.len()
@@ -620,7 +573,8 @@ fn put_symbol(_ buffer: mut Buffer, _ pos: Pos, _ symbol: MemSpan, width: u8, _ 
     buffer.put(i, Glyph { symbol: word, len, width }, style)
 }
 
-fn at(_ buffer: Buffer, _ x: u16, _ y: u16) -> Cell {
+/// For tests: the cell at `(x, y)`, which must be in `buffer`.
+pub(ingot) fn cell_at(_ buffer: Buffer, x: u16, y: u16) -> Cell {
     buffer.get(Pos::new(x, y)).unwrap()
 }
 
@@ -704,18 +658,18 @@ fn styles_apply_over_the_cells() {
             Style::new().fg(Color::RED),
             max_width: 9,
         )
-    let a = at(buffer, 1, 0)
+    let a = cell_at(buffer, x: 1, y: 0)
     assert(
         a.fg() == Color::RED && a.bg() == Color::BLUE && a.modifier() == Modifier::BOLD,
     )
-    let b = at(buffer, 2, 0)
+    let b = cell_at(buffer, x: 2, y: 0)
     assert(b.fg() == Color::RED && b.bg() == Color::BLUE)
-    let c = at(buffer, 3, 0)
+    let c = cell_at(buffer, x: 3, y: 0)
     assert(
         c.fg() == Color::RESET && c.bg() == Color::RESET && c.modifier().is_empty(),
     )
     assert(
-        at(buffer, 0, 0).style() == Style::reset().bg(Color::BLUE).bold(),
+        cell_at(buffer, x: 0, y: 0).style() == Style::reset().bg(Color::BLUE).bold(),
     )
     buffer
         .set_style(
@@ -723,14 +677,15 @@ fn styles_apply_over_the_cells() {
             Style::new().without(Modifier::BOLD),
         )
     assert(
-        at(buffer, 2, 0).modifier().is_empty() && at(buffer, 0, 0).modifier() == Modifier::BOLD,
+        cell_at(buffer, x: 2, y: 0).modifier().is_empty()
+            && cell_at(buffer, x: 0, y: 0).modifier() == Modifier::BOLD,
     )
     buffer.set_style(
             Rect::new(x: 9, y: 9, width: 2, height: 2),
             Style::new().italic(),
         )
     buffer.set_style(Rect::ZERO, Style::new().italic())
-    assert(at(buffer, 0, 0).modifier() == Modifier::BOLD)
+    assert(cell_at(buffer, x: 0, y: 0).modifier() == Modifier::BOLD)
 }
 
 #[test]
@@ -773,7 +728,7 @@ fn controls_never_reach_a_cell() {
             Style::new(),
         )
     assert(
-        at(buffer, 6, 0) == Cell::EMPTY && at(buffer, 7, 0) == Cell::EMPTY,
+        cell_at(buffer, x: 6, y: 0) == Cell::EMPTY && cell_at(buffer, x: 7, y: 0) == Cell::EMPTY,
     )
 }
 
@@ -809,7 +764,7 @@ fn symbols_take_their_first_cluster() {
     )
     assert(buffer.to_text() == " ─")
     var out = MemBuffer::empty()
-    buffer.write_symbol(at(buffer, 1, 0), mut out)
+    buffer.write_symbol(cell_at(buffer, x: 1, y: 0), mut out)
     assert(out == "─")
 }
 
@@ -824,7 +779,8 @@ fn fills_clip_to_the_buffer() {
         )
     assert(buffer.to_text() == "\n ###\n ###")
     assert(
-        at(buffer, 3, 2).fg() == Color::GREEN && at(buffer, 0, 2).fg() == Color::RESET,
+        cell_at(buffer, x: 3, y: 2).fg() == Color::GREEN
+            && cell_at(buffer, x: 0, y: 2).fg() == Color::RESET,
     )
     buffer.fill(
             Rect::new(x: 2, y: 0, width: 1, height: 3),
@@ -835,7 +791,8 @@ fn fills_clip_to_the_buffer() {
     buffer.reset(Rect::new(x: 0, y: 2, width: 4, height: 1))
     assert(buffer.to_text() == "\n # #\n")
     assert(
-        at(buffer, 3, 2) == Cell::EMPTY && at(buffer, 3, 1).fg() == Color::GREEN,
+        cell_at(buffer, x: 3, y: 2) == Cell::EMPTY
+            && cell_at(buffer, x: 3, y: 1).fg() == Color::GREEN,
     )
     buffer.fill(Rect::ZERO, format!("x").span(), Style::new())
     buffer.fill(
@@ -858,9 +815,9 @@ fn overwriting_half_a_wide_symbol_blanks_the_other() {
         style,
     )
     assert(
-        at(buffer, 1, 0).width() == 2 && at(buffer, 2, 0).is_continuation(),
+        cell_at(buffer, x: 1, y: 0).width() == 2 && cell_at(buffer, x: 2, y: 0).is_continuation(),
     )
-    assert(at(buffer, 2, 0).fg() == Color::CYAN)
+    assert(cell_at(buffer, x: 2, y: 0).fg() == Color::CYAN)
     assert(buffer.to_text() == " 界")
     // The left half: the continuation becomes a space in its style.
     buffer.set_string(
@@ -871,7 +828,7 @@ fn overwriting_half_a_wide_symbol_blanks_the_other() {
         )
     assert(buffer.to_text() == " a")
     assert(
-        at(buffer, 2, 0).width() == 1 && at(buffer, 2, 0).fg() == Color::CYAN,
+        cell_at(buffer, x: 2, y: 0).width() == 1 && cell_at(buffer, x: 2, y: 0).fg() == Color::CYAN,
     )
     // The continuation: the left half becomes a space.
     put_symbol(
@@ -888,7 +845,7 @@ fn overwriting_half_a_wide_symbol_blanks_the_other() {
             max_width: 1,
         )
     assert(buffer.to_text() == "  b")
-    assert(at(buffer, 1, 0).width() == 1)
+    assert(cell_at(buffer, x: 1, y: 0).width() == 1)
     // A wide symbol over the continuation of another.
     put_symbol(
         mut buffer,
@@ -905,7 +862,7 @@ fn overwriting_half_a_wide_symbol_blanks_the_other() {
         style,
     )
     assert(buffer.to_text() == "  世")
-    assert(at(buffer, 4, 0) == at(buffer, 1, 0))
+    assert(cell_at(buffer, x: 4, y: 0) == cell_at(buffer, x: 1, y: 0))
     // A wide symbol over the left half of another.
     put_symbol(
         mut buffer,
@@ -915,7 +872,7 @@ fn overwriting_half_a_wide_symbol_blanks_the_other() {
         style,
     )
     assert(buffer.to_text() == "   界")
-    assert(at(buffer, 2, 0).width() == 1)
+    assert(cell_at(buffer, x: 2, y: 0).width() == 1)
 }
 
 #[test]
@@ -933,14 +890,15 @@ fn styling_half_a_wide_symbol_styles_it_whole() {
             Style::new().bg(Color::RED),
         )
     assert(
-        at(buffer, 0, 0).bg() == Color::RED && at(buffer, 1, 0).bg() == Color::RED,
+        cell_at(buffer, x: 0, y: 0).bg() == Color::RED
+            && cell_at(buffer, x: 1, y: 0).bg() == Color::RED,
     )
-    assert(at(buffer, 1, 0).is_continuation())
+    assert(cell_at(buffer, x: 1, y: 0).is_continuation())
     buffer.set_style(
             Rect::new(x: 0, y: 0, width: 1, height: 1),
             Style::new().bold(),
         )
-    assert(at(buffer, 1, 0).modifier() == Modifier::BOLD)
+    assert(cell_at(buffer, x: 1, y: 0).modifier() == Modifier::BOLD)
 }
 
 #[test]
@@ -954,7 +912,7 @@ fn wide_fills_leave_a_space_in_an_odd_column() {
         )
     assert(buffer.to_text() == "界界")
     assert(
-        at(buffer, 4, 0).width() == 1 && at(buffer, 3, 0).is_continuation(),
+        cell_at(buffer, x: 4, y: 0).width() == 1 && cell_at(buffer, x: 3, y: 0).is_continuation(),
     )
 }
 
@@ -994,16 +952,28 @@ fn long_symbols_live_in_the_side_table() {
     )
     assert(a.longs.len() == 1 && a.long.len() == family.len())
     var out = MemBuffer::empty()
-    a.write_symbol(at(a, 2, 0), mut out)
+    a.write_symbol(cell_at(a, x: 2, y: 0), mut out)
     assert(out == family)
     // `==` never equates cells whose symbols are in their buffers.
-    assert(at(a, 0, 0) != at(a, 0, 0))
-    assert(a.cell_eq(at(a, 0, 0), a, at(a, 2, 0)))
-    assert(a.cell_eq(at(a, 0, 0), b, at(b, 0, 0)))
-    assert(a.cell_eq(at(a, 1, 0), b, at(b, 1, 0)))
-    assert(!a.cell_eq(at(a, 0, 0), b, at(b, 4, 0)))
-    assert(!a.cell_eq(at(a, 4, 0), b, at(b, 4, 0)))
-    assert(a.cell_eq(at(a, 5, 0), b, at(b, 5, 0)))
+    assert(cell_at(a, x: 0, y: 0) != cell_at(a, x: 0, y: 0))
+    assert(
+        a.cell_eq(cell_at(a, x: 0, y: 0), a, cell_at(a, x: 2, y: 0)),
+    )
+    assert(
+        a.cell_eq(cell_at(a, x: 0, y: 0), b, cell_at(b, x: 0, y: 0)),
+    )
+    assert(
+        a.cell_eq(cell_at(a, x: 1, y: 0), b, cell_at(b, x: 1, y: 0)),
+    )
+    assert(
+        !a.cell_eq(cell_at(a, x: 0, y: 0), b, cell_at(b, x: 4, y: 0)),
+    )
+    assert(
+        !a.cell_eq(cell_at(a, x: 4, y: 0), b, cell_at(b, x: 4, y: 0)),
+    )
+    assert(
+        a.cell_eq(cell_at(a, x: 5, y: 0), b, cell_at(b, x: 5, y: 0)),
+    )
     var expected = MemBuffer::empty()
     expected.extend_from(family.span())
     expected.extend_from(family.span())
@@ -1049,8 +1019,14 @@ fn copies_keep_symbols_and_cut_wide_ones_at_the_edges() {
     expected.extend_from(family.span())
     expected.extend_from(format!("\n abc").span())
     assert(target.to_text() == expected)
-    assert(target.cell_eq(at(target, 1, 1), source, at(source, 0, 0)))
-    assert(at(target, 3, 2).modifier() == Modifier::BOLD)
+    assert(
+        target.cell_eq(
+                cell_at(target, x: 1, y: 1),
+                source,
+                cell_at(source, x: 0, y: 0),
+            ),
+    )
+    assert(cell_at(target, x: 3, y: 2).modifier() == Modifier::BOLD)
     target
         .copy_from(
             source,
@@ -1058,7 +1034,7 @@ fn copies_keep_symbols_and_cut_wide_ones_at_the_edges() {
             to: Pos::new(x: 0, y: 0),
         )
     assert(
-        at(target, 0, 0).width() == 2 && at(target, 1, 0).is_continuation(),
+        cell_at(target, x: 0, y: 0).width() == 2 && cell_at(target, x: 1, y: 0).is_continuation(),
     )
     // A copy that starts on a continuation, and one cut by the right edge.
     target
@@ -1074,10 +1050,11 @@ fn copies_keep_symbols_and_cut_wide_ones_at_the_edges() {
             to: Pos::new(x: 3, y: 0),
         )
     assert(
-        at(target, 0, 0).width() == 1 && at(target, 1, 0).width() == 1,
+        cell_at(target, x: 0, y: 0).width() == 1 && cell_at(target, x: 1, y: 0).width() == 1,
     )
     assert(
-        at(target, 3, 0).width() == 1 && target.to_text().span().slice(offset: 0, len: 1) == "\n",
+        cell_at(target, x: 3, y: 0).width() == 1
+            && target.to_text().span().slice(offset: 0, len: 1) == "\n",
     )
     target.copy_from(source, area: source.area(), to: Pos::new(x: 4, y: 0))
     target.copy_from(source, area: Rect::ZERO, to: Pos::new(x: 0, y: 0))
