@@ -3,18 +3,14 @@
 use core::{MemBuffer, MemSpan}
 use core::ops::{Eq, Index, Len}
 use std::io::Display
-use ingot::event::{Key, KeyCode, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, theme}
-use ingot::geom::{Pos, Rect}
-use ingot::layout::{Constraint, Layout}
-use ingot::style::Style
-use ingot::text::{Alignment, ELLIPSIS, truncate, truncate_with_ellipsis, width}
 use ingot::buffer::Buffer
-use ingot::event::Modifiers
-use ingot::frame::{clipped, print}
-use ingot::geom::Size
+use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
+use ingot::frame::{Frame, clipped, print, theme}
+use ingot::geom::{Pos, Rect, Size}
+use ingot::layout::{Constraint, Layout}
 use ingot::layout::Constraint::{Fill, Length}
-use ingot::style::{Color, Modifier}
+use ingot::style::{Color, Modifier, Style}
+use ingot::text::{Alignment, ELLIPSIS, truncate, truncate_with_ellipsis, width}
 use ingot::theme::Theme
 
 /// The most columns a `TableState` records for hit-testing. A table may
