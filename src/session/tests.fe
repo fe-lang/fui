@@ -288,6 +288,38 @@ fn a_hangup_terminates_after_the_input_before_it() {
     assert(next(mut session) == Event::Terminate)
     assert(session.next_event(Option::None).is_err())
     assert(session.next_event(Option::Some(ms(5))).is_err())
+    // The terminal is gone: there is nothing to draw on or give back.
+    let writes = session.backend().writes()
+    show(mut session, Pos::new(x: 0, y: 0), "x")
+    assert(session.backend().writes() == writes)
+    assert(session.leave().is_ok())
+}
+
+#[test]
+fn a_write_to_a_terminal_that_hung_up_terminates() {
+    var session = enter(TestBackend::new(size(width: 4, height: 1)))
+    session.backend().push_hangup()
+    let _ = session.backend().wait(Option::Some(ms(0)))
+    show(mut session, Pos::new(x: 0, y: 0), "x")
+    assert(next(mut session) == Event::Terminate)
+    assert(session.next_event(Option::None).is_err())
+}
+
+#[test]
+fn leaving_fails_if_the_terminal_fails() {
+    var backend = TestBackend::new(size(width: 4, height: 1))
+    backend.push_signal(Signal::Hangup)
+    var session = enter(backend)
+    assert(next(mut session) == Event::Terminate)
+    // A hangup signalled: what fails after it is no error.
+    session.backend().push_hangup()
+    let _ = session.backend().wait(Option::Some(ms(0)))
+    assert(session.leave().is_ok())
+    var session = enter(TestBackend::new(size(width: 4, height: 1)))
+    session.backend().push_hangup()
+    let _ = session.backend().wait(Option::Some(ms(0)))
+    // The session has not seen the hangup: leaving reports the failure.
+    assert(session.leave().is_err())
 }
 
 #[test]

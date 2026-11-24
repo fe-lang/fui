@@ -78,6 +78,9 @@ pub struct Session<B: Backend> {
     head: usize,
     // When the input that left the parser waiting for more came.
     pending_since: Option<Duration>,
+    // The terminal's input has ended.
+    ended: bool,
+    // The terminal has hung up, by the end of its input or `SIGHUP`.
     hung_up: bool,
 }
 
@@ -102,6 +105,7 @@ impl<B: Backend> Session<B> {
             events: MemVec::new(),
             head: 0,
             pending_since: Option::None,
+            ended: false,
             hung_up: false,
         }
         var restore = MemBuffer::empty()
@@ -115,9 +119,12 @@ impl<B: Backend> Session<B> {
 
     /// Gives the terminal back as it was before `enter`: the restore bytes,
     /// then the settings from before raw mode. Destroying the session does
-    /// this too; nothing if done already.
+    /// this too; nothing if done already. Once the terminal has hung up,
+    /// by the end of its input or `SIGHUP`, there is nothing to give back,
+    /// and a failure is no error.
     pub fn leave(mut self) -> Result<Error, ()> {
-        self.backend.leave_raw()
+        let left = self.backend.leave_raw()
+        if self.hung_up { Result::Ok(()) } else { left }
     }
 
     /// The backend.
@@ -157,11 +164,17 @@ impl<B: Backend> Session<B> {
     /// a resize, a resume or `invalidate`. Then empties the frame for the
     /// next one, whether the write succeeded or not; after a failure the
     /// next frame is drawn whole. A terminal of no columns or rows is
-    /// written nothing.
+    /// written nothing, and so is one whose input has ended. A write that
+    /// fails because the terminal has hung up is no error: the session
+    /// queues `Event::Terminate` instead, as when it reads the end.
     pub fn present(mut self) -> Result<Error, ()> {
         var written: Result<Error, ()> = Result::Ok(())
-        if self.size.area() != 0 {
+        if self.size.area() != 0 && !self.ended {
             written = self.render()
+        }
+        if written.is_err() && self.is_gone() {
+            self.end_input()
+            written = Result::Ok(())
         }
         self.frame.buffer().clear()
         self.frame.hide_cursor()
@@ -200,7 +213,7 @@ impl<B: Backend> Session<B> {
             if let Option::Some(event) = self.pop_event() {
                 return Result::Ok(Option::Some(event))
             }
-            if self.hung_up {
+            if self.ended {
                 return Result::Err(Error::new(ErrorKind::UnexpectedEof))
             }
             let now = self.backend.now()
@@ -327,7 +340,7 @@ impl<B: Backend> Session<B> {
                 }
             },
             Result::Err(error) => if is_end(error) {
-                self.hang_up()
+                self.end_input()
             } else {
                 return Result::Err(error)
             },
@@ -335,12 +348,21 @@ impl<B: Backend> Session<B> {
         Result::Ok(())
     }
 
-    // The terminal has hung up: what came before is resolved, then
+    // Whether the terminal reports that it has hung up.
+    fn is_gone(mut self) -> bool {
+        match self.backend.wait(Option::Some(Duration::from_nanos(0))) {
+            Result::Ok(ready) => ready.hangup,
+            Result::Err(_) => false,
+        }
+    }
+
+    // The terminal's input has ended: what came before is resolved, then
     // `Event::Terminate`, once.
-    fn hang_up(mut self) {
-        if self.hung_up { return }
+    fn end_input(mut self) {
+        if self.ended { return }
         self.parser.flush(mut self.events)
         self.pending_since = Option::None
+        self.ended = true
         self.hung_up = true
         self.events.push(Event::Terminate)
     }
@@ -358,6 +380,10 @@ impl<B: Backend> Session<B> {
                 Signal::Continue => {
                     self.invalidate()
                     self.events.push(Event::Resume)
+                },
+                Signal::Hangup => {
+                    self.hung_up = true
+                    self.events.push(Event::Terminate)
                 },
                 _ => self.events.push(Event::Terminate),
             }

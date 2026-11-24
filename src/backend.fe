@@ -149,7 +149,8 @@ enum Step {
 ///
 /// Raw mode, restore bytes and stops are modelled: leaving raw mode and
 /// `suspend` write the restore bytes to the `Vt`, and `stops()` counts the
-/// times the process would have stopped.
+/// times the process would have stopped. Once hung up, writing and leaving
+/// raw mode fail, as they do on a terminal that is gone.
 pub struct TestBackend {
     vt: Vt,
     output: MemBuffer,
@@ -343,6 +344,9 @@ impl Backend for TestBackend {
     }
 
     fn write_all(mut self, _ bytes: MemSpan) -> Result<Error, ()> {
+        if self.hung_up {
+            return Result::Err(Error::new(ErrorKind::BrokenPipe))
+        }
         self.vt.feed(bytes)
         self.output.extend_from(bytes)
         self.writes += 1
@@ -403,9 +407,14 @@ impl Backend for TestBackend {
     }
 
     fn leave_raw(mut self) -> Result<Error, ()> {
-        if self.raw {
-            self.restore_screen()
+        if !self.raw {
+            return Result::Ok(())
         }
+        self.raw = false
+        if self.hung_up {
+            return Result::Err(Error::new(ErrorKind::BrokenPipe))
+        }
+        self.restore_screen()
         Result::Ok(())
     }
 

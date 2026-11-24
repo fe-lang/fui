@@ -8,8 +8,9 @@ reads what it writes through a small terminal emulator. Checks that it
 enters the alternate screen with its modes, that keys change what is drawn,
 that a window size change redraws at the new size, that Ctrl+Z stops it
 with the terminal restored and SIGCONT resumes it with a full redraw, that
-SIGTERM and Ctrl+C end it with exit status 0 and the terminal restored, and
-that the terminal attributes after it ended equal those before it started.
+a SIGTSTP from outside does the same, SIGTERM, Ctrl+C and `q` end it with
+exit status 0 and the terminal restored, the terminal attributes after it
+ended equal those before it started, and a hangup of the terminal ends it.
 Prints a PASS or FAIL line per check and exits non-zero if any failed.
 Standard library only.
 """
@@ -408,6 +409,18 @@ def check_session(path):
 
         run.settle()
         run.set_mark()
+        os.kill(run.pid, signal.SIGTSTP)
+        status = run.wait(os.WUNTRACED)
+        run.settle(0.1)
+        report(status is not None and os.WIFSTOPPED(status) and run.vt.restored()
+               and termios.tcgetattr(run.slave) == run.before,
+               "SIGTSTP from outside stops it with the terminal restored")
+        os.kill(run.pid, signal.SIGCONT)
+        report(run.until(lambda: run.vt.mode(1049) and row_of(run.vt, "Count: 4") == 7),
+               "SIGCONT resumes it with a full redraw")
+
+        run.settle()
+        run.set_mark()
         os.kill(run.pid, signal.SIGTERM)
         check_exit(run, "SIGTERM")
     finally:
@@ -438,6 +451,26 @@ def check_quit(path):
         run.close()
 
 
+def check_hangup(path):
+    run = Run(path, 40, 10)
+    report(run.until(lambda: row_of(run.vt, "Count: 0") is not None), "fourth run: the first frame is drawn")
+    run.settle()
+    # The terminal goes away, as when its window is closed.
+    os.close(run.master)
+    status = None
+    deadline = time.monotonic() + TIMEOUT
+    while status is None and time.monotonic() < deadline:
+        pid, code = os.waitpid(run.pid, os.WNOHANG)
+        status = code if pid else None
+        time.sleep(0.02)
+    report(status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0,
+           f"a hangup ends the program with exit status 0 (status {status})")
+    if status is None:
+        os.kill(run.pid, signal.SIGKILL)
+        os.waitpid(run.pid, 0)
+    os.close(run.slave)
+
+
 def in_session(check, path):
     """Runs `check` in a child that leads a new session, so it can own a new
     pty as its controlling terminal: the number of checks that failed."""
@@ -459,7 +492,7 @@ def main():
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
         return 2
     path = os.path.abspath(sys.argv[1])
-    failed = sum(in_session(check, path) for check in (check_session, check_ctrl_c, check_quit))
+    failed = sum(in_session(check, path) for check in (check_session, check_ctrl_c, check_quit, check_hangup))
     print("all checks passed" if failed == 0 else f"{failed} checks failed", flush=True)
     return 1 if failed else 0
 
