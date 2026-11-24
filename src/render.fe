@@ -9,9 +9,12 @@
 //!
 //! The output never relies on autowrap or on terminals agreeing on the
 //! width of a cluster: after a cell in the last column, or a cluster of
-//! more than one scalar, the next cell is placed with an absolute move.
-//! Each frame is wrapped in synchronized output (private mode 2026), and
-//! the cursor is hidden while cells are drawn.
+//! more than one scalar, the next cell is placed with an absolute move. A
+//! cell whose cluster would join the one written just before it, such as
+//! a regional indicator after another, is placed with a move too, which
+//! keeps the two apart on terminals that join only text written in one
+//! run. Each frame is wrapped in synchronized output (private mode 2026),
+//! and the cursor is hidden while cells are drawn.
 use core::ops::Eq
 use super::buffer::{Buffer, Cell}
 use super::geom::{Pos, Size, max, min}
@@ -461,8 +464,15 @@ impl Renderer {
 
     // The first column from `from` to `to`, which start cells, of a cell of
     // row `y` that the terminal shows otherwise in `next` than in `prev`.
-    // A wide cell counts as changed if either half is, so a continuation
-    // is drawn by drawing its wide cell.
+    //
+    // Drawing these cells from left to right leaves both columns of a wide
+    // cell right however widths change. A wide cell over two narrow ones
+    // covers the second. A write over either half of a wide cell blanks
+    // the other half, which is then a changed cell of its own, since its
+    // width changes: a left half is drawn before the write, which then
+    // overlaps no wide cell, and a right half after it. A continuation is
+    // drawn by drawing its wide cell, which counts as changed if its
+    // continuation is, though a buffer keeps the two in one style.
     fn changed_from(
         mut self,
         _ prev: Buffer,
@@ -591,6 +601,7 @@ impl Renderer {
     // one just written, such as a regional indicator after another, is
     // placed with a move, which keeps them apart.
     fn move_to(mut self, _ next: Buffer, _ to: Pos, _ first: u32, _ out: mut MemBuffer) {
+        let start = out.len()
         if let Option::Some(at) = self.term.cursor {
             if at == to {
                 if joins(self.term.last, first) {
@@ -599,8 +610,13 @@ impl Renderer {
                 }
                 return
             }
-            if at.y == to.y && at.x < to.x && self.rewrite(next, at, to, first, mut out) {
-                return
+            if at.y == to.y && at.x < to.x {
+                move_cursor(self.term.cursor, to, mut out)
+                let budget = out.len() - start
+                out.truncate(start)
+                if self.rewrite(next, at, to, first, budget, mut out) {
+                    return
+                }
             }
         }
         move_cursor(self.term.cursor, to, mut out)
@@ -609,21 +625,21 @@ impl Renderer {
     }
 
     // Writes the cells of `next` from `at` to `to`, on one row, again, if
-    // that is shorter than moving the cursor there and needs neither a
-    // change of pen nor a move: the cells are unchanged, so the terminal
-    // shows them already. Returns whether it did.
+    // that takes fewer than `budget` bytes and needs neither a change of
+    // pen nor a move: the cells are unchanged, so the terminal shows them
+    // already. Returns whether it did.
     fn rewrite(
         mut self,
         _ next: Buffer,
         _ at: Pos,
         _ to: Pos,
         _ first: u32,
+        _ budget: usize,
         _ out: mut MemBuffer,
     ) -> bool {
         let Option::Some(pen) = self.term.pen else {
             return false
         }
-        let budget = move_cost(self.term.cursor, to)
         let start = out.len()
         let row = index(next, 0, at.y)
         var last = self.term.last
@@ -751,21 +767,6 @@ fn cup_cost(_ to: Pos) -> usize {
     let row = to.y as u32 + 1
     let column = to.x as u32 + 1
     3 + (if row == 1 { 0 } else { digits(row) }) + if column == 1 { 0 } else { 1 + digits(column) }
-}
-
-// The length of the shortest move from `from`, or from anywhere, to `to`.
-fn move_cost(_ from: Option<Pos>, _ to: Pos) -> usize {
-    let cup = cup_cost(to)
-    let Option::Some(at) = from else {
-        return cup
-    }
-    let (rows, _, _) = axis(at.y, to.y, ahead: b'B', back: b'A', absolute: b'd')
-    let (columns, _, _) = axis(at.x, to.x, ahead: b'C', back: b'D', absolute: b'G')
-    if rows + columns < cup {
-        rows + columns
-    } else {
-        cup
-    }
 }
 
 // Appends the shortest sequence that moves the cursor from `from`, or from
