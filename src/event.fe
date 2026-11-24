@@ -444,10 +444,10 @@ impl Display for Key {
             KeyCode::Unicode(c) => push_utf8(mut out, c),
             KeyCode::F(n) => write!(mut out, "F", n),
             KeyCode::Modifier(m) => {
-                // The modifier's name without its `+`.
+                // The modifiers' names without the last `+`.
                 var name = MemBuffer::empty()
                 write!(mut name, m)
-                out.extend_from(name.slice(offset: 0, len: name.len() - 1))
+                out.extend_from(name.slice(offset: 0, len: name.len().saturating_sub(1)))
             },
             KeyCode::Enter => write!(mut out, "Enter"),
             KeyCode::Tab => write!(mut out, "Tab"),
@@ -835,6 +835,11 @@ fn keys_display_as_help_screens_show_them() {
         format!(
                 Key::new(KeyCode::Modifier(Modifiers::SHIFT), Modifiers::SHIFT),
             ) == "Shift+Shift",
+    )
+    assert(
+        format!(
+                Key::new(KeyCode::Modifier(Modifiers::NONE), Modifiers::NONE),
+            ) == "",
     )
     assert(
         format!(Key::new(KeyCode::Unicode(0xe9), Modifiers::NONE)) == "é",
