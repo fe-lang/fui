@@ -416,7 +416,7 @@ impl Buffer {
     }
 
     // Writes `glyph` into every cell of `area`, as `fill` does.
-    pub(ingot) fn fill_glyph(mut self, _ area: Rect, _ glyph: Glyph, _ style: Style) {
+    fn fill_glyph(mut self, _ area: Rect, _ glyph: Glyph, _ style: Style) {
         let area = area.intersect(self.area())
         let width = self.size.width as usize
         for y in area.y as usize .. area.bottom() as usize {
