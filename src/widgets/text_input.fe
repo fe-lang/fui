@@ -548,8 +548,20 @@ impl TextInputState {
 /// A single-line text field, which draws a `TextInputState`:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-///     TextInput::new().placeholder("Search").focused(self.focus == Focus::Search).render(area, mut self.search)
+/// fn view(_ area: Rect, _ search: mut TextInputState, focused: bool) uses (frame: mut Frame) {
+///     TextInput::new().placeholder("Search").focused(focused).render(area, mut search)
+/// }
+///
+/// fn update(_ search: mut TextInputState, _ event: Event) -> bool {
+///     match event {
+///         Event::Key(key) => search.handle_key(key),
+///         Event::Paste(ref text) => {
+///             search.insert(text.span())
+///             true
+///         },
+///         Event::Mouse(mouse) => search.handle_mouse(mouse),
+///         _ => false,
+///     }
 /// }
 /// ```
 ///

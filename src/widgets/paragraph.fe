@@ -11,10 +11,10 @@ use super::scroll::ScrollState
 /// `text::Lines`, wrapped to the area's width or cut at it, and aligned.
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+/// fn view(_ area: Rect, _ count: u64, _ log: Lines, _ scroll: mut ScrollState) uses (frame: mut Frame) {
 ///     let (head, body) = area.rows((Length(1), Fill(1)))
-///     Paragraph::new().centered().style(theme().title).render(head, self.count)
-///     Paragraph::new().wrap(WrapMode::Word).render_styled_scrolled(body, self.log, mut self.scroll)
+///     Paragraph::new().centered().style(theme().title).render(head, count)
+///     Paragraph::new().wrap(WrapMode::Word).render_styled_scrolled(body, log, mut scroll)
 /// }
 /// ```
 ///

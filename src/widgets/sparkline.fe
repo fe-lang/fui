@@ -9,8 +9,8 @@ use super::clamp_u16
 /// `▁▂▃▄▅▆▇█`:
 ///
 /// ```fe
-/// fn view(self, _ area: Rect) uses (frame: mut Frame) {
-///     Sparkline::new().max(100).render(area, self.load.as_slice())
+/// fn view(_ area: Rect, _ load: MemSlice<u64>) uses (frame: mut Frame) {
+///     Sparkline::new().max(100).render(area, load)
 /// }
 /// ```
 ///
@@ -29,6 +29,8 @@ pub struct Sparkline { style: Style, max: Option<u64>, right_aligned: bool }
 impl Copy for Sparkline {}
 
 impl Sparkline {
+    /// A sparkline in the theme's accent style, scaled to its largest value
+    /// shown, from the left edge.
     pub fn new() -> Self {
         Sparkline { style: Style::NONE, max: Option::None, right_aligned: false }
     }

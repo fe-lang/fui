@@ -2,36 +2,39 @@
 //!
 //! Every scrollable widget keeps its scroll position in a `ScrollState`,
 //! counted in the units it scrolls by: rows of a paragraph, items of a
-//! list. The state lives in the program's model. A render records the
-//! lengths it laid out, the content's and the viewport's, and clamps the
-//! position to them, so the event handling after it scrolls within the
-//! content the user sees:
+//! list or a table. The state lives in the program's model. A render
+//! records the lengths it laid out, the content's and the viewport's, and
+//! clamps the position to them, so the event handling after it scrolls
+//! within the content the user sees:
 //!
 //! ```fe
-//! fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-//!     Paragraph::new().wrap(WrapMode::Word).render_scrolled(area, self.log, mut self.scroll)
+//! fn view(_ area: Rect, _ log: MemSpan, _ scroll: mut ScrollState) uses (frame: mut Frame) {
+//!     let (text, bar) = area.columns((Fill(1), Length(1)))
+//!     Paragraph::new().wrap(WrapMode::Word).render_styled_scrolled(text, log, mut scroll)
+//!     Scrollbar::vertical().render_for(bar, scroll)
 //! }
 //!
-//! fn update(mut self, _ event: Event) -> Flow {
-//!     match event {
-//!         Event::Key(key) => if key.is(KeyCode::PageDown) { self.scroll.page_down() },
-//!         _ => {},
+//! fn update(_ scroll: mut ScrollState, _ key: Key) {
+//!     if key.is(KeyCode::PageDown) {
+//!         scroll.page_down()
+//!     } else if key.is(KeyCode::PageUp) {
+//!         scroll.page_up()
 //!     }
-//!     Flow::Redraw
 //! }
 //! ```
 //!
 //! Every method clamps: the position stays between 0 and `max_position()`,
 //! the content's length less the viewport's, so the last screenful of
-//! content fills the viewport rather than scrolling off it. A scrollbar
-//! takes its three numbers from `content()`, `viewport()` and `position()`.
+//! content fills the viewport rather than scrolling off it.
 use core::ops::Eq
 
 /// The rows a notch of the mouse wheel scrolls a list or a table by.
 pub const WHEEL_ROWS: u16 = 3
 
 /// The position of a viewport over content: the first unit shown, and the
-/// lengths of the viewport and the content the last render recorded.
+/// lengths of the viewport and the content the last render recorded. See
+/// the module documentation for an example; `Scrollbar::render_for` draws
+/// one.
 pub struct ScrollState { position: usize, viewport: usize, content: usize }
 
 impl Copy for ScrollState {}

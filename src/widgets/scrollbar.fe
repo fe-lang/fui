@@ -30,16 +30,13 @@ impl Eq for Orientation {
 /// from `position`:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-///     let rows = area.height as usize
-///     Scrollbar::vertical().render(
-///         area,
-///         content_length: self.lines.len(),
-///         viewport_length: rows,
-///         position: self.top,
-///     )
+/// fn view(_ area: Rect, _ lines: usize, _ top: usize) uses (frame: mut Frame) {
+///     Scrollbar::vertical().render(area, content_length: lines, viewport_length: area.height as usize, position: top)
 /// }
 /// ```
+///
+/// `render_for` takes the three numbers from a `ScrollState`, such as a
+/// `ListState`'s: `Scrollbar::vertical().render_for(bar, list.scroll())`.
 ///
 /// A vertical scrollbar takes the right column of its area and a
 /// horizontal one the bottom row, so it can share the area of what it

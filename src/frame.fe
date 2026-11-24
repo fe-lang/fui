@@ -96,6 +96,7 @@ impl Frame {
         self.clip
     }
 
+    /// The theme widgets draw with.
     pub fn theme(self) -> Theme {
         self.theme
     }
@@ -567,10 +568,13 @@ pub(ingot) fn frame_of(width: u16, height: u16) -> Frame {
 /// what it draws, and the frame's area:
 ///
 /// ```fe
-/// let text = drawn(width: 5, height: 3, |frame, area| {
-///     with (frame) { Block::bordered().render(area) }
-/// }).to_text()
-/// assert(text == "┌───┐\n│   │\n└───┘")
+/// #[test]
+/// fn borders_fill_the_frame() {
+///     let text = drawn(width: 5, height: 3, |frame, area| {
+///         with (frame) { Block::bordered().render(area) }
+///     }).to_text()
+///     assert(text == "┌───┐\n│   │\n└───┘")
+/// }
 /// ```
 pub(ingot) fn drawn<F: Fn(mut Frame, Rect)>(width: u16, height: u16, _ draw: F) -> Buffer
 uses F::E

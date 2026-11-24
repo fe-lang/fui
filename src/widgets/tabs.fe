@@ -147,9 +147,10 @@ impl TabsState {
 /// A row of titles with one selected, on the top row of its area:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+/// fn view(_ area: Rect, _ tabs: mut TabsState) uses (frame: mut Frame) {
 ///     let (head, body) = area.split_top(1)
-///     Tabs::new().render(head, ["Files", "Search", "Help"], mut self.tabs)
+///     Tabs::new().render(head, ["Files", "Search", "Help"], mut tabs)
+///     Paragraph::new().render(body, tabs.selected())
 /// }
 /// ```
 ///
@@ -157,7 +158,8 @@ impl TabsState {
 /// `MemSlice` or `MemVec` of `MemBuffer`s or `DynString`s. Each tab is its
 /// title with padding on both sides, and a divider stands between tabs.
 /// When the tabs do not fit, the row scrolls by whole tabs to show the
-/// selected one, as little as it can from where it was.
+/// selected one, as little as it can from where it was, and a title the
+/// row's right edge cuts ends in an ellipsis unless `ellipsis(false)`.
 ///
 /// Titles take the theme's `text` style and the selected tab its
 /// `highlight` style over it, padding included; dividers take the `border`

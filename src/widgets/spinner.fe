@@ -21,9 +21,9 @@ const ARC: [String<3>; 6] = ["◜", "◠", "◝", "◞", "◡", "◟"]
 /// an optional label after it:
 ///
 /// ```fe
-/// fn view(self, _ area: Rect) uses (frame: mut Frame) {
+/// fn view(_ area: Rect, _ elapsed_ms: u64) uses (frame: mut Frame) {
 ///     let spinner = Spinner::dots()
-///     spinner.render_labeled(area, tick: spinner.tick_at(self.elapsed_ms), label: "Loading")
+///     spinner.render_labeled(area, tick: spinner.tick_at(elapsed_ms), label: "Loading")
 /// }
 /// ```
 ///

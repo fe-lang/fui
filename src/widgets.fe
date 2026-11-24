@@ -1,18 +1,53 @@
 //! Widgets: what views draw with.
 //!
-//! A widget is a small `Copy` value that holds its configuration, built by
-//! methods that each return a changed copy:
-//! `Block::bordered().rounded().border_style(style)`. What it shows is
-//! passed to its render call as a view, so nothing is copied, and the state
-//! that outlives a frame, such as a selection or a scroll offset, is a `mut`
-//! parameter that lives in the program's model. A render may write what it
-//! laid out into that state, such as the area it drew, for event handling
-//! to use later.
+//! ```fe
+//! fn view(_ area: Rect, _ names: MemSlice<MemBuffer>, _ files: mut ListState) uses (frame: mut Frame) {
+//!     let (body, bar) = Block::bordered().render_titled(area, "Files").columns((Fill(1), Length(1)))
+//!     List::new().highlight_symbol("> ").render(body, names, mut files)
+//!     Scrollbar::vertical().render_for(bar, files.scroll())
+//! }
 //!
-//! Every render draws through the `Frame` effect, only inside the area it
-//! is given: an empty or tiny area draws what fits, or nothing, and never
-//! panics. Widgets take their styles from the frame's theme, and a style set
-//! on a widget applies over the theme's.
+//! fn update(_ files: mut ListState, _ event: Event) -> bool {
+//!     match event {
+//!         Event::Key(key) => files.handle_key(key),
+//!         Event::Mouse(mouse) => files.handle_mouse(mouse).is_some(),
+//!         _ => false,
+//!     }
+//! }
+//! ```
+//!
+//! Every widget has the same shape:
+//!
+//! - Configuration by value. A widget is a small `Copy` value, built by
+//!   methods that each return a changed copy:
+//!   `Block::bordered().rounded().border_style(style)`.
+//! - Data by view. What a widget shows is a parameter of its render, a view
+//!   of the caller's data, so nothing is copied: the items of a list, the
+//!   rows of a table, a title.
+//! - State by `mut`. What outlives a frame, such as a selection, a scroll
+//!   position or a cursor, is a state value in the program's model, passed
+//!   to the render as `mut`. The render records what it laid out in it, and
+//!   the state's `handle_key` and `handle_mouse` use that between frames.
+//! - Drawing by effect. A render draws through `uses (frame: mut Frame)`,
+//!   only inside the area it is given: a tiny or empty area draws what
+//!   fits, or nothing, and never panics. Styles come from the frame's
+//!   theme, by role, and a style set on a widget applies over the theme's.
+//! - Closures for custom rows. `List::render_with` and `Table::render_with`
+//!   draw each row or cell by calling a closure, with the frame clipped to
+//!   it, so a row can hold any drawing.
+//!
+//! The widgets are `Block` (borders and titles), `Paragraph` (text,
+//! wrapped or cut), `List` and `ListState`, `Table` and `TableState`,
+//! `Tabs` and `TabsState`, `TextInput` and `TextInputState`, `Gauge` and
+//! `LineGauge` (progress), `Sparkline` (a bar chart of recent values),
+//! `Spinner` (work in progress), `Scrollbar`, and `clear` and `popup` (for
+//! what is drawn over other widgets). `ScrollState` is the scroll position
+//! that lists, tables and paragraphs share.
+//!
+//! The states use one set of names: `select` and `selected`,
+//! `select_next` and `select_previous`, `handle_key`, which returns whether
+//! the key is one the widget takes, `handle_mouse`, which returns what a
+//! left click selected, and `area`, the area of the last render.
 use std::io::Display
 use ingot::frame::Frame
 use ingot::geom::Rect

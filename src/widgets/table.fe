@@ -59,7 +59,16 @@ impl<T: Display, const N: usize> TableRow for [T; N] {
 
 /// A cell that a `Table::render_with` closure draws: its row and column,
 /// its rectangle, and whether its row is selected.
-pub struct TableCell { pub row: usize, pub column: usize, pub area: Rect, pub selected: bool }
+pub struct TableCell {
+    /// The row's index in the rows.
+    pub row: usize,
+    /// The column's index in the columns.
+    pub column: usize,
+    /// The cell: its column's cells in its row.
+    pub area: Rect,
+    /// Whether the row is selected.
+    pub selected: bool,
+}
 
 impl Copy for TableCell {}
 
@@ -78,32 +87,47 @@ impl Copy for TableCell {}
 ///     }
 /// }
 ///
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+/// fn view(_ area: Rect, _ files: MemSlice<File>, _ table: mut TableState) uses (frame: mut Frame) {
 ///     let columns = [
 ///         Column::new("Name", Fill(1)),
 ///         Column::new("Size", Length(8)).alignment(Alignment::Right),
 ///     ]
-///     Table::new().separator(true).render(area, columns, self.files, mut self.table)
+///     Table::new().separator(true).render(area, columns, files, mut table)
 /// }
 /// ```
 ///
 /// The columns' widths are solved from their constraints as
 /// `Layout::columns()` solves them, with the table's column spacing between
-/// them, so they never overlap or leave the area. The header takes the top
-/// row, the separator, a line in the theme's `border` style, the next one,
-/// and the rows the rest, one row of the area each.
+/// them, after the highlight symbol's columns, so they never overlap or
+/// leave the area. The header takes the top row, the separator, a line in
+/// the theme's `border` style, the next one, and the rows the rest, one row
+/// of the area each.
 ///
 /// `render` draws a collection of `TableRow`s, writing each cell's text cut
 /// to its column at a cluster boundary, with an ellipsis where it is cut
 /// unless `ellipsis(false)`. `render_with` calls a closure for each cell
-/// instead, which draws in the cell's area. Either takes the rows as any
-/// collection indexed by position, such as a `MemVec`, a `MemSlice` or an
-/// array.
+/// instead, with the frame clipped to the cell:
 ///
-/// The table's `style` applies over the theme's `text` style to its whole
-/// area, the header style over the theme's `title` style to the header row,
-/// and the highlight style over the theme's `highlight` style to the whole
-/// selected row, gaps between columns included, after its cells are drawn.
+/// ```fe
+/// fn cells(_ area: Rect, _ files: MemSlice<File>, _ table: mut TableState) uses (frame: mut Frame) {
+///     let columns = [Column::new("Name", Fill(1)), Column::new("Size", Length(8))]
+///     Table::new().render_with(area, columns, files, mut table, |file, cell| {
+///         if cell.column > 0 {
+///             Gauge::new().render(cell.area, done: file.size, total: 4096)
+///         } else {
+///             let _ = print_in(cell.area, file.name, Style::new())
+///         }
+///     })
+/// }
+/// ```
+///
+/// Either takes the rows as any collection indexed by position, such as a
+/// `MemVec`, a `MemSlice` or an array. The table's `style` applies over the
+/// theme's `text` style to its whole area, the header style over the
+/// theme's `title` style to the header row, and the highlight style over
+/// the theme's `highlight` style to the whole selected row, gaps between
+/// columns included, after its cells are drawn; the selected row starts
+/// with the highlight symbol.
 pub struct Table {
     style: Style,
     header_style: Style,

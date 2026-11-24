@@ -28,6 +28,7 @@ pub struct Gauge { style: Style, label_style: Style }
 impl Copy for Gauge {}
 
 impl Gauge {
+    /// A gauge in the theme's styles.
     pub fn new() -> Self {
         Gauge { style: Style::NONE, label_style: Style::NONE }
     }
@@ -98,6 +99,7 @@ pub struct LineGauge { style: Style, unfilled_style: Style, label_style: Style }
 impl Copy for LineGauge {}
 
 impl LineGauge {
+    /// A line gauge in the theme's styles.
     pub fn new() -> Self {
         LineGauge { style: Style::NONE, unfilled_style: Style::NONE, label_style: Style::NONE }
     }

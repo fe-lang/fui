@@ -31,13 +31,20 @@ impl BitAnd for Borders {
 }
 
 impl Borders {
+    /// No side.
     pub const NONE: Borders = Borders { bits: 0 }
+    /// The top side.
     pub const TOP: Borders = Borders { bits: 1 }
+    /// The right side.
     pub const RIGHT: Borders = Borders { bits: 2 }
+    /// The bottom side.
     pub const BOTTOM: Borders = Borders { bits: 4 }
+    /// The left side.
     pub const LEFT: Borders = Borders { bits: 8 }
+    /// Every side.
     pub const ALL: Borders = Borders { bits: 15 }
 
+    /// Whether the set has no side.
     pub fn is_empty(self) -> bool {
         self.bits == 0
     }
@@ -79,17 +86,24 @@ impl Eq for BorderType {
 
 /// The symbols of a border: its two lines and four corners, each one cell.
 pub struct BorderSymbols {
+    /// The top and bottom lines.
     pub horizontal: String<3>,
+    /// The left and right lines.
     pub vertical: String<3>,
+    /// The corner where the top and left borders meet.
     pub top_left: String<3>,
+    /// The corner where the top and right borders meet.
     pub top_right: String<3>,
+    /// The corner where the bottom and left borders meet.
     pub bottom_left: String<3>,
+    /// The corner where the bottom and right borders meet.
     pub bottom_right: String<3>,
 }
 
 impl Copy for BorderSymbols {}
 
 impl BorderType {
+    /// The symbols this type draws with.
     pub fn symbols(self) -> BorderSymbols {
         match self {
             BorderType::Plain => BorderSymbols {
@@ -137,7 +151,16 @@ impl BorderType {
 }
 
 /// Empty cells between a block's borders and its inner area, on each side.
-pub struct Padding { pub top: u16, pub right: u16, pub bottom: u16, pub left: u16 }
+pub struct Padding {
+    /// Rows below the top border.
+    pub top: u16,
+    /// Columns before the right border.
+    pub right: u16,
+    /// Rows above the bottom border.
+    pub bottom: u16,
+    /// Columns after the left border.
+    pub left: u16,
+}
 
 impl Copy for Padding {}
 
@@ -151,8 +174,10 @@ impl Eq for Padding {
 }
 
 impl Padding {
+    /// No padding.
     pub const ZERO: Padding = Padding { top: 0, right: 0, bottom: 0, left: 0 }
 
+    /// `top`, `right`, `bottom` and `left` cells on those sides.
     pub fn new(top: u16, right: u16, bottom: u16, left: u16) -> Self {
         Padding { top, right, bottom, left }
     }
@@ -185,8 +210,8 @@ impl Padding {
 ///
 /// A border runs along each side in `borders`, with a corner where two
 /// meet. A title sits in its border between the corners, or, without that
-/// border, takes the row itself; it is cut at the corners if it does not
-/// fit. Borders take the theme's `border` style and titles its `title`
+/// border, takes the row itself; one that does not fit is cut at the
+/// corners and ends in an ellipsis unless `ellipsis(false)`. Borders take the theme's `border` style and titles its `title`
 /// style, each with the block's own style for them over it. The block's
 /// `style` applies first, to the whole area, such as a background color;
 /// the cells inside keep their symbols.
@@ -226,11 +251,13 @@ impl Block {
         Block::new().borders(Borders::ALL)
     }
 
+    /// This block with a border on each side in `borders`.
     pub fn borders(var own self, _ borders: Borders) -> Self {
         self.borders = borders
         self
     }
 
+    /// This block with its borders drawn in the lines of `border_type`.
     pub fn border_type(var own self, _ border_type: BorderType) -> Self {
         self.border_type = border_type
         self
@@ -259,6 +286,7 @@ impl Block {
         self
     }
 
+    /// This block with `padding` between its borders and its inner area.
     pub fn padding(var own self, _ padding: Padding) -> Self {
         self.padding = padding
         self
