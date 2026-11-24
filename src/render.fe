@@ -1,6 +1,26 @@
 //! Turning cell buffers into the bytes a terminal draws them from.
-use super::buffer::Buffer
-use super::geom::Pos
+//!
+//! A `Renderer` writes a frame either whole, with `full`, or as what
+//! changed since the frame before it, with `diff`. Between frames it keeps
+//! what it knows of the terminal: the colors and attributes text is
+//! written in, where the cursor is and whether it shows. So each frame
+//! writes only the cells that changed, moves the cursor only where it must,
+//! and changes only the attributes that differ.
+//!
+//! The output never relies on autowrap or on terminals agreeing on the
+//! width of a cluster: after a cell in the last column, or a cluster of
+//! more than one scalar, the next cell is placed with an absolute move. A
+//! cell whose cluster would join the one written just before it, such as
+//! a regional indicator after another, is placed with a move too, which
+//! keeps the two apart on terminals that join only text written in one
+//! run. Each frame is wrapped in synchronized output (private mode 2026),
+//! and the cursor is hidden while cells are drawn.
+use core::ops::Eq
+use super::buffer::{Buffer, Cell}
+use super::geom::{Pos, Size, max, min}
+use super::style::{Color, ColorKind, Modifier}
+use super::text::{Grapheme, decode}
+use super::vt::Vt
 
 /// How many colors the terminal shows. A color the terminal cannot show is
 /// drawn as the nearest one it can.
@@ -17,41 +37,313 @@ pub enum ColorDepth {
 
 impl Copy for ColorDepth {}
 
-/// Writes frames as terminal output: `full` draws a buffer from nothing, and
-/// `diff` only what changed since the frame before it.
-pub struct Renderer { depth: ColorDepth }
+impl Eq for ColorDepth {
+    fn eq(self, _ other: Self) -> bool {
+        self.colors() == other.colors()
+    }
+}
+
+impl ColorDepth {
+    /// The depth of a terminal from the values of the environment variables
+    /// `NO_COLOR` (whether it is set), `COLORTERM` and `TERM`, empty when
+    /// unset: none with `NO_COLOR`, 24-bit if `COLORTERM` holds `truecolor`
+    /// or `24bit`, 256 colors if `TERM` holds `256color`, none if `TERM` is
+    /// `dumb`, and else the 16 ANSI colors.
+    pub fn detect(no_color: bool, colorterm: MemSpan, term: MemSpan) -> ColorDepth {
+        if no_color {
+            ColorDepth::NoColor
+        } else if contains(colorterm, "truecolor") || contains(colorterm, "24bit") {
+            ColorDepth::TrueColor
+        } else if contains(term, "256color") {
+            ColorDepth::Ansi256
+        } else if term == "dumb" {
+            ColorDepth::NoColor
+        } else {
+            ColorDepth::Ansi16
+        }
+    }
+
+    /// `detect` from what `std::env::Env::lookup` returns for the three
+    /// variables. An empty `NO_COLOR` counts as unset, as no-color.org asks.
+    pub fn from_env(
+        no_color: own Option<MemBuffer>,
+        colorterm: own Option<MemBuffer>,
+        term: own Option<MemBuffer>,
+    ) -> ColorDepth {
+        let no_color = no_color.unwrap_or(default: MemBuffer::empty())
+        let colorterm = colorterm.unwrap_or(default: MemBuffer::empty())
+        let term = term.unwrap_or(default: MemBuffer::empty())
+        ColorDepth::detect(
+            no_color: !no_color.is_empty(),
+            colorterm: colorterm.span(),
+            term: term.span(),
+        )
+    }
+
+    /// The color a terminal of this depth shows for `color`: an RGB color
+    /// becomes the nearest of the 256 indexed colors, an RGB or indexed one
+    /// the nearest ANSI color (by xterm's palette), or any color the
+    /// default one. `Color::KEEP` stays as it is.
+    pub fn map(self, _ color: Color) -> Color {
+        match self {
+            ColorDepth::TrueColor => color,
+            ColorDepth::NoColor => if color.is_keep() {
+                color
+            } else {
+                Color::RESET
+            },
+            ColorDepth::Ansi256 => match color.kind() {
+                ColorKind::Rgb(r, g, b) => Color::indexed(nearest_indexed(r, g, b)),
+                _ => color,
+            },
+            ColorDepth::Ansi16 => match color.kind() {
+                ColorKind::Indexed(n) => Color::ansi(
+                    if n < 16 { n } else { nearest_ansi(palette(n)) },
+                ),
+                ColorKind::Rgb(r, g, b) => Color::ansi(nearest_ansi(rgb(r, g, b))),
+                _ => color,
+            },
+        }
+    }
+
+    // The number of colors, which tells the depths apart.
+    fn colors(self) -> u32 {
+        match self {
+            ColorDepth::NoColor => 0,
+            ColorDepth::Ansi16 => 16,
+            ColorDepth::Ansi256 => 256,
+            ColorDepth::TrueColor => 0x1000000,
+        }
+    }
+}
+
+// Whether `text` holds `needle`.
+fn contains<const N: usize>(_ text: MemSpan, _ needle: String<N>) -> bool {
+    let n = needle.len()
+    if text.len() < n {
+        return false
+    }
+    for i in 0 .. text.len() - n + 1 {
+        if text.slice(offset: i, len: n) == needle {
+            return true
+        }
+    }
+    false
+}
+
+// xterm's default values of the 16 ANSI colors, as `0xRRGGBB`.
+const ANSI: [u32; 16] = [
+    0x000000,
+    0xcd0000,
+    0x00cd00,
+    0xcdcd00,
+    0x0000ee,
+    0xcd00cd,
+    0x00cdcd,
+    0xe5e5e5,
+    0x7f7f7f,
+    0xff0000,
+    0x00ff00,
+    0xffff00,
+    0x5c5cff,
+    0xff00ff,
+    0x00ffff,
+    0xffffff,
+]
+
+// The levels of each channel in the 6x6x6 cube of the indexed colors 16 to
+// 231.
+const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255]
+
+fn rgb(_ r: u8, _ g: u8, _ b: u8) -> u32 {
+    (r as u32) << 16 | (g as u32) << 8 | b as u32
+}
+
+// The value `0xRRGGBB` of the indexed color `n` in xterm's palette.
+fn palette(_ n: u8) -> u32 {
+    let n = n as u32
+    if n < 16 {
+        ANSI[n as usize]
+    } else if n < 232 {
+        let i = n - 16
+        LEVELS[(i / 36) as usize] << 16
+            | LEVELS[(i / 6 % 6) as usize] << 8
+            | LEVELS[(i % 6) as usize]
+    } else {
+        let gray = 8 + 10 * (n - 232)
+        gray << 16 | gray << 8 | gray
+    }
+}
+
+// The squared distance between the colors `0xRRGGBB` `a` and `b`.
+fn distance(_ a: u32, _ b: u32) -> u32 {
+    let dr = difference(a >> 16, b >> 16)
+    let dg = difference(a >> 8 & 0xff, b >> 8 & 0xff)
+    let db = difference(a & 0xff, b & 0xff)
+    dr * dr + dg * dg + db * db
+}
+
+fn difference(_ a: u32, _ b: u32) -> u32 {
+    if a > b { a - b } else { b - a }
+}
+
+// The ANSI color nearest to `0xRRGGBB`, the first of those as near.
+fn nearest_ansi(_ color: u32) -> u8 {
+    var best: u8 = 0
+    var best_distance = distance(color, ANSI[0])
+    for (i, value) in ANSI.enumerate() {
+        let d = distance(color, value)
+        if d < best_distance {
+            best = i.downcast_truncate()
+            best_distance = d
+        }
+    }
+    best
+}
+
+// The index of the cube level nearest to `v`, the lower of two as near.
+fn level(_ v: u8) -> u32 {
+    if v < 48 {
+        0
+    } else if v < 116 {
+        1
+    } else if v < 156 {
+        2
+    } else if v < 196 { 3 } else if v < 236 { 4 } else { 5 }
+}
+
+// The indexed color nearest to `(r, g, b)` among the cube and the gray
+// ramp, which hold every color but the ANSI ones, whose values terminals
+// change. The cube wins a tie.
+fn nearest_indexed(_ r: u8, _ g: u8, _ b: u8) -> u8 {
+    // Each channel's nearest level makes the nearest cube color, and the
+    // gray nearest to the mean of the channels the nearest gray.
+    let cube: u8 = (16 + 36 * level(r) + 6 * level(g) + level(b)).downcast_truncate()
+    let sum = r as u32 + g as u32 + b as u32
+    let step = if sum < 24 { 0 } else { (sum - 24 + 15) / 30 }
+    let gray: u8 = (232 + if step > 23 { 23 } else { step }).downcast_truncate()
+    let color = rgb(r, g, b)
+    if distance(color, palette(gray)) < distance(color, palette(cube)) {
+        gray
+    } else {
+        cube
+    }
+}
+
+// The colors and attributes text is written in, with the colors as the
+// terminal shows them.
+struct Pen { fg: Color, bg: Color, modifier: Modifier }
+
+impl Copy for Pen {}
+
+impl Eq for Pen {
+    fn eq(self, _ other: Self) -> bool {
+        self.fg == other.fg && self.bg == other.bg && self.modifier == other.modifier
+    }
+}
+
+impl Pen {
+    // The pen after a reset, and of a blank cell.
+    const DEFAULT: Pen = Pen { fg: Color::RESET, bg: Color::RESET, modifier: Modifier::NONE }
+}
+
+// What the renderer knows of the terminal.
+struct Term {
+    // The pen, unless it is unknown.
+    pen: Option<Pen>,
+    // The cursor, unless it is unknown: after a cell in the last column,
+    // which leaves a wrap pending, or a cluster of more than one scalar,
+    // which terminals may count as other widths.
+    cursor: Option<Pos>,
+    // Whether the cursor shows, unless that is unknown.
+    visible: Option<bool>,
+    // The scalar of the one-scalar cluster just written before the cursor,
+    // which the next one written may join, or 0.
+    last: u32,
+}
+
+impl Copy for Term {}
+
+impl Term {
+    const UNKNOWN: Term = Term {
+        pen: Option::None,
+        cursor: Option::None,
+        visible: Option::None,
+        last: 0,
+    }
+}
+
+/// Writes frames as terminal output: `full` draws a buffer whatever the
+/// terminal shows, and `diff` only what changed since the frame before it.
+///
+/// A frame that changes nothing, not even the cursor, writes nothing at
+/// all, so a caller may skip writing an empty output.
+pub struct Renderer {
+    depth: ColorDepth,
+    synchronized: bool,
+    term: Term,
+    // Whether the frame being written has written anything.
+    started: bool,
+    // The bytes of the symbol being written or compared, and of another.
+    symbol: MemBuffer,
+    scratch: MemBuffer,
+}
 
 impl Renderer {
+    /// A renderer for a terminal of `depth`, which knows nothing of the
+    /// terminal yet, and wraps frames in synchronized output.
     pub fn new(_ depth: ColorDepth) -> Self {
-        Renderer { depth }
+        Renderer {
+            depth,
+            synchronized: true,
+            term: Term::UNKNOWN,
+            started: false,
+            symbol: MemBuffer::empty(),
+            scratch: MemBuffer::empty(),
+        }
+    }
+
+    /// This renderer, wrapping each frame in `CSI ? 2026 h` and
+    /// `CSI ? 2026 l` or not. Terminals without synchronized output ignore
+    /// the mode, and those with it show each frame at once.
+    pub fn synchronized(var own self, _ on: bool) -> Self {
+        self.synchronized = on
+        self
+    }
+
+    /// The depth the renderer draws colors in.
+    pub fn depth(self) -> ColorDepth {
+        self.depth
+    }
+
+    /// Forgets what the renderer knows of the terminal: the attributes,
+    /// the cursor and whether it shows. Call it after writing to the
+    /// terminal by other means, as after a suspend; the next frame then
+    /// sets each before it relies on it. The screen itself must still show
+    /// the buffer `diff` is given as the previous one.
+    pub fn invalidate(mut self) {
+        self.term = Term::UNKNOWN
     }
 
     /// Appends to `out` the bytes that make a terminal in any state show
-    /// `next`, with the cursor at `cursor`, or hidden without one.
+    /// `next`, with the cursor at `cursor`, or hidden without one: a reset
+    /// of the attributes, an erasure of the screen, and the cells that are
+    /// not blank.
     pub fn full(mut self, _ next: Buffer, cursor: Option<Pos>, _ out: mut MemBuffer) {
-        // Placeholder: every cell's symbol, row by row, without styles.
-        push_csi(mut out, "0m")
-        push_csi(mut out, "2J")
-        var y: u16 = 0
-        while y < next.size().height {
-            push_csi(mut out, format!(y + 1, ";1H"))
-            for cell in next.row(y) {
-                next.write_symbol(cell, mut out)
-            }
-            y += 1
-        }
-        match cursor {
-            Option::Some(pos) => {
-                push_csi(mut out, format!(pos.y + 1, ";", pos.x + 1, "H"))
-                push_csi(mut out, "?25h")
-            },
-            Option::None => push_csi(mut out, "?25l"),
-        }
+        self.term = Term::UNKNOWN
+        self.started = false
+        self.begin(hide: true, mut out)
+        csi(mut out, "0m")
+        csi(mut out, "2J")
+        self.term.pen = Option::Some(Pen::DEFAULT)
+        self.draw(Buffer::new(next.size()), next, mut out)
+        self.finish(cursor, next.size(), mut out)
     }
 
     /// Appends to `out` the bytes that make a terminal showing `prev`, as
     /// this renderer last drew it, show `next`, with the cursor at `cursor`,
-    /// or hidden without one. The buffers have the same size.
+    /// or hidden without one. A cursor outside the buffer is placed on its
+    /// nearest cell. Buffers of different sizes are drawn with `full`.
     pub fn diff(
         mut self,
         _ prev: Buffer,
@@ -59,42 +351,687 @@ impl Renderer {
         cursor: Option<Pos>,
         _ out: mut MemBuffer,
     ) {
-        self.full(next, cursor, mut out)
+        if prev.size() != next.size() {
+            return self.full(next, cursor, mut out)
+        }
+        self.started = false
+        self.draw(prev, next, mut out)
+        self.finish(cursor, next.size(), mut out)
+    }
+
+    // Starts writing the frame, once, and hides the cursor if `hide`.
+    fn begin(mut self, hide: bool, _ out: mut MemBuffer) {
+        if !self.started {
+            self.started = true
+            if self.synchronized {
+                csi(mut out, "?2026h")
+            }
+        }
+        if hide && self.term.visible != Option::Some(false) {
+            csi(mut out, "?25l")
+            self.term.visible = Option::Some(false)
+        }
+    }
+
+    // Places and shows the cursor, or hides it, and ends the frame.
+    fn finish(mut self, _ cursor: Option<Pos>, _ size: Size, _ out: mut MemBuffer) {
+        match cursor {
+            Option::Some(pos) => {
+                let pos = Pos::new(
+                    x: min(pos.x, size.width.saturating_sub(1)),
+                    y: min(pos.y, size.height.saturating_sub(1)),
+                )
+                if self.term.cursor != Option::Some(pos) {
+                    self.begin(hide: false, mut out)
+                    move_cursor(self.term.cursor, pos, mut out)
+                    self.term.cursor = Option::Some(pos)
+                    self.term.last = 0
+                }
+                if self.term.visible != Option::Some(true) {
+                    self.begin(hide: false, mut out)
+                    csi(mut out, "?25h")
+                    self.term.visible = Option::Some(true)
+                }
+            },
+            Option::None => {
+                if self.term.visible != Option::Some(false) {
+                    self.begin(hide: false, mut out)
+                    csi(mut out, "?25l")
+                    self.term.visible = Option::Some(false)
+                }
+            },
+        }
+        if self.started && self.synchronized {
+            csi(mut out, "?2026l")
+        }
+    }
+
+    // Draws what changed from `prev` to `next`, row by row.
+    fn draw(mut self, _ prev: Buffer, _ next: Buffer, _ out: mut MemBuffer) {
+        var y: u16 = 0
+        while y < next.size().height {
+            self.draw_row(prev, next, y, mut out)
+            y += 1
+        }
+    }
+
+    // Draws the changed cells of row `y`. Those among the blank cells that
+    // end the row are drawn, or erased with the rest of the row, whichever
+    // is shorter.
+    fn draw_row(mut self, _ prev: Buffer, _ next: Buffer, _ y: u16, _ out: mut MemBuffer) {
+        let width = next.size().width
+        let Option::Some(first) = self.changed_from(prev, next, y, from: 0, to: width) else {
+            return
+        }
+        self.begin(hide: true, mut out)
+        let tail = self.blank_tail(next, y)
+        self.draw_cells(prev, next, y, from: first, to: tail, mut out)
+        let Option::Some(at) = self
+            .changed_from(prev, next, y, from: max(first, tail), to: width) else {
+            return
+        }
+        let start = out.len()
+        let before = self.term
+        self.erase_from(at, y, tail, mut out)
+        let erased = out.len() - start
+        out.truncate(start)
+        self.term = before
+        self.draw_cells(prev, next, y, from: at, to: width, mut out)
+        if out.len() - start > erased {
+            out.truncate(start)
+            self.term = before
+            self.erase_from(at, y, tail, mut out)
+        }
+    }
+
+    // Draws the changed cells of row `y` from column `from` to `to`, which
+    // start cells.
+    fn draw_cells(
+        mut self,
+        _ prev: Buffer,
+        _ next: Buffer,
+        _ y: u16,
+        from: u16,
+        to: u16,
+        _ out: mut MemBuffer,
+    ) {
+        var x = from
+        while let Option::Some(at) = self.changed_from(prev, next, y, from: x, to) {
+            self.put(next, at, y, mut out)
+            x = at + next.cells()[index(next, at, y)].width() as u16
+        }
+    }
+
+    // The first column from `from` to `to`, which start cells, of a cell of
+    // row `y` that the terminal shows otherwise in `next` than in `prev`.
+    //
+    // Drawing these cells from left to right leaves both columns of a wide
+    // cell right however widths change. A wide cell over two narrow ones
+    // covers the second. A write over either half of a wide cell blanks
+    // the other half, which is then a changed cell of its own, since its
+    // width changes: a left half is drawn before the write, which then
+    // overlaps no wide cell, and a right half after it. A continuation is
+    // drawn by drawing its wide cell, which counts as changed if its
+    // continuation is, though a buffer keeps the two in one style.
+    fn changed_from(
+        mut self,
+        _ prev: Buffer,
+        _ next: Buffer,
+        _ y: u16,
+        from: u16,
+        to: u16,
+    ) -> Option<u16> {
+        let row = index(next, 0, y)
+        var x = from
+        while x < to {
+            let i = row + x as usize
+            let cell = next.cells()[i]
+            if cell.is_continuation() {
+                x += 1
+                continue
+            }
+            if !self.same(prev, prev.cells()[i], next, cell)
+                || cell.width() == 2
+                    && !self.same(prev, prev.cells()[i + 1], next, next.cells()[i + 1]) {
+                return Option::Some(x)
+            }
+            x += cell.width() as u16
+        }
+        Option::None
+    }
+
+    // Whether the terminal shows `a`, a cell of `prev`, as `b`, a cell of
+    // `next`: as the same symbol of the same width, with the same colors
+    // at this depth and the same attributes.
+    fn same(mut self, _ prev: Buffer, _ a: Cell, _ next: Buffer, _ b: Cell) -> bool {
+        if prev.cell_eq(a, next, b) {
+            return true
+        }
+        if self.depth == ColorDepth::TrueColor
+            || a.width() != b.width()
+            || a.modifier() != b.modifier()
+            || !self.same_color(a.fg(), b.fg())
+            || !self.same_color(a.bg(), b.bg()) {
+            return false
+        }
+        self.symbol.clear()
+        prev.write_symbol(a, mut self.symbol)
+        self.scratch.clear()
+        next.write_symbol(b, mut self.scratch)
+        self.symbol.span() == self.scratch.span()
+    }
+
+    // Whether the terminal shows `a` and `b` as one color.
+    fn same_color(self, _ a: Color, _ b: Color) -> bool {
+        a == b || self.depth.map(a) == self.depth.map(b)
+    }
+
+    // The first column of the blank cells that end row `y` of `next`: cells
+    // an erasure leaves.
+    fn blank_tail(mut self, _ next: Buffer, _ y: u16) -> u16 {
+        let row = index(next, 0, y)
+        var x = next.size().width
+        while x > 0 && self.is_blank(next, next.cells()[row + x as usize - 1]) {
+            x -= 1
+        }
+        x
+    }
+
+    // Whether `cell` of `next` shows as a cell that an erasure with the
+    // default background leaves: a space in the default colors, without
+    // attributes.
+    fn is_blank(mut self, _ next: Buffer, _ cell: Cell) -> bool {
+        if cell == Cell::EMPTY {
+            return true
+        }
+        if cell.width() != 1 || self.pen(cell) != Pen::DEFAULT {
+            return false
+        }
+        self.symbol.clear()
+        next.write_symbol(cell, mut self.symbol)
+        self.symbol.span() == " "
+    }
+
+    // Erases row `y` from column `at` to its end, where every cell is to be
+    // blank; from the cursor instead if it is between `tail`, where the
+    // blank cells start, and `at`.
+    fn erase_from(mut self, _ at: u16, _ y: u16, _ tail: u16, _ out: mut MemBuffer) {
+        let here = match self.term.cursor {
+            Option::Some(pos) => pos.y == y && pos.x >= tail && pos.x <= at,
+            Option::None => false,
+        }
+        if !here {
+            move_cursor(self.term.cursor, Pos::new(x: at, y), mut out)
+            self.term.cursor = Option::Some(Pos::new(x: at, y))
+        }
+        // An erasure fills with the background; only the default one is
+        // blank on every terminal.
+        let pen = match self.term.pen {
+            Option::Some(pen) => Pen { fg: pen.fg, bg: Color::RESET, modifier: pen.modifier },
+            Option::None => Pen::DEFAULT,
+        }
+        self.set_pen(pen, mut out)
+        csi(mut out, "K")
+        self.term.last = 0
+    }
+
+    // Writes the cell of `next` at `(x, y)`.
+    fn put(mut self, _ next: Buffer, _ x: u16, _ y: u16, _ out: mut MemBuffer) {
+        let cell = next.cells()[index(next, x, y)]
+        self.symbol.clear()
+        next.write_symbol(cell, mut self.symbol)
+        let first = decode(self.symbol.span(), 0)
+        let single = first.len == self.symbol.len()
+        self.move_to(next, Pos::new(x, y), first.value, mut out)
+        let pen = self.pen(cell)
+        self.set_pen(pen, mut out)
+        out.extend_from(self.symbol.span())
+        let end = x + cell.width() as u16
+        self.term.cursor = if single && end < next.size().width {
+            Option::Some(Pos::new(x: end, y))
+        } else {
+            Option::None
+        }
+        self.term.last = if single { first.value } else { 0 }
+    }
+
+    // Moves the cursor to `to` to write a cluster that starts with the
+    // scalar `first`: by the shortest sequence, or by writing again the
+    // cells before `to` when that is shorter. A cluster that would join the
+    // one just written, such as a regional indicator after another, is
+    // placed with a move, which keeps them apart.
+    fn move_to(mut self, _ next: Buffer, _ to: Pos, _ first: u32, _ out: mut MemBuffer) {
+        let start = out.len()
+        if let Option::Some(at) = self.term.cursor {
+            if at == to {
+                if joins(self.term.last, first) {
+                    step(mut out, to.x as u32 + 1, b'G')
+                    self.term.last = 0
+                }
+                return
+            }
+            if at.y == to.y && at.x < to.x {
+                move_cursor(self.term.cursor, to, mut out)
+                let budget = out.len() - start
+                out.truncate(start)
+                if self.rewrite(next, at, to, first, budget, mut out) {
+                    return
+                }
+            }
+        }
+        move_cursor(self.term.cursor, to, mut out)
+        self.term.cursor = Option::Some(to)
+        self.term.last = 0
+    }
+
+    // Writes the cells of `next` from `at` to `to`, on one row, again, if
+    // that takes fewer than `budget` bytes and needs neither a change of
+    // pen nor a move: the cells are unchanged, so the terminal shows them
+    // already. Returns whether it did.
+    fn rewrite(
+        mut self,
+        _ next: Buffer,
+        _ at: Pos,
+        _ to: Pos,
+        _ first: u32,
+        _ budget: usize,
+        _ out: mut MemBuffer,
+    ) -> bool {
+        let Option::Some(pen) = self.term.pen else {
+            return false
+        }
+        let start = out.len()
+        let row = index(next, 0, at.y)
+        var last = self.term.last
+        var x = at.x
+        while x < to.x {
+            let cell = next.cells()[row + x as usize]
+            if cell.is_continuation() || self.pen(cell) != pen {
+                break
+            }
+            let from = out.len()
+            next.write_symbol(cell, mut out)
+            let scalar = decode(out.span(), from)
+            if from + scalar.len != out.len()
+                || joins(last, scalar.value)
+                || out.len() - start >= budget {
+                break
+            }
+            last = scalar.value
+            x += cell.width() as u16
+        }
+        if x == to.x && !joins(last, first) {
+            self.term.cursor = Option::Some(to)
+            self.term.last = last
+            return true
+        }
+        out.truncate(start)
+        false
+    }
+
+    // The pen of `cell` at this depth.
+    fn pen(self, _ cell: Cell) -> Pen {
+        Pen {
+            fg: self.depth.map(cell.fg()),
+            bg: self.depth.map(cell.bg()),
+            modifier: cell.modifier(),
+        }
+    }
+
+    // Changes the terminal's pen to `pen`.
+    fn set_pen(mut self, _ pen: Pen, _ out: mut MemBuffer) {
+        if self.term.pen == Option::Some(pen) {
+            return
+        }
+        sgr(self.term.pen, pen, mut self.scratch, mut out)
+        self.term.pen = Option::Some(pen)
     }
 }
 
-fn push_csi<T: std::io::Display>(_ out: mut MemBuffer, _ rest: T) {
+// The index of the cell at `(x, y)` of `buffer`.
+fn index(_ buffer: Buffer, _ x: u16, _ y: u16) -> usize {
+    y as usize * buffer.size().width as usize + x as usize
+}
+
+// Whether a cluster starting with `next` joins the one-scalar cluster of
+// `last`, or none if `last` is 0. ASCII joins no ASCII.
+fn joins(_ last: u32, _ next: u32) -> bool {
+    if last == 0 || next == 0 || last < 0x80 && next < 0x80 {
+        return false
+    }
+    var cluster = Grapheme::new(last)
+    cluster.extend(next)
+}
+
+fn csi<T: std::io::Display>(_ out: mut MemBuffer, _ rest: T) {
     out.push(0x1b)
     out.push(b'[')
     write!(mut out, rest)
 }
 
-#[test]
-fn a_full_frame_draws_every_row() {
-    use super::geom::Size
-    use super::style::Style
-    use super::vt::Vt
+fn push_decimal(_ out: mut MemBuffer, _ n: u32) {
+    if n >= 10 {
+        push_decimal(mut out, n / 10)
+    }
+    out.push(b'0' + (n % 10).downcast_truncate())
+}
 
-    var buffer = Buffer::new(Size::new(width: 4, height: 2))
-    let _ = buffer
-        .set_string(
-            Pos::new(x: 0, y: 0),
-            format!("ab").span(),
-            Style::new(),
-            max_width: 4,
+fn digits(_ n: u32) -> usize {
+    if n < 10 {
+        1
+    } else if n < 100 {
+        2
+    } else if n < 1000 {
+        3
+    } else if n < 10000 { 4 } else { 5 }
+}
+
+// Appends `CSI n final`, without `n` if it is 1, the default.
+fn step(_ out: mut MemBuffer, _ n: u32, _ final: u8) {
+    out.push(0x1b)
+    out.push(b'[')
+    if n != 1 {
+        push_decimal(mut out, n)
+    }
+    out.push(final)
+}
+
+// The length of `step(n, ..)`.
+fn step_cost(_ n: u32) -> usize {
+    if n == 1 { 3 } else { 3 + digits(n) }
+}
+
+// The shortest move along one axis from `from` to `to`, `CSI n ahead`,
+// `CSI n back` or `CSI to+1 absolute`, as its length, its count and its
+// final byte; of length 0 if there is nothing to move.
+fn axis(_ from: u16, _ to: u16, ahead: u8, back: u8, absolute: u8) -> (usize, u32, u8) {
+    if from == to {
+        return (0, 0, 0)
+    }
+    let (n, relative) = if to > from {
+        ((to - from) as u32, ahead)
+    } else {
+        ((from - to) as u32, back)
+    }
+    let position = to as u32 + 1
+    if step_cost(position) < step_cost(n) {
+        (step_cost(position), position, absolute)
+    } else {
+        (step_cost(n), n, relative)
+    }
+}
+
+// The length of `CSI row ; column H` to `to`, without the parameters that
+// are 1.
+fn cup_cost(_ to: Pos) -> usize {
+    let row = to.y as u32 + 1
+    let column = to.x as u32 + 1
+    3 + (if row == 1 { 0 } else { digits(row) }) + if column == 1 { 0 } else { 1 + digits(column) }
+}
+
+// Appends the shortest sequence that moves the cursor from `from`, or from
+// anywhere, to `to`: relative or absolute moves along each axis, or an
+// absolute position.
+fn move_cursor(_ from: Option<Pos>, _ to: Pos, _ out: mut MemBuffer) {
+    if let Option::Some(at) = from {
+        let (rows, n, row_final) = axis(at.y, to.y, ahead: b'B', back: b'A', absolute: b'd')
+        let (columns, m, column_final) = axis(at.x, to.x, ahead: b'C', back: b'D', absolute: b'G')
+        if rows + columns < cup_cost(to) {
+            if rows > 0 {
+                step(mut out, n, row_final)
+            }
+            if columns > 0 {
+                step(mut out, m, column_final)
+            }
+            return
+        }
+    }
+    out.push(0x1b)
+    out.push(b'[')
+    let row = to.y as u32 + 1
+    let column = to.x as u32 + 1
+    if row != 1 {
+        push_decimal(mut out, row)
+    }
+    if column != 1 {
+        out.push(b';')
+        push_decimal(mut out, column)
+    }
+    out.push(b'H')
+}
+
+// Each attribute, with the SGR parameters that turn it on and off.
+const ATTRIBUTES: [(Modifier, u32, u32); 8] = [
+    (Modifier::BOLD, 1, 22),
+    (Modifier::DIM, 2, 22),
+    (Modifier::ITALIC, 3, 23),
+    (Modifier::UNDERLINED, 4, 24),
+    (Modifier::BLINK, 5, 25),
+    (Modifier::REVERSED, 7, 27),
+    (Modifier::HIDDEN, 8, 28),
+    (Modifier::CROSSED_OUT, 9, 29),
+]
+
+// Appends the SGR sequence that changes the pen `from`, or an unknown one,
+// to `to`: one that changes what differs, or one that resets all and sets
+// what `to` has, whichever is shorter. `scratch` is room to compare them.
+fn sgr(_ from: Option<Pen>, _ to: Pen, _ scratch: mut MemBuffer, _ out: mut MemBuffer) {
+    scratch.clear()
+    var reset = Params { start: 0, count: 0 }
+    reset.push(mut scratch, 0)
+    changes(Pen::DEFAULT, to, mut scratch, mut reset)
+    out.push(0x1b)
+    out.push(b'[')
+    if let Option::Some(from) = from {
+        let start = out.len()
+        var params = Params { start, count: 0 }
+        changes(from, to, mut out, mut params)
+        if out.len() - start <= scratch.len() {
+            out.push(b'm')
+            return
+        }
+        out.truncate(start)
+    }
+    out.extend_from(scratch.span())
+    out.push(b'm')
+}
+
+// The most parameters a sequence holds: terminals such as st read no more.
+const MAX_PARAMS: usize = 16
+
+// The SGR parameters being appended to an output from `start`, `count` of
+// them in the sequence they are in. A list longer than `MAX_PARAMS`
+// continues in another sequence.
+struct Params { start: usize, count: usize }
+
+impl Params {
+    // Makes room for a group of `n` parameters that must be in one
+    // sequence, such as those of a color.
+    fn group(mut self, _ out: mut MemBuffer, _ n: usize) {
+        if self.count + n > MAX_PARAMS {
+            out.push(b'm')
+            out.push(0x1b)
+            out.push(b'[')
+            self.start = out.len()
+            self.count = 0
+        }
+        self.count += n
+    }
+
+    // Appends the parameter `n` alone.
+    fn push(mut self, _ out: mut MemBuffer, _ n: u32) {
+        self.group(mut out, 1)
+        self.next(mut out, n)
+    }
+
+    // Appends the parameter `n` of a group.
+    fn next(self, _ out: mut MemBuffer, _ n: u32) {
+        if out.len() > self.start {
+            out.push(b';')
+        }
+        push_decimal(mut out, n)
+    }
+}
+
+// Appends the SGR parameters that change the pen `from` to `to`. `22`
+// turns off both bold and dim, so the one of them that stays is turned on
+// again.
+fn changes(_ from: Pen, _ to: Pen, _ out: mut MemBuffer, _ params: mut Params) {
+    let both = Modifier::BOLD | Modifier::DIM
+    let off = from.modifier.without(to.modifier)
+    var kept = from.modifier
+    for (bit, _, code) in ATTRIBUTES {
+        // Bold and dim share theirs, which is written once.
+        if off.contains(bit) && kept.contains(bit) {
+            params.push(mut out, code)
+            kept = kept.without(if both.contains(bit) { both } else { bit })
+        }
+    }
+    for (bit, code, _) in ATTRIBUTES {
+        if to.modifier.contains(bit) && !kept.contains(bit) {
+            params.push(mut out, code)
+        }
+    }
+    if from.fg != to.fg {
+        color(mut out, mut params, to.fg, 30)
+    }
+    if from.bg != to.bg {
+        color(mut out, mut params, to.bg, 40)
+    }
+}
+
+// Appends the SGR parameters that set `color`, the foreground for `base`
+// 30 or the background for 40.
+fn color(_ out: mut MemBuffer, _ params: mut Params, _ color: Color, _ base: u32) {
+    match color.kind() {
+        ColorKind::Ansi(i) => params
+            .push(
+                mut out,
+                if i < 8 {
+                    base + i as u32
+                } else {
+                    base + 52 + i as u32
+                },
+            ),
+        ColorKind::Indexed(n) => {
+            params.group(mut out, 3)
+            params.next(mut out, base + 8)
+            params.next(mut out, 5)
+            params.next(mut out, n as u32)
+        },
+        ColorKind::Rgb(r, g, b) => {
+            params.group(mut out, 5)
+            params.next(mut out, base + 8)
+            params.next(mut out, 2)
+            params.next(mut out, r as u32)
+            params.next(mut out, g as u32)
+            params.next(mut out, b as u32)
+        },
+        _ => params.push(mut out, base + 9),
+    }
+}
+
+/// What differs between the screen `vt` shows and `buffer` as a terminal
+/// of `depth` shows it, with the cursor at `cursor` and shown, or hidden
+/// for `None`: a description of the first difference, or `None` if there
+/// is none. Each cell is compared by its symbol, width, colors at `depth`
+/// and attributes; the right half of a wide cell has no symbol.
+pub(ingot) fn mismatch(
+    _ vt: Vt,
+    _ buffer: Buffer,
+    _ depth: ColorDepth,
+    cursor: Option<Pos>,
+) -> Option<MemBuffer> {
+    let size = buffer.size()
+    if vt.size() != size {
+        return Option::Some(format!("size ", vt.size().width, "x", vt.size().height))
+    }
+    var symbol = MemBuffer::empty()
+    for (i, cell) in buffer.cells().enumerate() {
+        let pos = Pos::new(
+            x: (i % size.width as usize).downcast_truncate(),
+            y: (i / size.width as usize).downcast_truncate(),
         )
-    let _ = buffer
-        .set_string(
-            Pos::new(x: 1, y: 1),
-            format!("cd").span(),
-            Style::new(),
-            max_width: 4,
-        )
-    var renderer = Renderer::new(ColorDepth::TrueColor)
-    var out = MemBuffer::empty()
-    renderer.full(buffer, cursor: Option::None, mut out)
-    var vt = Vt::new(Size::new(width: 4, height: 2))
-    vt.feed(out.span())
-    assert(vt.to_text() == buffer.to_text())
-    assert(!vt.cursor_visible())
+        let shown = ref vt.cell(pos)
+        symbol.clear()
+        buffer.write_symbol(cell, mut symbol)
+        if shown.symbol() != symbol.span()
+            || shown.width != cell.width()
+            || shown.fg != depth.map(cell.fg())
+            || shown.bg != depth.map(cell.bg())
+            || shown.modifier != cell.modifier() {
+            var message = format!("cell (", pos.x, ", ", pos.y, ") shows ")
+            describe(
+                mut message,
+                shown.symbol(),
+                shown.width,
+                shown.fg,
+                shown.bg,
+                shown.modifier,
+            )
+            write!(mut message, ", expected ")
+            describe(
+                mut message,
+                symbol.span(),
+                cell.width(),
+                depth.map(cell.fg()),
+                depth.map(cell.bg()),
+                cell.modifier(),
+            )
+            return Option::Some(message)
+        }
+    }
+    match cursor {
+        Option::Some(pos) => {
+            if !vt.cursor_visible() || vt.cursor() != pos || vt.pending_wrap() {
+                return Option::Some(
+                    format!(
+                        "cursor at (",
+                        vt.cursor().x,
+                        ", ",
+                        vt.cursor().y,
+                        "), expected (",
+                        pos.x,
+                        ", ",
+                        pos.y,
+                        ") and shown",
+                    ),
+                )
+            }
+        },
+        Option::None => {
+            if vt.cursor_visible() {
+                return Option::Some(format!("cursor shown"))
+            }
+        },
+    }
+    Option::None
+}
+
+// Appends a description of a cell for `mismatch`.
+fn describe(
+    _ out: mut MemBuffer,
+    _ symbol: MemSpan,
+    _ width: u8,
+    _ fg: Color,
+    _ bg: Color,
+    _ modifier: Modifier,
+) {
+    out.push(b'"')
+    out.extend_from(symbol)
+    write!(mut out, "\" of width ", width, ", fg ")
+    describe_color(mut out, fg)
+    write!(mut out, ", bg ")
+    describe_color(mut out, bg)
+    write!(mut out, ", attributes ", modifier.bits())
+}
+
+fn describe_color(_ out: mut MemBuffer, _ color: Color) {
+    match color.kind() {
+        ColorKind::Keep => write!(mut out, "keep"),
+        ColorKind::Reset => write!(mut out, "reset"),
+        ColorKind::Ansi(i) => write!(mut out, "ansi ", i),
+        ColorKind::Indexed(n) => write!(mut out, "indexed ", n),
+        ColorKind::Rgb(r, g, b) => write!(mut out, "rgb ", r, " ", g, " ", b),
+    }
 }
