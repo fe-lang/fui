@@ -1,9 +1,9 @@
 //! Progress as a bar.
 use std::io::Display
 use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
-use ingot::geom::{Pos, Rect, min}
+use ingot::geom::{Pos, Rect, clamp_u16, min}
 use ingot::style::{Color, Modifier, Style}
-use super::{Alignment, clamp_u16}
+use super::Alignment
 
 /// A bar that fills its area as far as `done` is of `total`, with a label
 /// in the middle:

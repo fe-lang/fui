@@ -49,7 +49,7 @@
 //! without length makes segments without length at its start.
 use core::iter::Collection
 use core::ops::{Eq, Index, Len}
-use super::geom::Rect
+use super::geom::{Rect, min}
 
 /// What one segment of a split asks for.
 pub enum Constraint {
@@ -300,10 +300,6 @@ uses C::E
 // A rectangle holding a segment's size, `size` being at most a length.
 fn sized(_ size: u32) -> Rect {
     Rect { x: 0, y: 0, width: size.downcast_truncate(), height: 0 }
-}
-
-fn min(_ a: u32, _ b: u32) -> u32 {
-    if a < b { a } else { b }
 }
 
 /// Constraints a `Layout` splits an area by, and the segments that gives.

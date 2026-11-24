@@ -1,7 +1,7 @@
 use core::{MemBuffer, MemSpan}
 use ingot::geom::{Pos, Size}
 use ingot::style::{Color, Modifier}
-use ingot::text::encode
+use ingot::text::utf8
 use super::Vt
 
 // `text` with caret notation for C0 controls: "^[" is ESC, "^G" BEL, "^H"
@@ -29,14 +29,6 @@ fn fed<T: std::io::Display>(width: u16, height: u16, _ input: T) -> Vt {
 
 fn feed<T: std::io::Display>(_ vt: mut Vt, _ input: T) {
     vt.feed(bytes(format!(input).span()).span())
-}
-
-fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
-    var out = MemBuffer::empty()
-    for c in scalars {
-        encode(c, mut out)
-    }
-    out
 }
 
 fn at(x: u16, y: u16) -> Pos {

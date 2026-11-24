@@ -501,12 +501,34 @@ impl ListState {
         (if end < self.len() { end } else { self.len() }) - 1
     }
 
+    /// Records that there are `len` items, as the next render will: clamps
+    /// the selection to them and the scroll position to their rows, then
+    /// follows the selection. An `update` that changes the items calls it,
+    /// so that keys handled before the next render, which run against the
+    /// items the last render drew, move within the new ones.
+    pub fn set_len(mut self, _ len: usize) {
+        self.fit(len, viewport: self.scroll.viewport())
+    }
+
     // Records what a render lays out: `len` items in `area`, `item_height`
-    // rows each. Clamps the selection to the items and the scroll position
-    // to the rows, then follows the selection.
+    // rows each; see `fit`.
     pub(ingot) fn lay_out(mut self, _ len: usize, _ area: Rect, _ item_height: u16) {
         self.area = area
         self.item_height = item_height
+        // An item the area cuts is not counted, unless the area shows no
+        // item whole.
+        let whole = (area.height / item_height) as usize
+        let viewport = if whole == 0 && area.height > 0 {
+            1
+        } else {
+            whole
+        }
+        self.fit(len, viewport)
+    }
+
+    // Clamps the selection to `len` items and the scroll position to them
+    // in a viewport of `viewport` items, then follows the selection.
+    fn fit(mut self, _ len: usize, viewport: usize) {
         match self.selected {
             Option::Some(i) => if i >= len {
                 self.selected = if len == 0 {
@@ -516,14 +538,6 @@ impl ListState {
                 }
             },
             Option::None => {},
-        }
-        // An item the area cuts is not counted, unless the area shows no
-        // item whole.
-        let whole = (area.height / item_height) as usize
-        let viewport = if whole == 0 && area.height > 0 {
-            1
-        } else {
-            whole
         }
         self.scroll.set_lengths(content: len, viewport)
         if self.follow {
@@ -804,6 +818,25 @@ fn a_selection_beyond_shrunk_items_clamps_to_the_last() {
     with (frame) {
         draw_letters(area, none, mut state)
     }
+    assert(state.selected().is_none() && state.is_empty())
+}
+
+#[test]
+fn set_len_clamps_before_the_next_render() {
+    var frame = frame_of(width: 4, height: 3)
+    let area = frame.area()
+    var state = ListState::new()
+    state.select(8)
+    with (frame) {
+        draw_letters(area, letters(), mut state)
+    }
+    // The items shrink to two in `update`: keys move within them at once.
+    state.set_len(2)
+    assert(state.selected() == Option::Some(1) && state.len() == 2)
+    assert(state.scroll().position() == 0)
+    assert(state.handle_key(Key::new(KeyCode::Down, Modifiers::NONE)))
+    assert(state.selected() == Option::Some(1))
+    state.set_len(0)
     assert(state.selected().is_none() && state.is_empty())
 }
 

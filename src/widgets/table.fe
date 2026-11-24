@@ -6,12 +6,12 @@ use std::io::Display
 use ingot::buffer::{Buffer, cell_at}
 use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
 use ingot::frame::{Frame, frame_of, measure, print, print_in, theme}
-use ingot::geom::{Pos, Rect}
+use ingot::geom::{Pos, Rect, clamp_u16}
 use ingot::layout::{Constraint, Layout}
 use ingot::layout::Constraint::{Fill, Length}
 use ingot::style::{Color, Modifier, Style}
 use ingot::text::Alignment
-use super::{clamp_u16, print_cut}
+use super::print_cut
 use super::list::ListState
 use super::scroll::ScrollState
 
@@ -463,6 +463,11 @@ impl TableState {
     /// Selects no row.
     pub fn deselect(mut self) {
         self.rows.deselect()
+    }
+
+    /// Records that there are `len` rows; see `ListState::set_len`.
+    pub fn set_len(mut self, _ len: usize) {
+        self.rows.set_len(len)
     }
 
     /// Selects the row below the selected one; see `ListState::select_next`.

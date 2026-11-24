@@ -22,7 +22,7 @@ use core::{MemBuffer, MemSpan, Option}
 use std::io::Display
 use ingot::app::{App, Options, draw, handle}
 use ingot::backend::TestBackend
-use ingot::event::{Event, Key, KeyCode, Modifiers}
+use ingot::event::{Event, Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
 use ingot::geom::{Pos, Size}
 use ingot::session::Session
 use ingot::text::decode
@@ -82,6 +82,17 @@ impl<A: App> Harness<A> {
             }
             self.key(code)
         }
+    }
+
+    /// Sends a mouse event of `kind` at `pos`, without modifiers.
+    pub fn mouse(mut self, _ kind: MouseKind, _ pos: Pos) uses A::E {
+        self.send(Event::Mouse(Mouse::new(kind, pos, Modifiers::NONE)))
+    }
+
+    /// Sends a press and a release of the left button at `pos`.
+    pub fn click(mut self, _ pos: Pos) uses A::E {
+        self.mouse(MouseKind::Down(MouseButton::Left), pos)
+        self.mouse(MouseKind::Up(MouseButton::Left), pos)
     }
 
     /// Sends a paste of the `Display` text of `text`.

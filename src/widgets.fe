@@ -85,15 +85,6 @@ uses (frame: mut Frame)
     written
 }
 
-// `value` as a `u16`, or 65535 if it is larger.
-pub(ingot) fn clamp_u16(_ value: usize) -> u16 {
-    if value > 65535 {
-        65535
-    } else {
-        value.downcast_truncate()
-    }
-}
-
 #[test]
 fn alignments_place_content_in_the_room_left() {
     assert(Alignment::Left.offset(width: 3, available: 10) == 0)
@@ -102,11 +93,4 @@ fn alignments_place_content_in_the_room_left() {
     assert(Alignment::Center.offset(width: 12, available: 10) == 0)
     assert(Alignment::Right.offset(width: 10, available: 10) == 0)
     assert(Alignment::Center != Alignment::Right)
-}
-
-#[test]
-fn values_clamp_to_u16() {
-    assert(
-        clamp_u16(70000) == 65535 && clamp_u16(65535) == 65535 && clamp_u16(7) == 7,
-    )
 }

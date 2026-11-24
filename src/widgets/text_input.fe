@@ -5,10 +5,9 @@ use core::{MemBuffer, MemSpan}
 use core::mem::replace
 use ingot::event::{Key, KeyCode, KeyKind, Modifiers, Mouse, MouseButton, MouseKind}
 use ingot::frame::{Frame, frame_of, theme}
-use ingot::geom::{Pos, Rect}
+use ingot::geom::{Pos, Rect, clamp_u16, max, min}
 use ingot::style::{Modifier, Style}
 use ingot::text::{column_offset, decode, encode, is_control, next_cluster, utf8, width}
-use super::clamp_u16
 
 /// The most text a `TextInputState` holds.
 pub enum TextLimit {
@@ -835,14 +834,6 @@ fn locate(_ text: MemSpan, _ column: usize, mask: usize) -> (usize, usize) {
         columns += mask
     }
     (at, columns)
-}
-
-fn min(_ a: usize, _ b: usize) -> usize {
-    if a < b { a } else { b }
-}
-
-fn max(_ a: usize, _ b: usize) -> usize {
-    if a > b { a } else { b }
 }
 
 fn typed(_ text: MemSpan) -> TextInputState {

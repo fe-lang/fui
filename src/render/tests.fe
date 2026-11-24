@@ -4,7 +4,7 @@ use std::io::Stderr
 use ingot::buffer::Buffer
 use ingot::geom::{Pos, Rect, Size}
 use ingot::style::{Color, Modifier, Style}
-use ingot::text::encode
+use ingot::text::utf8
 use ingot::vt::Vt
 use super::{ColorDepth, Pen, Renderer, mismatch, sgr}
 
@@ -33,14 +33,6 @@ impl Rng {
     fn chance(mut self, _ one_in: u32) -> bool {
         self.below(one_in) == 0
     }
-}
-
-fn utf8<const N: usize>(_ scalars: [u32; N]) -> MemBuffer {
-    var out = MemBuffer::empty()
-    for c in scalars {
-        encode(c, mut out)
-    }
-    out
 }
 
 // A symbol of the kinds a buffer holds: narrow, wide, joined, of more than

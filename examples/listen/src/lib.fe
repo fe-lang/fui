@@ -1,0 +1,231 @@
+//! A program that runs its own loop: it waits on the terminal and on a TCP
+//! listener with one `std::net::Poller`, and lists each connection it
+//! accepts.
+//!
+//! `run` waits on the terminal alone. A program that waits on more drives
+//! a `Session` itself: it registers the session's `input_fd` and
+//! `signal_fd` with its poller beside its own sources, calls `pump` when
+//! either is readable or `pending_timeout` has passed, takes the events
+//! with `pop_event`, and draws with `frame` and `present`. It listens on
+//! 127.0.0.1 at a port the system picks, shown in the title; `q` or Ctrl+C
+//! quits, Ctrl+Z suspends.
+use std::io::{Error, ErrorKind}
+use std::net::{
+    Events,
+    Interest,
+    IpAddr,
+    Ipv4Addr,
+    Net,
+    Pollable,
+    Poller,
+    SocketAddr,
+    TcpListener,
+    Token,
+}
+use std::term::Tty
+use std::time::Clock
+use tui::prelude::*
+use tui::{Session, TermBackend}
+
+/// The model: the port listened on, and the peers accepted, oldest first.
+pub struct Server { pub port: u16, pub peers: MemVec<MemBuffer>, pub list: ListState }
+
+impl Server {
+    /// Lists `peer`, after the others.
+    pub fn add(mut self, _ peer: own MemBuffer) {
+        self.peers.push(peer)
+        // Keys before the next render then move within the new peers.
+        self.list.set_len(self.peers.len())
+    }
+}
+
+impl App for Server {
+    uses E = ()
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        match event {
+            Event::Key(key) => if key.is_char(b'q') {
+                Flow::Quit
+            } else if self.list.handle_key(key) {
+                Flow::Redraw
+            } else {
+                Flow::Unchanged
+            },
+            _ => Flow::Unchanged,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let (body, foot) = area.rows((Fill(1), Length(1)))
+        let title = format!("Listening on 127.0.0.1:", self.port)
+        let inner = Block::bordered().render_titled(body, title)
+        List::new()
+            .highlight_symbol("> ")
+            .placeholder("No connections yet")
+            .render(inner, self.peers, mut self.list)
+        print_in(
+            foot,
+            format!(self.peers.len(), " accepted  q quit"),
+            theme().muted,
+        )
+    }
+}
+
+// What the poller waits on: one of the terminal's descriptors, which the
+// session owns, or the listener.
+enum Source {
+    Terminal(i32),
+    Listener(TcpListener),
+}
+
+impl Pollable for Source {
+    fn raw_fd(self) -> i32 {
+        match self {
+            Source::Terminal(fd) => fd,
+            Source::Listener(ref listener) => listener.as_raw_fd(),
+        }
+    }
+}
+
+/// Listens, takes the terminal over, and serves until a quit: 0, or 1 if
+/// the terminal or the network fails.
+pub fn main() -> i32 uses (tty: mut Tty, clock: Clock, net: mut Net) {
+    match listen() {
+        Result::Ok(()) => 0,
+        Result::Err(_) => 1,
+    }
+}
+
+fn listen() -> Result<Error, ()>
+uses (tty: mut Tty, clock: Clock, net: mut Net)
+{
+    var listener = net.listen(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+    )?
+    listener.set_nonblocking(true)?
+    var server = Server {
+        port: listener.local_addr()?.port(),
+        peers: MemVec::new(),
+        list: ListState::new(),
+    }
+    var session = Session::enter(TermBackend::open()?, Options::new())?
+    let served = serve(mut server, mut session, listener)
+    let left = session.leave()
+    served?
+    left
+}
+
+// The loop: draws when something changed, waits on every source, then
+// accepts what the listener has and handles what the terminal sent.
+fn serve(
+    _ server: mut Server,
+    _ session: mut Session<TermBackend>,
+    _ listener: own TcpListener,
+) -> Result<Error, ()>
+uses (clock: Clock)
+{
+    var poller: Poller<Source> = Poller::new()?
+    poller.add(Source::Terminal(session.input_fd()), Interest::READABLE)?
+    poller.add(Source::Terminal(session.signal_fd()), Interest::READABLE)?
+    let listening = poller.add(Source::Listener(listener), Interest::READABLE)?
+    var events = Events::with_capacity(4)
+    var dirty = true
+    while true {
+        if dirty {
+            let area = session.area()
+            with (Frame = session.frame()) {
+                server.view(area)
+            }
+            session.present()?
+            dirty = false
+        }
+        poller.wait(mut events, session.pending_timeout())?
+        for i in 0 .. events.len() {
+            if events.get(i).token() == listening {
+                dirty = accept(mut poller, listening, mut server)? || dirty
+            }
+        }
+        // Reads whatever the terminal has, and resolves a lone Esc.
+        session.pump()?
+        // Handles the events as `run` does: Ctrl+C and termination end
+        // the loop, Ctrl+Z suspends, and the rest go to `update`.
+        while true {
+            let event = match session.pop_event() {
+                Option::Some(event) => event,
+                Option::None => {
+                    break
+                },
+            }
+            match event {
+                Event::Terminate => {
+                    return Result::Ok(())
+                },
+                Event::Key(key) => if key.ctrl(b'c') {
+                    return Result::Ok(())
+                } else if key.ctrl(b'z') {
+                    session.suspend()?
+                    continue
+                },
+                Event::Resize(_) | Event::Resume => dirty = true,
+                _ => {},
+            }
+            match server.update(event) {
+                Flow::Quit => {
+                    return Result::Ok(())
+                },
+                Flow::Redraw => dirty = true,
+                Flow::Suspend => session.suspend()?,
+                Flow::Unchanged => {},
+            }
+        }
+    }
+    Result::Ok(())
+}
+
+// Accepts every connection waiting, records its peer and closes it:
+// whether there was one.
+fn accept(_ poller: mut Poller<Source>, _ token: Token, _ server: mut Server) -> Result<
+    Error,
+    bool,
+> {
+    var accepted = false
+    if let Option::Some(mut source) = poller.get(token)
+        && let Source::Listener(mut listener) = source {
+        while true {
+            match listener.accept() {
+                Result::Ok((_, peer)) => {
+                    server.add(format!(peer))
+                    accepted = true
+                },
+                Result::Err(error) => match error.kind() {
+                    ErrorKind::WouldBlock => {
+                        break
+                    },
+                    _ => {
+                        return Result::Err(error)
+                    },
+                },
+            }
+        }
+    }
+    Result::Ok(accepted)
+}
+
+#[test]
+fn peers_are_listed_under_the_port() {
+    let server = Server { port: 4000, peers: MemVec::new(), list: ListState::new() }
+    var harness = Harness::new(server, Size::new(width: 30, height: 4))
+    assert(
+        harness.screen()
+            == "┌Listening on 127.0.0.1:4000─┐\n│No connections yet          │\n└────────────────────────────┘\n0 accepted  q quit",
+    )
+    harness.app().add(format!("127.0.0.1:5000"))
+    // The harness draws when `update` asks, as for this key.
+    harness.key(KeyCode::Down)
+    assert(
+        harness.screen()
+            == "┌Listening on 127.0.0.1:4000─┐\n│> 127.0.0.1:5000            │\n└────────────────────────────┘\n1 accepted  q quit",
+    )
+    harness.key(KeyCode::Char(b'q'))
+    assert(harness.quit_requested())
+}
