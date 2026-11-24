@@ -22,6 +22,7 @@ use ingot::text::width
 use ingot::theme::Theme
 
 pub use block::{Block, BorderSymbols, BorderType, Borders, Padding}
+pub use clear::{clear, popup}
 pub use gauge::{Gauge, LineGauge}
 pub use scrollbar::{Orientation, Scrollbar}
 pub use sparkline::Sparkline
