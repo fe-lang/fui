@@ -324,7 +324,9 @@ impl Parser {
                 self.end_text(mut events)
             } else {
                 // An `ESC` that is no string terminator ends the string
-                // unread and begins a sequence of its own.
+                // unread and begins a sequence of its own. An empty string
+                // was Alt and its introducer, as at `flush`.
+                self.lone_introducer(mut events, self.text_kind)
                 self.reset()
                 self.state = State::Escape
                 self.escape(b, mut events)

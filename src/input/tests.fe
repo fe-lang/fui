@@ -333,6 +333,10 @@ fn escape_prefixes_alt() {
         ),
     )
     assert(parses("^[]^[", two(alt(b']'), plain(KeyCode::Esc))))
+    assert(
+        parses("^[]^[]^[x", three(alt(b']'), alt(b']'), alt(b'x'))),
+    )
+    assert(parses("^[P^[_", two(alt(b'P'), alt(b'_'))))
     assert(parses("^[xy", two(alt(b'x'), ch(b'y'))))
 }
 
