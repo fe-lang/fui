@@ -13,46 +13,44 @@ use super::print_cut
 use super::scroll::{ScrollState, WHEEL_ROWS}
 
 /// A list of items, one row (or `item_height` rows) each, scrolled so the
-/// selected item is shown.
+/// selected item is shown:
 ///
 /// ```fe
-/// fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
-///     let inner = Block::bordered().title("Files").render(area)
-///     List::new().highlight_symbol("> ").render(inner, self.names, mut self.files)
-/// }
-///
-/// fn update(mut self, _ event: Event) -> Flow {
-///     match event {
-///         Event::Key(key) => if self.files.handle_key(key) { return Flow::Redraw },
-///         Event::Mouse(mouse) => if let Option::Some(i) = self.files.handle_mouse(mouse) { self.open(i) },
-///         _ => {},
-///     }
-///     Flow::Continue
+/// fn view(_ area: Rect, _ names: MemSlice<MemBuffer>, _ files: mut ListState) uses (frame: mut Frame) {
+///     let inner = Block::bordered().render_titled(area, "Files")
+///     List::new().highlight_symbol("> ").render(inner, names, mut files)
 /// }
 /// ```
 ///
-/// `render` draws items that are `Display`: a `MemVec` or `MemSlice` of
-/// them, or an array such as `["one", "two"]`. `render_with` draws each row
-/// with a closure, which draws through the frame in the row it is given,
-/// clipped to it, so a row can be anything:
+/// `render` draws items that are `Display`, from any collection indexed by
+/// position: a `MemVec` or `MemSlice` of them, or an array such as
+/// `["one", "two"]`. An item wider than the area ends in an ellipsis unless
+/// `ellipsis(false)`. `render_with` draws each row with a closure instead,
+/// with the frame clipped to the row, so a row can be anything:
 ///
 /// ```fe
-/// List::new().render_with(area, self.entries, mut self.list, |entry, row| {
-///     let (name, size) = row.area.columns((Fill(1), Length(8)))
-///     print_in(name, entry.name, Style::new())
-///     Paragraph::new().right().render(size, entry.size)
-/// })
+/// struct Entry { name: MemBuffer, size: u64 }
+///
+/// fn entries(_ area: Rect, _ entries: MemSlice<Entry>, _ list: mut ListState) uses (frame: mut Frame) {
+///     List::new().render_with(area, entries, mut list, |entry, row| {
+///         let (name, size) = row.area.columns((Fill(1), Length(8)))
+///         print_in(name, entry.name, Style::new())
+///         Paragraph::new().right().render(size, entry.size)
+///     })
+/// }
 /// ```
 ///
 /// The data is viewed, not stored, and the selection and scroll position
 /// are a `ListState` in the program's model, which the render updates: it
 /// records the items, the area and the rows, clamps a selection beyond the
 /// last item (the items may have shrunk), and scrolls as little as shows
-/// the selected item. The selected row is drawn in the theme's highlight
-/// style, patched by `highlight_style`, across its whole width, after the
-/// row's own drawing, and starts with the highlight symbol; every other row
-/// starts with as many blank columns, so text does not shift as the
-/// selection moves.
+/// the selected item. The list's style applies over the theme's `text`
+/// style to the whole area. The selected row is drawn in the theme's
+/// `highlight` style, patched by `highlight_style`, across its whole width,
+/// after the row's own drawing, and starts with the highlight symbol;
+/// every other row starts with as many blank columns, so text does not
+/// shift as the selection moves. With no items, the list draws its
+/// placeholder in the theme's `muted` style.
 pub struct List {
     style: Style,
     highlight_style: Style,
@@ -67,7 +65,14 @@ impl Copy for List {}
 
 /// What `List::render_with` draws a row in: the item's index, its area
 /// after the highlight symbol's columns, and whether it is selected.
-pub struct ListRow { pub index: usize, pub area: Rect, pub selected: bool }
+pub struct ListRow {
+    /// The item's index in the items.
+    pub index: usize,
+    /// The rows of the item, after the highlight symbol's columns.
+    pub area: Rect,
+    /// Whether the item is selected.
+    pub selected: bool,
+}
 
 impl Copy for ListRow {}
 
@@ -156,7 +161,7 @@ impl List {
 
     /// Draws the items of `items` in `area`, each by calling `draw` with
     /// the item and its row, with the frame clipped to the row.
-    pub fn render_with<T, C: Len + Index<usize, Output = T>, F: Fn(T, ListRow)>(
+    pub fn render_with<C: Len + Index<usize>, F: Fn(C::Output, ListRow)>(
         self,
         _ area: Rect,
         _ items: C,
