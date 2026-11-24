@@ -5,7 +5,7 @@ use core::ops::{Eq, Index, Len}
 use std::io::Display
 use ingot::buffer::Buffer
 use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
-use ingot::frame::{Frame, clipped, print, theme}
+use ingot::frame::{Frame, print, theme}
 use ingot::geom::{Pos, Rect, Size}
 use ingot::layout::{Constraint, Layout}
 use ingot::layout::Constraint::{Fill, Length}
@@ -190,32 +190,29 @@ impl Table {
     uses (frame: mut Frame, R::E)
     where R::Output: TableRow
     {
-        var scratch = MemBuffer::empty()
-        let rects = self.prepare(area, columns, rows.len(), mut state, mut scratch)
-        if area.is_empty() { return }
-        let first = state.offset
-        for row in first .. min(first + state.viewport, rows.len()) {
-            let y = row_y(state.body, row - first)
-            for (column, rect) in rects.enumerate() {
-                scratch.clear()
-                rows[row].cell(column, mut scratch)
-                self.draw_text(
-                    cell_at(rect, y),
-                    scratch.span(),
-                    columns[column].alignment,
-                )
-            }
-            if state.selected == Option::Some(row) {
-                self.highlight(area, y)
-            }
+        var alignments: [Alignment; N] = [Alignment::Left; N]
+        for (i, ref column) in columns.enumerate() {
+            alignments[i] = column.alignment
         }
+        let table = self
+        self.render_with(
+            area,
+            columns,
+            rows,
+            mut state,
+            |row, cell| {
+                var text = frame.take_scratch()
+                row.cell(cell.column, mut text)
+                table.draw_text(cell.area, text.span(), alignments[cell.column])
+                frame.restore_scratch(text)
+            },
+        )
     }
 
     /// Draws the visible rows of `rows` in `area` under the titles of
-    /// `columns`, calling `draw` for each cell with its row and the cell.
-    /// `draw` keeps to `cell.area`, as `print_in(cell.area, ..)` does, or
-    /// clips to it with `with (Frame = clipped(cell.area)) { .. }`. Records
-    /// the layout in `state` as `render` does.
+    /// `columns`, calling `draw` for each cell with its row and the cell,
+    /// with the frame clipped to the cell. Records the layout in `state` as
+    /// `render` does.
     pub fn render_with<
         R: Len + Index<usize>,
         T: Display,
@@ -232,10 +229,12 @@ impl Table {
             let y = row_y(state.body, row - first)
             let selected = state.selected == Option::Some(row)
             for (column, rect) in rects.enumerate() {
-                draw(
-                    rows[row],
-                    TableCell { row, column, area: cell_at(rect, y), selected },
-                )
+                let cell = cell_at(rect, y)
+                // `with (Frame = clipped(cell))` would not reach `draw`; see
+                // `Frame::clip_to`.
+                let clip = frame.clip_to(cell)
+                draw(rows[row], TableCell { row, column, area: cell, selected })
+                frame.restore_clip(clip)
             }
             if selected {
                 self.highlight(area, y)
@@ -1116,19 +1115,19 @@ uses (frame: mut Frame)
             mut state,
             |row: [u16; 2], cell: TableCell| {
                 let mark = if cell.selected { ">" } else { "" }
-                with (Frame = clipped(cell.area)) {
-                    print(
-                        cell.area.pos(),
-                        format!(mark, row[cell.column], "xyz"),
-                        Style::new(),
-                    )
-                }
+                print(
+                    cell.area.pos(),
+                    format!(mark, row[cell.column], "xyz"),
+                    Style::new(),
+                )
+                // Outside the cell: clipped away.
+                print(Pos::new(x: 0, y: 0), "!", Style::new())
             },
         )
 }
 
 #[test]
-fn closures_draw_each_cell() {
+fn closures_draw_each_cell_clipped_to_it() {
     var state = TableState::new()
     state.select(Option::Some(1))
     var frame = blank(width: 7, height: 3)

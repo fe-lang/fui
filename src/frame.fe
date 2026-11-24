@@ -297,9 +297,21 @@ impl Frame {
     }
 
     // Intersects the clip with `area` until `restore_clip` restores the one
-    // this returns. Where a `with (Frame = clipped(area))` cannot provide
-    // the frame, around a call of a generic callable whose row takes the
-    // caller's frame, this clips that frame in place.
+    // this returns. A widget that draws rows or cells by a closure clips the
+    // closure's drawing this way, around each call:
+    //
+    //     let clip = frame.clip_to(row)
+    //     draw(item, row)
+    //     frame.restore_clip(clip)
+    //
+    // A `with (Frame = clipped(row)) { draw(item, row) }` there would not
+    // clip, since a callable whose row the widget forwards (`uses F::E`)
+    // draws into the frame the widget's caller provides (Fe issue
+    // with-block-ignored-by-forwarded-row-call). A function that does the
+    // three steps, `draw_clipped(row, item, row, draw)`, would be the safe
+    // form; the compiler rejects its call when the closure comes from a
+    // function that has the frame as an effect (Fe issue
+    // own-effect-and-row-component-rejected).
     pub(ingot) fn clip_to(mut self, _ area: Rect) -> Rect {
         let old = self.clip
         self.clip = old.intersect(area)
@@ -573,7 +585,7 @@ fn prints_in_an_area_keep_to_its_top_row() {
     assert(frame.buffer().to_text() == "\n  hel\n      he")
 }
 
-fn draw_clipped() uses (frame: mut Frame) {
+fn draw_in_clip() uses (frame: mut Frame) {
     with (Frame = clipped(Rect::new(x: 2, y: 0, width: 3, height: 2))) {
         // Starts left of the clip: only the columns in it are drawn.
         print(Pos::new(x: 0, y: 0), "abcdefg", Style::new())
@@ -597,7 +609,7 @@ fn drawing_stays_in_the_clip() {
     var frame = frame_of(width: 6, height: 3)
     frame.fill(frame.area(), ".", Style::new())
     with (frame) {
-        draw_clipped()
+        draw_in_clip()
     }
     assert(frame.clip() == frame.area())
     assert(frame.buffer().to_text() == "..cde.\n..###.\n......")
@@ -610,6 +622,52 @@ fn drawing_stays_in_the_clip() {
     )
     frame.clear(Rect::new(x: 4, y: 0, width: 9, height: 2))
     assert(frame.buffer().to_text() == "..cd\n..##\n......")
+}
+
+// Calls `draw` for each of `items` on a row of `area`, clipped to the row,
+// as a widget with a row closure does.
+fn rows_with<F: Fn(u8, Rect)>(_ area: Rect, _ items: [u8; 3], _ draw: F)
+uses (frame: mut Frame, F::E)
+{
+    for (i, item) in items.enumerate() {
+        let row = Rect {
+            x: area.x,
+            y: area.y + i.downcast_truncate(),
+            width: area.width,
+            height: 1,
+        }
+        let clip = frame.clip_to(row)
+        draw(item, row)
+        frame.restore_clip(clip)
+    }
+}
+
+#[test]
+fn closures_draw_only_in_the_clip_around_their_call() {
+    var frame = frame_of(width: 5, height: 4)
+    frame.fill(frame.area(), ".", Style::new())
+    with (frame) {
+        rows_with(
+            Rect::new(x: 1, y: 1, width: 3, height: 3),
+            [1, 2, 3],
+            |item, row| {
+                // From the frame's left edge past the row's right one, and
+                // over the whole top row.
+                print(
+                    Pos::new(x: 0, y: row.y),
+                    format!(item, item, item, item, item),
+                    Style::new(),
+                )
+                fill(
+                    Rect::new(x: 0, y: 0, width: 5, height: 1),
+                    "#",
+                    Style::new(),
+                )
+            },
+        )
+    }
+    assert(frame.clip() == frame.area())
+    assert(frame.buffer().to_text() == ".....\n.111.\n.222.\n.333.")
 }
 
 fn nested() -> bool uses (frame: mut Frame) {

@@ -200,9 +200,8 @@ impl List {
             if selected {
                 print_in(row, self.highlight_symbol, Style::NONE)
             }
-            // A `with (Frame = clipped(content))` here would not reach
-            // `draw`, whose row takes this function's own frame: clip that
-            // frame in place.
+            // `with (Frame = clipped(content))` would not reach `draw`; see
+            // `Frame::clip_to`.
             let clip = frame.clip_to(content)
             draw(items[index], ListRow { index, area: content, selected })
             frame.restore_clip(clip)
@@ -849,7 +848,7 @@ fn the_wheel_scrolls_the_view_until_the_selection_moves() {
 struct Entry { name: MemBuffer, size: u64 }
 
 #[test]
-fn rows_can_be_drawn_by_a_closure() {
+fn rows_can_be_drawn_by_a_closure_clipped_to_them() {
     var entries: MemVec<Entry> = MemVec::new()
     entries.push(Entry { name: format!("a.txt"), size: 10 })
     entries.push(Entry { name: format!("bin"), size: 2048 })
@@ -869,7 +868,7 @@ fn rows_can_be_drawn_by_a_closure() {
                     let (name, size) = row.area.split_right(5)
                     print_in(name, format!(row.index, ":", entry.name), Style::NONE)
                     Paragraph::new().right().render(size, entry.size)
-                    // Drawing stays in the row.
+                    // Outside the row: clipped away.
                     print_in(
                         Rect::new(x: 0, y: 0, width: 12, height: 2),
                         "!",
