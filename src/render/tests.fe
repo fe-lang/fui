@@ -1,4 +1,5 @@
 use core::{MemBuffer, MemSpan, Option}
+use core::ops::WrappingMul
 use std::io::Stderr
 use ingot::buffer::Buffer
 use ingot::geom::{Pos, Rect, Size}
@@ -12,7 +13,7 @@ struct Rng { state: u64 }
 
 impl Rng {
     fn new(_ seed: u64) -> Self {
-        Rng { state: seed * 0x9e3779b97f4a7c15 | 1 }
+        Rng { state: seed.wrapping_mul(0x9e3779b97f4a7c15) | 1 }
     }
 
     fn next(mut self) -> u64 {
@@ -206,8 +207,9 @@ fn changed(_ rng: mut Rng, _ buffer: Buffer) -> Buffer {
 }
 
 fn random_size(_ rng: mut Rng) -> Size {
-    let width: u16 = (rng.below(12) + 1).downcast_truncate()
-    let height: u16 = (rng.below(6) + 1).downcast_truncate()
+    let large = rng.chance(16)
+    let width: u16 = (rng.below(if large { 60 } else { 12 }) + 1).downcast_truncate()
+    let height: u16 = (rng.below(if large { 20 } else { 6 }) + 1).downcast_truncate()
     match rng.below(8) {
         0 => Size::new(width: 1, height: 1),
         1 => Size::new(width, height: 1),
@@ -256,6 +258,20 @@ fn garble(_ rng: mut Rng, _ vt: mut Vt) {
     }
 }
 
+// Changes the attributes of `vt`, its cursor and whether that shows,
+// without changing its screen.
+fn unsettle(_ rng: mut Rng, _ vt: mut Vt) {
+    var out = MemBuffer::empty()
+    match rng.below(4) {
+        0 => write!(mut out, "x[1;3;7;38;2;1;2;3;44m"),
+        1 => write!(mut out, "x[?25h"),
+        2 => write!(mut out, "x[?25l"),
+        _ => write!(mut out, "x[5;9H"),
+    }
+    out.span()[0] = 0x1b
+    vt.feed(out.span())
+}
+
 // Whether `vt` shows `buffer`; if not, writes what differs, with `case`.
 fn check(
     _ vt: Vt,
@@ -287,7 +303,7 @@ fn frames_draw_what_the_buffers_hold() uses (err: mut Stderr) {
     var rng = Rng::new(1)
     var failures: u32 = 0
     var case: u32 = 0
-    while case < 4000 {
+    while case < 6000 {
         let size = random_size(mut rng)
         let depth = random_depth(mut rng)
         var renderer = Renderer::new(depth).synchronized(rng.chance(2))
@@ -307,6 +323,11 @@ fn frames_draw_what_the_buffers_hold() uses (err: mut Stderr) {
         vt.feed(out.span())
         ok = ok && check(vt, b, depth, cursor, case, format!("diff(a, b)").span())
         out.clear()
+        if rng.chance(4) {
+            // Something else wrote to the terminal, but left its screen.
+            renderer.invalidate()
+            unsettle(mut rng, mut vt)
+        }
         let cursor = random_cursor(mut rng, size)
         renderer.diff(b, c, cursor, mut out)
         vt.feed(out.span())
@@ -315,4 +336,889 @@ fn frames_draw_what_the_buffers_hold() uses (err: mut Stderr) {
         case += 1
     }
     assert(failures == 0)
+}
+
+// `text` with ESC written as "^[".
+fn bytes<T: std::io::Display>(_ text: T) -> MemBuffer {
+    let text = format!(text)
+    var out = MemBuffer::empty()
+    var i: usize = 0
+    while i < text.len() {
+        if text[i] == b'^' && i + 1 < text.len() && text[i + 1] == b'[' {
+            out.push(0x1b)
+            i += 2
+        } else {
+            out.push(text[i])
+            i += 1
+        }
+    }
+    out
+}
+
+// A buffer of `width` by `height` with `text` from the top left.
+fn text_buffer<T: std::io::Display>(width: u16, height: u16, _ text: T) -> Buffer {
+    var buffer = Buffer::new(Size::new(width, height))
+    let _ = buffer
+        .set_string(
+            Pos::new(x: 0, y: 0),
+            format!(text).span(),
+            Style::new(),
+            max_width: width,
+        )
+    buffer
+}
+
+// Whether `actual` is `expected`, with ESC written as "^["; if not, writes
+// both.
+fn is<T: std::io::Display>(_ actual: MemBuffer, _ expected: T) -> bool
+uses (err: mut Stderr)
+{
+    let expected = bytes(expected)
+    if actual == expected {
+        return true
+    }
+    var report = format!("got      ")
+    caret(mut report, actual.span())
+    write!(mut report, "\nexpected ")
+    caret(mut report, expected.span())
+    write!(mut report, "\n")
+    let _ = err.write_stderr(report.span())
+    false
+}
+
+fn caret(_ out: mut MemBuffer, _ bytes: MemSpan) {
+    for byte in bytes {
+        if byte == 0x1b {
+            out.push(b'^')
+            out.push(b'[')
+        } else {
+            out.push(byte)
+        }
+    }
+}
+
+fn at(x: u16, y: u16) -> Option<Pos> {
+    Option::Some(Pos::new(x, y))
+}
+
+// A renderer and a terminal that show `buffer`, with the cursor at
+// `cursor`.
+fn shown(_ buffer: Buffer, _ depth: ColorDepth, cursor: Option<Pos>) -> (Renderer, Vt) {
+    var renderer = Renderer::new(depth)
+    var vt = Vt::new(buffer.size())
+    var out = MemBuffer::empty()
+    renderer.full(buffer, cursor, mut out)
+    vt.feed(out.span())
+    assert(mismatch(vt, buffer, depth, cursor).is_none())
+    (renderer, vt)
+}
+
+// The output of `diff(prev, next)`, checked on `vt`.
+fn diffed(
+    _ renderer: mut Renderer,
+    _ vt: mut Vt,
+    _ prev: Buffer,
+    _ next: Buffer,
+    cursor: Option<Pos>,
+) -> MemBuffer {
+    var out = MemBuffer::empty()
+    renderer.diff(prev, next, cursor, mut out)
+    vt.feed(out.span())
+    assert(mismatch(vt, next, renderer.depth(), cursor).is_none())
+    out
+}
+
+#[test]
+fn unchanged_frames_write_nothing() uses (err: mut Stderr) {
+    let a = text_buffer(width: 4, height: 2, "ab")
+    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 1, y: 1))
+    var renderer = renderer
+    var vt = vt
+    assert(
+        diffed(mut renderer, mut vt, a, a, cursor: at(x: 1, y: 1)).is_empty(),
+    )
+    // Only the cursor moves: one step, in a frame, without hiding it.
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, a, cursor: at(x: 2, y: 1)),
+            "^[[?2026h^[[C^[[?2026l",
+        ),
+    )
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, a, cursor: Option::None),
+            "^[[?2026h^[[?25l^[[?2026l",
+        ),
+    )
+    assert(
+        diffed(mut renderer, mut vt, a, a, cursor: Option::None).is_empty(),
+    )
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, a, cursor: at(x: 2, y: 1)),
+            "^[[?2026h^[[?25h^[[?2026l",
+        ),
+    )
+}
+
+#[test]
+fn a_one_cell_change_is_small() uses (err: mut Stderr) {
+    var a = Buffer::new(Size::new(width: 80, height: 24))
+    var y: u16 = 0
+    while y < 24 {
+        let _ = a
+            .set_string(
+                Pos::new(x: 0, y),
+                format!(
+                    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor inc",
+                )
+                    .span(),
+                Style::new(),
+                max_width: 80,
+            )
+        y += 1
+    }
+    var b = Buffer::new(a.size())
+    b.copy_from(a, area: a.area(), to: Pos::new(x: 0, y: 0))
+    let _ = b.set_symbol(
+            Pos::new(x: 40, y: 12),
+            format!("X").span(),
+            Style::new().fg(Color::RED),
+        )
+    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, b, cursor: Option::None),
+            "^[[?2026h^[[13;41H^[[31mX^[[?2026l",
+        ),
+    )
+    // With a cursor to hide, move back and show: still small.
+    var c = Buffer::new(a.size())
+    c.copy_from(a, area: a.area(), to: Pos::new(x: 0, y: 0))
+    let _ = c.set_symbol(Pos::new(x: 41, y: 12), format!("Y").span(), Style::new())
+    let _ = diffed(mut renderer, mut vt, b, b, cursor: at(x: 0, y: 23))
+    assert(
+        diffed(mut renderer, mut vt, b, c, cursor: at(x: 0, y: 23)).len() <= 48,
+    )
+}
+
+fn pen(_ fg: Color, _ modifier: Modifier) -> Pen {
+    Pen { fg, bg: Color::RESET, modifier }
+}
+
+fn transition(_ from: Option<Pen>, _ to: Pen) -> MemBuffer {
+    var scratch = MemBuffer::empty()
+    var out = MemBuffer::empty()
+    sgr(from, to, mut scratch, mut out)
+    out
+}
+
+#[test]
+fn attributes_change_by_the_shortest_sequence() uses (err: mut Stderr) {
+    let none = Modifier::NONE
+    let reset = Color::RESET
+    let red = Color::RED
+    let codes: [(Modifier, u32, u32); 8] = [
+        (Modifier::BOLD, 1, 22),
+        (Modifier::DIM, 2, 22),
+        (Modifier::ITALIC, 3, 23),
+        (Modifier::UNDERLINED, 4, 24),
+        (Modifier::BLINK, 5, 25),
+        (Modifier::REVERSED, 7, 27),
+        (Modifier::HIDDEN, 8, 28),
+        (Modifier::CROSSED_OUT, 9, 29),
+    ]
+    for (bit, on, off) in codes {
+        assert(
+            is(
+                transition(Option::Some(pen(reset, none)), pen(reset, bit)),
+                format!("^[[", on, "m"),
+            ),
+        )
+        // Turning the attribute off alone is longer than a reset.
+        assert(
+            is(
+                transition(Option::Some(pen(reset, bit)), pen(reset, none)),
+                "^[[0m",
+            ),
+        )
+        // With a color to keep, the attribute's own code is shorter.
+        assert(
+            is(
+                transition(Option::Some(pen(red, bit)), pen(red, none)),
+                format!("^[[", off, "m"),
+            ),
+        )
+        assert(
+            is(
+                transition(Option::None, pen(reset, bit)),
+                format!("^[[0;", on, "m"),
+            ),
+        )
+    }
+    let bold = Modifier::BOLD
+    let dim = Modifier::DIM
+    // 22 ends both bold and dim: the one that stays comes back.
+    assert(
+        is(
+            transition(Option::Some(pen(red, bold | dim)), pen(red, dim)),
+            "^[[22;2m",
+        ),
+    )
+    assert(
+        is(
+            transition(Option::Some(pen(red, bold | dim)), pen(red, bold)),
+            "^[[22;1m",
+        ),
+    )
+    assert(
+        is(
+            transition(Option::Some(pen(red, bold)), pen(red, dim)),
+            "^[[22;2m",
+        ),
+    )
+    assert(
+        is(
+            transition(Option::Some(pen(red, dim)), pen(red, bold | dim)),
+            "^[[1m",
+        ),
+    )
+    assert(
+        is(
+            transition(Option::Some(pen(red, bold | dim)), pen(red, none)),
+            "^[[22m",
+        ),
+    )
+    // A reset is shorter than two codes off.
+    assert(
+        is(
+            transition(
+                Option::Some(pen(red, bold | Modifier::ITALIC)),
+                pen(red, none),
+            ),
+            "^[[0;31m",
+        ),
+    )
+    assert(
+        is(
+            transition(Option::Some(pen(red, bold)), pen(reset, bold)),
+            "^[[39m",
+        ),
+    )
+    assert(
+        is(
+            transition(
+                Option::Some(pen(red, bold)),
+                pen(Color::GREEN, Modifier::ITALIC),
+            ),
+            "^[[0;3;32m",
+        ),
+    )
+    assert(is(transition(Option::None, pen(reset, none)), "^[[0m"))
+}
+
+#[test]
+fn colors_have_their_codes() uses (err: mut Stderr) {
+    let none = Modifier::NONE
+    let plain = Option::Some(Pen::DEFAULT)
+    assert(is(transition(plain, pen(Color::RED, none)), "^[[31m"))
+    assert(
+        is(transition(plain, pen(Color::LIGHT_RED, none)), "^[[91m"),
+    )
+    assert(is(transition(plain, pen(Color::WHITE, none)), "^[[97m"))
+    assert(
+        is(
+            transition(plain, pen(Color::indexed(200), none)),
+            "^[[38;5;200m",
+        ),
+    )
+    assert(
+        is(
+            transition(plain, pen(Color::rgb(1, 2, 3), none)),
+            "^[[38;2;1;2;3m",
+        ),
+    )
+    let on_black = Pen { fg: Color::RESET, bg: Color::BLACK, modifier: none }
+    assert(is(transition(plain, on_black), "^[[40m"))
+    let on_white = Pen { fg: Color::RESET, bg: Color::WHITE, modifier: none }
+    assert(
+        is(transition(Option::Some(on_black), on_white), "^[[107m"),
+    )
+    let on_rgb = Pen { fg: Color::indexed(9), bg: Color::rgb(4, 5, 6), modifier: none }
+    assert(is(transition(plain, on_rgb), "^[[38;5;9;48;2;4;5;6m"))
+    let red_on_rgb = Pen { fg: Color::RED, bg: Color::rgb(4, 5, 6), modifier: none }
+    assert(
+        is(
+            transition(Option::Some(red_on_rgb), on_white),
+            "^[[0;107m",
+        ),
+    )
+    // No sequence holds more than 16 parameters, nor splits a color.
+    let all = Pen { fg: Color::rgb(1, 2, 3), bg: Color::rgb(4, 5, 6), modifier: Modifier::ALL }
+    assert(
+        is(
+            transition(Option::None, all),
+            "^[[0;1;2;3;4;5;7;8;9;38;2;1;2;3m^[[48;2;4;5;6m",
+        ),
+    )
+}
+
+#[test]
+fn colors_map_to_the_depth() {
+    let true_color = ColorDepth::TrueColor
+    let indexed = ColorDepth::Ansi256
+    let ansi = ColorDepth::Ansi16
+    let none = ColorDepth::NoColor
+    let red = Color::rgb(255, 0, 0)
+    assert(
+        true_color.map(red) == red && true_color.map(Color::indexed(7)) == Color::indexed(7),
+    )
+    // The cube, the gray ramp, and ties to the cube.
+    assert(indexed.map(red) == Color::indexed(196))
+    assert(indexed.map(Color::rgb(0, 0, 0)) == Color::indexed(16))
+    assert(
+        indexed.map(Color::rgb(255, 255, 255)) == Color::indexed(231),
+    )
+    assert(
+        indexed.map(Color::rgb(95, 135, 175)) == Color::indexed(67),
+    )
+    assert(
+        indexed.map(Color::rgb(128, 128, 128)) == Color::indexed(244),
+    )
+    assert(indexed.map(Color::rgb(8, 8, 8)) == Color::indexed(232))
+    assert(
+        indexed.map(Color::rgb(238, 238, 238)) == Color::indexed(255),
+    )
+    assert(
+        indexed.map(Color::rgb(250, 10, 120)) == Color::indexed(198),
+    )
+    assert(
+        indexed.map(Color::BLUE) == Color::BLUE
+            && indexed.map(Color::indexed(3)) == Color::indexed(3),
+    )
+    // xterm's 16 colors.
+    assert(ansi.map(red) == Color::LIGHT_RED)
+    assert(ansi.map(Color::rgb(205, 0, 0)) == Color::RED)
+    assert(ansi.map(Color::rgb(128, 128, 128)) == Color::DARK_GRAY)
+    assert(ansi.map(Color::rgb(0, 0, 255)) == Color::BLUE)
+    assert(ansi.map(Color::rgb(250, 250, 250)) == Color::WHITE)
+    assert(ansi.map(Color::rgb(0, 0, 0)) == Color::BLACK)
+    assert(ansi.map(Color::indexed(196)) == Color::LIGHT_RED)
+    assert(ansi.map(Color::indexed(232)) == Color::BLACK)
+    assert(ansi.map(Color::indexed(12)) == Color::LIGHT_BLUE)
+    assert(
+        ansi.map(Color::YELLOW) == Color::YELLOW && ansi.map(Color::RESET) == Color::RESET,
+    )
+    assert(
+        none.map(red) == Color::RESET && none.map(Color::GREEN) == Color::RESET,
+    )
+    assert(
+        none.map(Color::indexed(9)) == Color::RESET && none.map(Color::KEEP) == Color::KEEP,
+    )
+}
+
+#[test]
+fn lower_depths_write_their_codes() uses (err: mut Stderr) {
+    let style = Style::new().fg(Color::rgb(255, 0, 0)).bg(Color::indexed(21)).bold()
+    var a = Buffer::new(Size::new(width: 3, height: 1))
+    let _ = a.set_symbol(Pos::new(x: 0, y: 0), format!("x").span(), style)
+    for (depth, ref expected) in [
+        (
+            ColorDepth::TrueColor,
+            "^[[?2026h^[[?25l^[[0m^[[2J^[[H^[[1;38;2;255;0;0;48;5;21mx^[[?2026l",
+        ),
+        (ColorDepth::Ansi256, "^[[?2026h^[[?25l^[[0m^[[2J^[[H^[[1;38;5;196;48;5;21mx^[[?2026l"),
+        (ColorDepth::Ansi16, "^[[?2026h^[[?25l^[[0m^[[2J^[[H^[[1;91;44mx^[[?2026l"),
+        (ColorDepth::NoColor, "^[[?2026h^[[?25l^[[0m^[[2J^[[H^[[1mx^[[?2026l"),
+    ] {
+        var renderer = Renderer::new(depth)
+        var out = MemBuffer::empty()
+        renderer.full(a, cursor: Option::None, mut out)
+        assert(is(out, expected))
+        var vt = Vt::new(a.size())
+        vt.feed(out.span())
+        assert(mismatch(vt, a, depth, cursor: Option::None).is_none())
+    }
+}
+
+#[test]
+fn equal_colors_at_the_depth_are_unchanged() {
+    var a = Buffer::new(Size::new(width: 3, height: 1))
+    let _ = a
+        .set_symbol(
+            Pos::new(x: 1, y: 0),
+            format!("x").span(),
+            Style::new().fg(Color::rgb(255, 0, 0)),
+        )
+    var b = Buffer::new(Size::new(width: 3, height: 1))
+    let _ = b
+        .set_symbol(
+            Pos::new(x: 1, y: 0),
+            format!("x").span(),
+            Style::new().fg(Color::rgb(250, 10, 5)),
+        )
+    let (renderer, vt) = shown(a, ColorDepth::Ansi16, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    assert(
+        diffed(mut renderer, mut vt, a, b, cursor: Option::None).is_empty(),
+    )
+    // Blank at the depth: nothing to draw after an erasure.
+    var c = Buffer::new(Size::new(width: 3, height: 1))
+    c.set_style(c.area(), Style::new().bg(Color::rgb(9, 9, 9)))
+    let (_, vt) = shown(c, ColorDepth::NoColor, cursor: Option::None)
+    assert(vt.to_text().is_empty())
+}
+
+#[test]
+fn depths_are_detected_from_the_environment() {
+    let empty = MemBuffer::empty()
+    let truecolor = format!("truecolor")
+    let bits = format!("24bit")
+    let xterm = format!("xterm")
+    let xterm256 = format!("xterm-256color")
+    let dumb = format!("dumb")
+    assert(
+        ColorDepth::detect(
+                no_color: true,
+                colorterm: truecolor.span(),
+                term: xterm256.span(),
+            )
+            == ColorDepth::NoColor,
+    )
+    assert(
+        ColorDepth::detect(
+                no_color: false,
+                colorterm: truecolor.span(),
+                term: dumb.span(),
+            )
+            == ColorDepth::TrueColor,
+    )
+    assert(
+        ColorDepth::detect(
+                no_color: false,
+                colorterm: bits.span(),
+                term: xterm.span(),
+            )
+            == ColorDepth::TrueColor,
+    )
+    assert(
+        ColorDepth::detect(
+                no_color: false,
+                colorterm: empty.span(),
+                term: xterm256.span(),
+            )
+            == ColorDepth::Ansi256,
+    )
+    assert(
+        ColorDepth::detect(
+                no_color: false,
+                colorterm: xterm.span(),
+                term: dumb.span(),
+            )
+            == ColorDepth::NoColor,
+    )
+    assert(
+        ColorDepth::detect(
+                no_color: false,
+                colorterm: empty.span(),
+                term: xterm.span(),
+            )
+            == ColorDepth::Ansi16,
+    )
+    assert(
+        ColorDepth::detect(
+                no_color: false,
+                colorterm: empty.span(),
+                term: empty.span(),
+            )
+            == ColorDepth::Ansi16,
+    )
+    assert(
+        ColorDepth::from_env(
+                no_color: Option::Some(format!("")),
+                colorterm: Option::None,
+                term: Option::Some(format!("screen-256color")),
+            )
+            == ColorDepth::Ansi256,
+    )
+    assert(
+        ColorDepth::from_env(
+                no_color: Option::Some(format!("1")),
+                colorterm: Option::Some(format!("truecolor")),
+                term: Option::None,
+            )
+            == ColorDepth::NoColor,
+    )
+    assert(
+        ColorDepth::from_env(
+                no_color: Option::None,
+                colorterm: Option::None,
+                term: Option::None,
+            )
+            == ColorDepth::Ansi16,
+    )
+}
+
+#[test]
+fn wide_cells_leave_both_columns_right() uses (err: mut Stderr) {
+    // A wide cell over two narrow ones writes only itself.
+    let a = text_buffer(width: 4, height: 1, "abcd")
+    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    let b = text_buffer(width: 4, height: 1, "a界d")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, b, cursor: Option::None),
+            "^[[?2026h^[[;2H界^[[?2026l",
+        ),
+    )
+    // Two narrow cells over a wide one write both.
+    let c = text_buffer(width: 4, height: 1, "axyd")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, b, c, cursor: Option::None),
+            "^[[?2026h^[[2Dxy^[[?2026l",
+        ),
+    )
+    // A wide cell moved by a column rewrites the columns it left and took.
+    let d = text_buffer(width: 5, height: 1, "界ab")
+    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    let e = text_buffer(width: 5, height: 1, "a界b")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, d, e, cursor: Option::None),
+            "^[[?2026h^[[Ha界^[[?2026l",
+        ),
+    )
+    // A narrow cell over the right half: the left half becomes a space.
+    var f = text_buffer(width: 5, height: 1, "界ab")
+    let _ = f.set_symbol(Pos::new(x: 1, y: 0), format!("x").span(), Style::new())
+    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    assert(
+        is(
+            diffed(mut renderer, mut vt, d, f, cursor: Option::None),
+            "^[[?2026h^[[H x^[[?2026l",
+        ),
+    )
+    // And over the left half.
+    var g = text_buffer(width: 5, height: 1, "界ab")
+    let _ = g.set_symbol(Pos::new(x: 0, y: 0), format!("y").span(), Style::new())
+    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    assert(
+        is(
+            diffed(mut renderer, mut vt, d, g, cursor: Option::None),
+            "^[[?2026h^[[Hy ^[[?2026l",
+        ),
+    )
+    // A cell after a wide one is placed by the wide one's width.
+    var h = text_buffer(width: 5, height: 1, "界ab")
+    let _ = h.set_symbol(Pos::new(x: 2, y: 0), format!("z").span(), Style::new())
+    let _ = h.set_symbol(Pos::new(x: 0, y: 0), format!("世").span(), Style::new())
+    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    assert(
+        is(
+            diffed(mut renderer, mut vt, d, h, cursor: Option::None),
+            "^[[?2026h^[[H世z^[[?2026l",
+        ),
+    )
+}
+
+#[test]
+fn clusters_terminals_may_count_otherwise_are_placed_absolutely()
+uses (err: mut Stderr)
+{
+    let blank = Buffer::new(Size::new(width: 6, height: 1))
+    var a = Buffer::new(Size::new(width: 6, height: 1))
+    let _ = a.set_symbol(
+            Pos::new(x: 0, y: 0),
+            utf8([0x65, 0x301]).span(),
+            Style::new(),
+        )
+    let _ = a.set_symbol(Pos::new(x: 1, y: 0), format!("x").span(), Style::new())
+    let family = utf8(
+        [0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467, 0x200d, 0x1f466],
+    )
+    let _ = a.set_symbol(Pos::new(x: 2, y: 0), family.span(), Style::new())
+    let _ = a.set_symbol(Pos::new(x: 4, y: 0), format!("y").span(), Style::new())
+    let (renderer, vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    var expected = format!("^[[?2026h^[[H")
+    expected.extend_from(utf8([0x65, 0x301]).span())
+    write!(mut expected, "^[[;2Hx")
+    expected.extend_from(family.span())
+    write!(mut expected, "^[[;5Hy^[[?2026l")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, blank, a, cursor: Option::None),
+            expected,
+        ),
+    )
+}
+
+#[test]
+fn clusters_that_would_join_are_kept_apart() uses (err: mut Stderr) {
+    // Two regional indicators in two cells, which a terminal would join
+    // into a flag if they were written one after the other.
+    let blank = Buffer::new(Size::new(width: 4, height: 1))
+    var a = Buffer::new(Size::new(width: 4, height: 1))
+    let _ = a.set_symbol(Pos::new(x: 0, y: 0), utf8([0x1f1fa]).span(), Style::new())
+    let _ = a.set_symbol(Pos::new(x: 1, y: 0), utf8([0x1f1f8]).span(), Style::new())
+    let (renderer, vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    var expected = format!("^[[?2026h^[[H")
+    expected.extend_from(utf8([0x1f1fa]).span())
+    write!(mut expected, "^[[2G")
+    expected.extend_from(utf8([0x1f1f8]).span())
+    write!(mut expected, "^[[?2026l")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, blank, a, cursor: Option::None),
+            expected,
+        ),
+    )
+}
+
+#[test]
+fn rows_that_end_blank_are_erased_when_that_is_shorter()
+uses (err: mut Stderr)
+{
+    let a = text_buffer(width: 10, height: 2, "abcdefghij")
+    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    let b = text_buffer(width: 10, height: 2, "abc")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, b, cursor: Option::None),
+            "^[[?2026h^[[;4H^[[K^[[?2026l",
+        ),
+    )
+    // One blank cell is shorter written than erased.
+    let c = text_buffer(width: 10, height: 2, "ab")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, b, c, cursor: Option::None),
+            "^[[?2026h^[[D ^[[?2026l",
+        ),
+    )
+    // An erasure takes the default background, here by a reset, which is
+    // shorter than `CSI 49 m`.
+    var d = text_buffer(width: 10, height: 2, "abcdefghij")
+    d.set_style(d.area(), Style::new().bg(Color::BLUE))
+    let (renderer, vt) = shown(d, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    var e = text_buffer(width: 10, height: 2, "abcdefghij")
+    e.set_style(e.area(), Style::new().bg(Color::BLUE))
+    e.reset(Rect::new(x: 2, y: 0, width: 8, height: 1))
+    assert(
+        is(
+            diffed(mut renderer, mut vt, d, e, cursor: Option::None),
+            "^[[?2026h^[[;3H^[[0m^[[K^[[?2026l",
+        ),
+    )
+}
+
+#[test]
+fn short_gaps_are_written_again_instead_of_moved_over() uses (err: mut Stderr) {
+    let a = text_buffer(width: 12, height: 1, "aaaaaaaaaaaa")
+    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    // Three cells are shorter than `CSI 3 C`; four are not shorter than `CSI 4 C`.
+    let b = text_buffer(width: 12, height: 1, "abaaabaaaaba")
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, b, cursor: Option::None),
+            "^[[?2026h^[[;2Hbaaab^[[4Cb^[[?2026l",
+        ),
+    )
+    // Cells in another style are moved over.
+    var c = text_buffer(width: 12, height: 1, "abaaabaaaaba")
+    c.set_style(
+        Rect::new(x: 2, y: 0, width: 3, height: 1),
+        Style::new().bold(),
+    )
+    let (renderer, vt) = shown(c, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    var d = text_buffer(width: 12, height: 1, "acaaacaaaaba")
+    d.set_style(
+        Rect::new(x: 2, y: 0, width: 3, height: 1),
+        Style::new().bold(),
+    )
+    assert(
+        is(
+            diffed(mut renderer, mut vt, c, d, cursor: Option::None),
+            "^[[?2026h^[[;2Hc^[[3Cc^[[?2026l",
+        ),
+    )
+}
+
+#[test]
+fn the_last_column_is_followed_by_an_absolute_move() uses (err: mut Stderr) {
+    let blank = Buffer::new(Size::new(width: 3, height: 2))
+    var a = Buffer::new(Size::new(width: 3, height: 2))
+    let _ = a.set_symbol(Pos::new(x: 2, y: 0), format!("x").span(), Style::new())
+    let _ = a.set_symbol(Pos::new(x: 0, y: 1), format!("y").span(), Style::new())
+    let (renderer, vt) = shown(blank, ColorDepth::TrueColor, cursor: Option::None)
+    var renderer = renderer
+    var vt = vt
+    assert(
+        is(
+            diffed(mut renderer, mut vt, blank, a, cursor: Option::None),
+            "^[[?2026h^[[;3Hx^[[2Hy^[[?2026l",
+        ),
+    )
+    // The bottom right cell scrolls nothing, and the cursor is placed after
+    // it. The blank cell before it is shorter written again than moved over.
+    var b = Buffer::new(Size::new(width: 3, height: 2))
+    b.copy_from(a, area: a.area(), to: Pos::new(x: 0, y: 0))
+    let _ = b.set_symbol(Pos::new(x: 2, y: 1), format!("z").span(), Style::new())
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, b, cursor: at(x: 0, y: 0)),
+            "^[[?2026h z^[[H^[[?25h^[[?2026l",
+        ),
+    )
+    assert(vt.to_text() == "  x\ny z")
+}
+
+#[test]
+fn cell_contents_never_reach_the_output_as_controls() {
+    var rng = Rng::new(7)
+    var case: u32 = 0
+    while case < 200 {
+        var buffer = Buffer::new(Size::new(width: 8, height: 3))
+        var y: u16 = 0
+        while y < 3 {
+            let text = hostile(mut rng)
+            let _ = buffer.set_string(
+                    Pos::new(x: 0, y),
+                    text.span(),
+                    style(mut rng),
+                    max_width: 8,
+                )
+            y += 1
+        }
+        let (renderer, vt) = shown(buffer, ColorDepth::TrueColor, cursor: Option::None)
+        var renderer = renderer
+        var out = MemBuffer::empty()
+        renderer.full(buffer, cursor: Option::None, mut out)
+        // Every control is the ESC of a CSI sequence, and no C1 control is
+        // encoded.
+        var i: usize = 0
+        while i < out.len() {
+            let byte = out[i]
+            assert(
+                byte >= 0x20 && byte != 0x7f
+                    || byte == 0x1b && i + 1 < out.len() && out[i + 1] == b'[',
+            )
+            assert(
+                !(byte == 0xc2 && i + 1 < out.len() && out[i + 1] >= 0x80 && out[i + 1] < 0xa0),
+            )
+            i += 1
+        }
+        assert(vt.size() == buffer.size())
+        case += 1
+    }
+}
+
+#[test]
+fn attributes_and_the_cursor_carry_across_frames() uses (err: mut Stderr) {
+    let red = Style::new().fg(Color::RED)
+    let a = Buffer::new(Size::new(width: 6, height: 2))
+    let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 0, y: 1))
+    var renderer = renderer
+    var vt = vt
+    var b = Buffer::new(Size::new(width: 6, height: 2))
+    let _ = b.set_symbol(Pos::new(x: 1, y: 0), format!("x").span(), red)
+    // Hidden while drawing, then moved back and shown. `CSI ; 2 H` is shorter
+    // than `CSI A CSI C`.
+    assert(
+        is(
+            diffed(mut renderer, mut vt, a, b, cursor: at(x: 0, y: 1)),
+            "^[[?2026h^[[?25l^[[;2H^[[31mx^[[2H^[[?25h^[[?2026l",
+        ),
+    )
+    var c = Buffer::new(Size::new(width: 6, height: 2))
+    c.copy_from(b, area: b.area(), to: Pos::new(x: 0, y: 0))
+    let _ = c.set_symbol(Pos::new(x: 3, y: 0), format!("y").span(), red)
+    // The pen is still red: no SGR.
+    assert(
+        is(
+            diffed(mut renderer, mut vt, b, c, cursor: Option::None),
+            "^[[?2026h^[[?25l^[[;4Hy^[[?2026l",
+        ),
+    )
+    // After `invalidate`, the pen, the cursor and its visibility are set again.
+    renderer.invalidate()
+    var d = Buffer::new(Size::new(width: 6, height: 2))
+    d.copy_from(c, area: c.area(), to: Pos::new(x: 0, y: 0))
+    let _ = d.set_symbol(Pos::new(x: 5, y: 0), format!("z").span(), red)
+    assert(
+        is(
+            diffed(mut renderer, mut vt, c, d, cursor: Option::None),
+            "^[[?2026h^[[?25l^[[;6H^[[0;31mz^[[?2026l",
+        ),
+    )
+}
+
+#[test]
+fn synchronized_output_can_be_left_out() uses (err: mut Stderr) {
+    let a = text_buffer(width: 3, height: 1, "ab")
+    var renderer = Renderer::new(ColorDepth::TrueColor).synchronized(false)
+    var out = MemBuffer::empty()
+    renderer.full(a, cursor: at(x: 2, y: 0), mut out)
+    assert(is(out, "^[[?25l^[[0m^[[2J^[[Hab^[[?25h"))
+    out.clear()
+    renderer.diff(a, a, cursor: Option::None, mut out)
+    assert(is(out, "^[[?25l"))
+}
+
+#[test]
+fn buffers_of_any_size_draw() {
+    for size in [
+        Size::new(width: 0, height: 0),
+        Size::new(width: 0, height: 3),
+        Size::new(width: 3, height: 0),
+    ] {
+        let a = Buffer::new(size)
+        let (renderer, vt) = shown(a, ColorDepth::TrueColor, cursor: at(x: 0, y: 0))
+        var renderer = renderer
+        var vt = vt
+        let _ = diffed(mut renderer, mut vt, a, a, cursor: Option::None)
+    }
+    // Buffers of different sizes draw the next one whole.
+    let small = text_buffer(width: 2, height: 1, "ab")
+    let large = text_buffer(width: 4, height: 2, "cd")
+    var renderer = Renderer::new(ColorDepth::TrueColor)
+    var out = MemBuffer::empty()
+    renderer.diff(small, large, cursor: Option::None, mut out)
+    var vt = Vt::new(large.size())
+    vt.feed(out.span())
+    assert(
+        mismatch(vt, large, ColorDepth::TrueColor, cursor: Option::None).is_none(),
+    )
+    // A cursor outside the buffer stops at its edge.
+    out.clear()
+    renderer.diff(large, large, cursor: at(x: 9, y: 9), mut out)
+    vt.feed(out.span())
+    assert(
+        mismatch(vt, large, ColorDepth::TrueColor, cursor: at(x: 3, y: 1)).is_none(),
+    )
 }

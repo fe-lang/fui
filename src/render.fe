@@ -499,7 +499,9 @@ impl Renderer {
         }
         if self.depth == ColorDepth::TrueColor
             || a.width() != b.width()
-            || self.pen(a) != self.pen(b) {
+            || a.modifier() != b.modifier()
+            || !self.same_color(a.fg(), b.fg())
+            || !self.same_color(a.bg(), b.bg()) {
             return false
         }
         self.symbol.clear()
@@ -507,6 +509,11 @@ impl Renderer {
         self.scratch.clear()
         next.write_symbol(b, mut self.scratch)
         self.symbol.span() == self.scratch.span()
+    }
+
+    // Whether the terminal shows `a` and `b` as one color.
+    fn same_color(self, _ a: Color, _ b: Color) -> bool {
+        a == b || self.depth.map(a) == self.depth.map(b)
     }
 
     // The first column of the blank cells that end row `y` of `next`: cells
