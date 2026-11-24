@@ -4,7 +4,7 @@ use std::io::Display
 use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
 use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Modifier, Style}
-use super::{Alignment, clamp_u16}
+use super::{Alignment, clamp_u16, print_cut}
 
 /// A set of the sides of a `Block` that have a border:
 /// `Borders::TOP | Borders::BOTTOM`.
@@ -199,6 +199,7 @@ pub struct Block {
     padding: Padding,
     title_alignment: Alignment,
     bottom_title_alignment: Alignment,
+    ellipsis: bool,
 }
 
 impl Copy for Block {}
@@ -216,6 +217,7 @@ impl Block {
             padding: Padding::ZERO,
             title_alignment: Alignment::Left,
             bottom_title_alignment: Alignment::Left,
+            ellipsis: true,
         }
     }
 
@@ -271,6 +273,13 @@ impl Block {
     /// Where the bottom title sits: on the left unless set.
     pub fn bottom_title_alignment(var own self, _ alignment: Alignment) -> Self {
         self.bottom_title_alignment = alignment
+        self
+    }
+
+    /// Ends a title cut at the corners with an ellipsis, as a block does
+    /// unless `ellipsis(false)`, or cuts it there plainly.
+    pub fn ellipsis(var own self, _ show: bool) -> Self {
+        self.ellipsis = show
         self
     }
 
@@ -394,11 +403,9 @@ impl Block {
             }
         }
         if width > 0 {
-            print_in(
-                Rect { x: at, y, width, height: 1 },
-                title,
-                theme().title.patch(self.title_style),
-            )
+            let cells = Rect { x: at, y, width, height: 1 }
+            frame.set_style(cells, theme().title.patch(self.title_style))
+            print_cut(cells, title, Alignment::Left, ellipsis: self.ellipsis)
         }
     }
 
@@ -565,16 +572,32 @@ fn titles_align_between_the_corners() {
 fn long_titles_are_cut_at_the_corners() {
     let text = drawn_text(
         width: 8,
-        height: 2,
+        height: 3,
         |frame, area| {
             with (frame) {
+                let (top, bottom) = area.split_top(2)
                 Block::bordered()
                     .title_alignment(Alignment::Center)
-                    .render_titles(area, top: "Directory listing", bottom: "exactly6")
+                    .render_titles(top, top: "Directory listing", bottom: "exactly6")
+                Block::new()
+                    .borders(Borders::TOP)
+                    .ellipsis(false)
+                    .render_titled(bottom, "Directory listing")
             }
         },
     )
-    assert(text == "┌Direct┐\n└exactl┘")
+    // With an ellipsis unless asked not to; a title that fits has none.
+    assert(text == "┌Direc…┐\n└exact…┘\nDirector")
+    let text = drawn_text(
+        width: 8,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Block::new().borders(Borders::LEFT | Borders::RIGHT).render_titled(area, "exactly6")
+            }
+        },
+    )
+    assert(text == "│exact…│")
     let text = drawn_text(
         width: 2,
         height: 2,
@@ -594,7 +617,7 @@ fn long_titles_are_cut_at_the_corners() {
             }
         },
     )
-    assert(text == "│Fi")
+    assert(text == "│F…")
 }
 
 #[test]
@@ -688,7 +711,7 @@ fn blocks_draw_only_in_their_area() {
             }
         },
     )
-    assert(text == ".......\n.┌abc┐.\n.│...│.\n.└───┘.\n.......")
+    assert(text == ".......\n.┌ab…┐.\n.│...│.\n.└───┘.\n.......")
     let text = drawn_text(
         width: 3,
         height: 3,

@@ -6,7 +6,8 @@ use ingot::event::{Key, KeyCode, Modifiers, Mouse, MouseButton, MouseKind}
 use ingot::frame::{Frame, drawn, drawn_text, fill, measure, print_in, theme}
 use ingot::geom::{Pos, Rect}
 use ingot::style::{Color, Modifier, Style}
-use super::clamp_u16
+use ingot::text::Alignment
+use super::{clamp_u16, print_cut}
 
 /// The most tabs a `TabsState` records for hit-testing. A row may show
 /// more, and a click on a later one selects none.
@@ -168,6 +169,7 @@ pub struct Tabs {
     style: Style,
     highlight_style: Style,
     divider_style: Style,
+    ellipsis: bool,
 }
 
 impl Copy for Tabs {}
@@ -182,6 +184,7 @@ impl Tabs {
             style: Style::NONE,
             highlight_style: Style::NONE,
             divider_style: Style::NONE,
+            ellipsis: true,
         }
     }
 
@@ -213,6 +216,13 @@ impl Tabs {
     /// The style for the dividers, over the theme's `border` style.
     pub fn divider_style(var own self, _ style: Style) -> Self {
         self.divider_style = style
+        self
+    }
+
+    /// Ends a title the row's right edge cuts with an ellipsis, as tabs do
+    /// unless `ellipsis(false)`, or cuts it there plainly.
+    pub fn ellipsis(var own self, _ show: bool) -> Self {
+        self.ellipsis = show
         self
     }
 
@@ -264,10 +274,11 @@ impl Tabs {
                 state.shown += 1
             }
             fill(tab, " ", style)
-            print_in(
+            print_cut(
                 part(row, x + self.padding_left as usize, title),
                 titles[i],
-                Style::NONE,
+                Alignment::Left,
+                ellipsis: self.ellipsis,
             )
             x += width
         }
@@ -422,7 +433,7 @@ fn tabs_scroll_to_show_the_selected_one() {
     // The tabs are 7, 6, 7 and 7 columns, with a divider between each two.
     assert(
         scrolled([0, 1, 2, 3, 2, 0])
-            == " Alpha │ Bet\n Beta │ Gamm\n Gamma │ Del\n Delta\n Gamma │ Del\n Alpha │ Bet",
+            == " Alpha │ Be…\n Beta │ Gam…\n Gamma │ De…\n Delta\n Gamma │ De…\n Alpha │ Be…",
     )
     // A selection past the last tab selects the last.
     drawn(
@@ -459,6 +470,17 @@ fn tabs_scroll_to_show_the_selected_one() {
             with (frame) {
                 var state = selecting(1)
                 Tabs::new().render(area, ["Alpha", "Beta"], mut state)
+            }
+        },
+    )
+    assert(text == " Be…")
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                var state = selecting(1)
+                Tabs::new().ellipsis(false).render(area, ["Alpha", "Beta"], mut state)
             }
         },
     )
@@ -524,7 +546,7 @@ fn titles_may_be_buffers_or_strings() {
         },
     )
     assert(
-        text == " log │ tab 2\n x │ a title longer than\n x │ a title longer than",
+        text == " log │ tab 2\n x │ a title longer tha…\n x │ a title longer tha…",
     )
 }
 

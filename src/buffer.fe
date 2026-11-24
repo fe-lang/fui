@@ -141,6 +141,8 @@ impl Glyph {
     const CONTINUATION: Glyph = Glyph { symbol: 0, len: 0, width: 0 }
     // U+FFFD, for a byte that is no UTF-8.
     const REPLACEMENT: Glyph = Glyph { symbol: 0xbdbfef, len: 3, width: 1 }
+    // `text::ELLIPSIS`, U+2026.
+    const ELLIPSIS: Glyph = Glyph { symbol: 0xa680e2, len: 3, width: 1 }
 }
 
 /// A grid of cells, row by row, with the side table that holds symbols
@@ -413,6 +415,16 @@ impl Buffer {
             column = end
         }
         written.downcast_truncate()
+    }
+
+    // Draws `text::ELLIPSIS` at `pos` as `draw` would, if its column is in
+    // `from..to`. Returns the columns written.
+    pub(ingot) fn draw_ellipsis(mut self, _ pos: Pos, _ style: Style, from: u16, to: u16) -> u16 {
+        if pos.y >= self.size.height || pos.x < from || pos.x >= to || pos.x >= self.size.width {
+            return 0
+        }
+        self.put(self.index(pos), Glyph::ELLIPSIS, style)
+        1
     }
 
     // Writes `glyph` into every cell of `area`, as `fill` does.

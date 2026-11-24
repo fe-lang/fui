@@ -13,6 +13,9 @@
 //! is given: an empty or tiny area draws what fits, or nothing, and never
 //! panics. Widgets take their styles from the frame's theme, and a style set
 //! on a widget applies over the theme's.
+use std::io::Display
+use ingot::frame::Frame
+use ingot::geom::Rect
 
 pub use block::{Block, BorderSymbols, BorderType, Borders, Padding}
 pub use clear::{clear, popup}
@@ -24,10 +27,28 @@ pub use scrollbar::{Orientation, Scrollbar}
 pub use sparkline::Sparkline
 pub use spinner::Spinner
 pub use table::{Column, MAX_COLUMNS, Table, TableCell, TableHit, TableRow, TableState}
-pub use tabs::{Tabs, TabsState}
+pub use tabs::{MAX_TABS, Tabs, TabsState}
 pub use text_input::{TextInput, TextInputState, TextLimit}
 
 pub use ingot::text::Alignment
+
+// Draws the `Display` text of `text` on the top row of `area`, placed by
+// `alignment` and cut to the area, with an ellipsis if `ellipsis`; see
+// `Frame::print_line`. The cells keep their styles.
+pub(ingot) fn print_cut<T: Display>(
+    _ area: Rect,
+    _ text: T,
+    _ alignment: Alignment,
+    ellipsis: bool,
+) -> u16
+uses (frame: mut Frame)
+{
+    var bytes = frame.take_scratch()
+    text.fmt(mut bytes)
+    let written = frame.print_line_cut(area, bytes.span(), alignment, ellipsis)
+    frame.restore_scratch(bytes)
+    written
+}
 
 // `value` as a `u16`, or 65535 if it is larger.
 pub(ingot) fn clamp_u16(_ value: usize) -> u16 {

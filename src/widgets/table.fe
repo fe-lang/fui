@@ -1,6 +1,6 @@
 //! Tables: rows of cells in columns under a header, with a selected row and
 //! scrolling.
-use core::{MemBuffer, MemSpan}
+use core::MemBuffer
 use core::ops::{Eq, Index, Len}
 use std::io::Display
 use ingot::buffer::{Buffer, cell_at}
@@ -10,8 +10,8 @@ use ingot::geom::{Pos, Rect}
 use ingot::layout::{Constraint, Layout}
 use ingot::layout::Constraint::{Fill, Length}
 use ingot::style::{Color, Modifier, Style}
-use ingot::text::{Alignment, ELLIPSIS, truncate, truncate_with_ellipsis, width}
-use super::clamp_u16
+use ingot::text::Alignment
+use super::{clamp_u16, print_cut}
 use super::list::ListState
 use super::scroll::ScrollState
 
@@ -199,11 +199,11 @@ impl Table {
     uses (frame: mut Frame, R::E)
     where R::Output: TableRow
     {
+        let ellipsis = self.ellipsis
         var alignments: [Alignment; N] = [Alignment::Left; N]
         for (i, ref column) in columns.enumerate() {
             alignments[i] = column.alignment
         }
-        let table = self
         self.render_with(
             area,
             columns,
@@ -212,7 +212,7 @@ impl Table {
             |row, cell| {
                 var text = frame.take_scratch()
                 row.cell(cell.column, mut text)
-                table.draw_text(cell.area, text.span(), alignments[cell.column])
+                frame.print_line_cut(cell.area, text.span(), alignments[cell.column], ellipsis)
                 frame.restore_scratch(text)
             },
         )
@@ -230,8 +230,7 @@ impl Table {
     >(self, _ area: Rect, _ columns: [Column<T>; N], _ rows: R, _ state: mut TableState, _ draw: F)
     uses (frame: mut Frame, R::E, F::E)
     {
-        var scratch = MemBuffer::empty()
-        let rects = self.prepare(area, columns, rows.len(), mut state, mut scratch)
+        let rects = self.prepare(area, columns, rows.len(), mut state)
         if area.is_empty() { return }
         let scroll = state.rows.scroll()
         let first = scroll.position()
@@ -266,7 +265,6 @@ impl Table {
         _ columns: [Column<T>; N],
         _ rows: usize,
         _ state: mut TableState,
-        _ scratch: mut MemBuffer,
     ) -> [Rect; N]
     uses (frame: mut Frame)
     {
@@ -294,51 +292,16 @@ impl Table {
         if !header.is_empty() {
             frame.set_style(header, theme.title.patch(self.header_style))
             for (i, ref column) in columns.enumerate() {
-                scratch.clear()
-                column.title.fmt(mut scratch)
-                self.draw_text(
+                print_cut(
                     cell_rect(rects[i], header.y),
-                    scratch.span(),
+                    column.title,
                     column.alignment,
+                    ellipsis: self.ellipsis,
                 )
             }
         }
         frame.fill(line, "─", theme.border)
         rects
-    }
-
-    // Draws `text` in `cell`, cut to its width and placed by `alignment`.
-    fn draw_text(self, _ cell: Rect, _ text: MemSpan, _ alignment: Alignment)
-    uses (frame: mut Frame)
-    {
-        let room = cell.width as usize
-        let len = if self.ellipsis {
-            truncate_with_ellipsis(text, room)
-        } else {
-            truncate(text, room)
-        }
-        let shown = text.slice(offset: 0, len)
-        let cut = self.ellipsis && len < text.len() && room > 0
-        let columns = width(shown)
-        let lead: u16 = alignment
-            .offset(width: columns + if cut { 1 } else { 0 }, available: room)
-            .downcast_truncate()
-        let x = cell.x + lead
-        frame
-            .print_in(
-                Rect { x, y: cell.y, width: cell.right() - x, height: 1 },
-                shown,
-                Style::NONE,
-            )
-        if cut {
-            let end: u16 = x + columns.downcast_truncate()
-            frame
-                .print_in(
-                    Rect { x: end, y: cell.y, width: cell.right() - end, height: 1 },
-                    ELLIPSIS,
-                    Style::NONE,
-                )
-        }
     }
 
     // Applies the highlight style to row `y` of `area`, gaps included.

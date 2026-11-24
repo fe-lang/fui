@@ -44,7 +44,7 @@ use std::io::Display
 use super::buffer::{Buffer, cell_at}
 use super::geom::{Pos, Rect, Size}
 use super::style::{Color, Modifier, Style}
-use super::text::{Alignment, ELLIPSIS, Line, Run, Text, column_offset, next_cluster, width}
+use super::text::{Alignment, Line, Run, Text, next_cluster, truncate, truncate_with_ellipsis, width}
 use super::theme::Theme
 
 /// The surface view code draws on: a buffer, the clip rectangle drawing
@@ -150,53 +150,64 @@ impl Frame {
             )
     }
 
-    /// Draws `line` on the top row of `area`, each run in its style applied
-    /// over the cells' styles, placed in the row by `alignment`. A line
-    /// wider than the area is cut after its last whole cluster that fits,
-    /// so a wide cluster is never split: one that would cross the area's
-    /// right edge leaves its column as it was. Returns the columns written.
-    pub fn print_line(mut self, _ area: Rect, _ line: Line, _ alignment: Alignment) -> u16 {
-        self.print_line_cut(area, line, alignment, ellipsis: false)
-    }
-
-    /// Draws `line` as `print_line` does, except that a line wider than the
-    /// area ends in `text::ELLIPSIS`, in the style of the text it stands
-    /// for, after its last whole cluster that leaves a column for it.
-    pub fn print_line_with_ellipsis(
+    /// Draws the first line of `text`, such as a `Line`, on the top row of
+    /// `area`, each run in its style applied over the cells' styles, placed
+    /// in the row by `alignment`. A line wider than the area is cut after
+    /// its last whole cluster that fits, as `text::truncate` cuts it, so a
+    /// wide cluster is never split: one that would cross the area's right
+    /// edge leaves its column as it was. Returns the columns written.
+    pub fn print_line<S: StyledText>(
         mut self,
         _ area: Rect,
-        _ line: Line,
+        _ text: S,
         _ alignment: Alignment,
     ) -> u16 {
-        self.print_line_cut(area, line, alignment, ellipsis: true)
+        self.print_line_cut(area, text, alignment, ellipsis: false)
     }
 
-    fn print_line_cut(
+    /// Draws the first line of `text` as `print_line` does, except that a
+    /// line wider than the area is cut as `text::truncate_with_ellipsis`
+    /// cuts it and ends in `text::ELLIPSIS`, in the style of the text it
+    /// stands for.
+    pub fn print_line_with_ellipsis<S: StyledText>(
         mut self,
         _ area: Rect,
-        _ line: Line,
+        _ text: S,
+        _ alignment: Alignment,
+    ) -> u16 {
+        self.print_line_cut(area, text, alignment, ellipsis: true)
+    }
+
+    // Draws the first line of `text` as `print_line` does, or as
+    // `print_line_with_ellipsis` does if `ellipsis`.
+    pub(ingot) fn print_line_cut<S: StyledText>(
+        mut self,
+        _ area: Rect,
+        _ text: S,
         _ alignment: Alignment,
         ellipsis: bool,
     ) -> u16 {
-        if area.is_empty() {
+        if area.is_empty() || text.line_count() == 0 {
             return 0
         }
-        let available = area.width as usize
-        let full = line.width()
-        let cut = full > available
-        let elide = cut && ellipsis
-        let (len, shown) = if !cut {
-            (line.len(), full)
+        let room = area.width as usize
+        let bytes = text.line_text(0)
+        let len = if ellipsis {
+            truncate_with_ellipsis(bytes, room)
         } else {
-            column_offset(line.text(), if elide { available - 1 } else { available })
+            truncate(bytes, room)
         }
-        let total = if elide { shown + 1 } else { shown }
-        let x: u16 = (area.x as usize + alignment.offset(width: total, available))
-            .downcast_truncate()
+        let elide = ellipsis && len < bytes.len()
+        let shown = width(bytes.slice(offset: 0, len))
+        let lead = alignment.offset(
+                width: if elide { shown + 1 } else { shown },
+                available: room,
+            )
+        let x: u16 = (area.x as usize + lead).downcast_truncate()
         let (row, _) = area.split_top(1)
         var written = self
             .draw_styled(
-                line,
+                text,
                 line: 0,
                 start: 0,
                 end: len,
@@ -204,14 +215,16 @@ impl Frame {
                 skip: 0,
                 within: row,
             )
-        if elide {
+        let clip = self.clip.intersect(row)
+        if elide && area.y >= clip.y && area.y < clip.bottom() {
             let at: u16 = (x as usize + shown).downcast_truncate()
-            written += self.print_clipped(
-                Pos::new(x: at, y: area.y),
-                ELLIPSIS,
-                style_at(line, line: 0, offset: len),
-                self.clip.intersect(row),
-            )
+            written += self.buffer
+                .draw_ellipsis(
+                    Pos::new(x: at, y: area.y),
+                    style_at(text, line: 0, offset: len),
+                    from: clip.x,
+                    to: clip.right(),
+                )
         }
         written
     }
@@ -486,19 +499,24 @@ uses (frame: mut Frame)
     frame.print_in(area, text, style)
 }
 
-/// Draws `line` on the top row of `area`; see `Frame::print_line`.
-pub fn print_line(_ area: Rect, _ line: Line, _ alignment: Alignment) -> u16
+/// Draws the first line of `text` on the top row of `area`; see
+/// `Frame::print_line`.
+pub fn print_line<S: StyledText>(_ area: Rect, _ text: S, _ alignment: Alignment) -> u16
 uses (frame: mut Frame)
 {
-    frame.print_line(area, line, alignment)
+    frame.print_line(area, text, alignment)
 }
 
-/// Draws `line` on the top row of `area`, with an ellipsis if it is cut;
-/// see `Frame::print_line_with_ellipsis`.
-pub fn print_line_with_ellipsis(_ area: Rect, _ line: Line, _ alignment: Alignment) -> u16
+/// Draws the first line of `text` on the top row of `area`, with an
+/// ellipsis if it is cut; see `Frame::print_line_with_ellipsis`.
+pub fn print_line_with_ellipsis<S: StyledText>(
+    _ area: Rect,
+    _ text: S,
+    _ alignment: Alignment,
+) -> u16
 uses (frame: mut Frame)
 {
-    frame.print_line_with_ellipsis(area, line, alignment)
+    frame.print_line_with_ellipsis(area, text, alignment)
 }
 
 /// Applies `style` over the style of each cell of `area`; see
@@ -941,6 +959,38 @@ fn cut_lines_may_end_in_an_ellipsis() {
             == 1,
     )
     assert(frame.buffer().to_text() == "abc…\nabcdef\n漢…\n …")
+}
+
+#[test]
+fn lines_may_be_bytes_or_the_first_line_of_a_text() {
+    var frame = frame_of(width: 5, height: 3)
+    let bytes = format!("abcdefg")
+    let text = Text::from("first\nsecond")
+    assert(
+        frame
+                .print_line_with_ellipsis(
+                    Rect::new(x: 0, y: 0, width: 5, height: 1),
+                    bytes.span(),
+                    Alignment::Left,
+                )
+            == 5,
+    )
+    frame.print_line(
+            Rect::new(x: 0, y: 1, width: 5, height: 1),
+            text,
+            Alignment::Right,
+        )
+    // Empty bytes are no line.
+    assert(
+        frame
+                .print_line(
+                    Rect::new(x: 0, y: 2, width: 5, height: 1),
+                    bytes.slice(offset: 0, len: 0),
+                    Alignment::Left,
+                )
+            == 0,
+    )
+    assert(frame.buffer().to_text() == "abcd…\nfirst\n")
 }
 
 #[test]

@@ -7,7 +7,9 @@ use ingot::event::{Key, KeyCode, KeyKind, Modifiers, Mouse, MouseButton, MouseKi
 use ingot::frame::{Frame, frame_of, measure, print_in, set_style, theme}
 use ingot::geom::{Pos, Rect, min}
 use ingot::style::{Color, Modifier, Style}
+use ingot::text::Alignment
 use super::paragraph::Paragraph
+use super::print_cut
 use super::scroll::{ScrollState, WHEEL_ROWS}
 
 /// A list of items, one row (or `item_height` rows) each, scrolled so the
@@ -58,6 +60,7 @@ pub struct List {
     item_height: u16,
     placeholder: String<31>,
     placeholder_style: Style,
+    ellipsis: bool,
 }
 
 impl Copy for List {}
@@ -79,6 +82,7 @@ impl List {
             item_height: 1,
             placeholder: "",
             placeholder_style: Style::NONE,
+            ellipsis: true,
         }
     }
 
@@ -109,6 +113,14 @@ impl List {
         self
     }
 
+    /// Ends an item `render` cuts at the area's right edge with an
+    /// ellipsis, as a list does unless `ellipsis(false)`, or cuts it there
+    /// plainly.
+    pub fn ellipsis(var own self, _ show: bool) -> Self {
+        self.ellipsis = show
+        self
+    }
+
     /// Draws `text` when there are no items.
     pub fn placeholder(var own self, _ text: String<31>) -> Self {
         self.placeholder = text
@@ -131,12 +143,13 @@ impl List {
     )
     uses (frame: mut Frame, C::E)
     {
+        let ellipsis = self.ellipsis
         self.render_with(
             area,
             items,
             mut state,
             |item, row| {
-                print_in(row.area, item, Style::NONE)
+                print_cut(row.area, item, Alignment::Left, ellipsis)
             },
         )
     }
@@ -989,18 +1002,20 @@ fn tiny_areas_draw_what_fits() {
 }
 
 #[test]
-fn wide_items_are_cut_at_the_edge() {
+fn wide_items_are_cut_at_the_edge_with_an_ellipsis() {
     var frame = frame_of(width: 3, height: 2)
     frame.fill(frame.area(), ".", Style::new())
     let area = frame.area()
     var state = ListState::new()
     with (frame) {
-        List::new().render(area, ["ab漢", "漢字"], mut state)
+        List::new().ellipsis(false).render(area, ["ab漢", "漢字"], mut state)
     }
-    // A wide cluster that would cross the edge leaves a space in its one
-    // column.
-    assert(frame.buffer().to_text() == "ab\n漢")
-    assert(
-        frame.buffer().get(Pos::new(x: 2, y: 1)).unwrap().width() == 1,
-    )
+    // A wide cluster that would cross the edge is left out, and its one
+    // column left as it was.
+    assert(frame.buffer().to_text() == "ab.\n漢.")
+    // With an ellipsis unless asked not to.
+    with (frame) {
+        List::new().render(area, ["ab漢", "漢字", "abc"], mut state)
+    }
+    assert(frame.buffer().to_text() == "ab…\n漢…")
 }
