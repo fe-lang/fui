@@ -465,6 +465,11 @@ impl TableState {
         self.rows.deselect()
     }
 
+    /// Records that there are `len` rows; see `ListState::set_len`.
+    pub fn set_len(mut self, _ len: usize) {
+        self.rows.set_len(len)
+    }
+
     /// Selects the row below the selected one; see `ListState::select_next`.
     pub fn select_next(mut self) {
         self.rows.select_next()
