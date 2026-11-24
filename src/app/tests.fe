@@ -1,6 +1,8 @@
 use core::{MemBuffer, Option, Result}
 use std::io::Display
 use std::term::Signal
+use std::fs::Fs
+use std::term::Tty
 use std::time::{Clock, Duration}
 use ingot::backend::TestBackend
 use ingot::event::{Event, Key, KeyCode, Modifiers}
@@ -8,7 +10,7 @@ use ingot::frame::{Frame, print}
 use ingot::geom::{Pos, Rect, Size}
 use ingot::session::Session
 use ingot::style::Style
-use super::{App, Flow, Options, run_session}
+use super::{App, Flow, Options, run, run_session}
 
 // Counts what it gets, quits on `q`, and asks to suspend on `s`.
 struct Recorder {
@@ -277,4 +279,43 @@ fn an_app_row_with_a_host_capability_runs() uses (clock: Clock) {
     assert(
         app.reads == 2 && session.backend().vt().to_text() == "1\n",
     )
+}
+
+// Apps whose rows name other capabilities, or `run`'s own: each runs under
+// `run`, which this function type-checks (it needs a terminal to run).
+struct Filer {}
+
+impl App for Filer {
+    uses E = (fs: mut Fs)
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        Flow::Quit
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {}
+}
+
+struct Opener {}
+
+impl App for Opener {
+    uses E = (tty: mut Tty, clock: Clock)
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        let _ = tty.open()
+        let _ = clock.instant()
+        Flow::Quit
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {}
+}
+
+fn runs_with_any_row() -> bool uses (tty: mut Tty, clock: Clock, fs: mut Fs) {
+    var recorder = Recorder::new()
+    var filer = Filer {}
+    var timed = Timed { reads: 0 }
+    var opener = Opener {}
+    run(mut recorder, Options::new()).is_ok()
+        && run(mut filer, Options::new()).is_ok()
+        && run(mut timed, Options::new()).is_ok()
+        && run(mut opener, Options::new()).is_ok()
 }

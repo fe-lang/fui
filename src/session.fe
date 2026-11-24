@@ -19,8 +19,11 @@
 //! session.present()?
 //! ```
 //!
-//! Inside the block, draw through the frame effect only: naming the session
-//! there would end the frame's access early.
+//! Inside the block, draw through the frame effect only: the frame's access
+//! holds the session until the block ends, so naming the session there is
+//! a conflict. `present` is a call of its own, rather than the slide of
+//! `frame`, so that a failed write is returned where it happens, and a
+//! block left early, by `return` or `?`, shows no half-drawn frame.
 //!
 //! `next_event` waits for the next `Event`: keys, mouse actions, pastes and
 //! focus changes decoded from the terminal's input, and the signals a
