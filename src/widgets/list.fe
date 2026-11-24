@@ -10,10 +10,7 @@ use ingot::geom::{Pos, Rect, Size, min}
 use ingot::style::{Color, Modifier, Style}
 use ingot::theme::Theme
 use super::paragraph::Paragraph
-use super::scroll::ScrollState
-
-// The rows a notch of the mouse wheel scrolls.
-const WHEEL_ROWS: u16 = 3
+use super::scroll::{ScrollState, WHEEL_ROWS}
 
 /// A list of items, one row (or `item_height` rows) each, scrolled so the
 /// selected item is shown.
@@ -223,13 +220,18 @@ impl Default for List {
 
 /// The state of a `List` that outlives a frame: the selected item, the
 /// scroll position, and what the last render laid out, which key and
-/// mouse handling use.
+/// mouse handling use. `TableState` keeps its rows in one.
 ///
-/// Moving the selection clamps to the items the last render drew, and
-/// makes the view follow the selection: each render scrolls as little as
-/// shows it. Scrolling the view itself, by `scroll_by` or the mouse wheel,
-/// stops that until the selection moves again, so the selected item may
-/// scroll out of view.
+/// Moving the selection clamps to the items the last render drew and
+/// scrolls as little as shows the selected item, and each render does the
+/// same after clamping the selection to the items there are (no items, no
+/// selection), so the view follows the selection. Scrolling the view
+/// itself, by `scroll_by`, `scroll_to` or the mouse wheel, leaves the
+/// selection where it is and stops the following until the selection moves
+/// again, so the selected item may scroll out of view.
+///
+/// Without a selection, the keys that move it start from the view: Down
+/// and PageDown select the first item shown, Up and PageUp the last.
 pub struct ListState {
     selected: Option<usize>,
     scroll: ScrollState,
@@ -266,18 +268,16 @@ impl ListState {
 
     /// This state with `j`, `k`, `g` and `G` moving the selection as Down,
     /// Up, Home and End do in `handle_key`.
-    pub fn vi_keys(own self) -> Self {
-        var state = self
-        state.vi_keys = true
-        state
+    pub fn vi_keys(var own self) -> Self {
+        self.vi_keys = true
+        self
     }
 
     /// This state with the selection moving from the last item to the
     /// first with `select_next`, and back with `select_previous`.
-    pub fn wrap_around(own self) -> Self {
-        var state = self
-        state.wrap_around = true
-        state
+    pub fn wrap_around(var own self) -> Self {
+        self.wrap_around = true
+        self
     }
 
     /// The selected item's index.
@@ -296,21 +296,22 @@ impl ListState {
     }
 
     /// The scroll position in items, with the items and the items the area
-    /// shows whole: what a scrollbar shows.
+    /// shows whole: what a scrollbar shows (`Scrollbar::render_for`).
     pub fn scroll(self) -> ScrollState {
         self.scroll
     }
 
-    /// The area the last render drew in.
+    /// The area the last render drew the items in.
     pub fn area(self) -> Rect {
         self.area
     }
 
-    /// Selects the item at `index`. The next render clamps an index beyond
-    /// the last item to it.
+    /// Selects the item at `index` and scrolls as little as shows it. The
+    /// next render clamps an index beyond the last item to it.
     pub fn select(mut self, _ index: usize) {
         self.selected = Option::Some(index)
         self.follow = true
+        self.scroll.ensure_visible(index)
     }
 
     /// Selects no item.
@@ -318,9 +319,9 @@ impl ListState {
         self.selected = Option::None
     }
 
-    /// Selects the item after the selected one, or the first if none is.
-    /// From the last item it stays, or moves to the first if the state
-    /// wraps around.
+    /// Selects the item after the selected one, or the first one shown if
+    /// none is. From the last item it stays, or moves to the first if the
+    /// state wraps around.
     pub fn select_next(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -328,14 +329,14 @@ impl ListState {
             Option::Some(i) => if i < len - 1 {
                 i + 1
             } else if self.wrap_around { 0 } else { len - 1 },
-            Option::None => 0,
+            Option::None => self.scroll.position(),
         }
         self.select(next)
     }
 
-    /// Selects the item before the selected one, or the last if none is.
-    /// From the first item it stays, or moves to the last if the state
-    /// wraps around.
+    /// Selects the item before the selected one, or the last one shown if
+    /// none is. From the first item it stays, or moves to the last if the
+    /// state wraps around.
     pub fn select_previous(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -345,7 +346,7 @@ impl ListState {
             } else if i > 0 {
                 i - 1
             } else if self.wrap_around { len - 1 } else { 0 },
-            Option::None => len - 1,
+            Option::None => self.last_shown(),
         }
         self.select(previous)
     }
@@ -367,7 +368,7 @@ impl ListState {
 
     /// Moves the view and the selection down by the items the area shows,
     /// so the selection keeps its place in the view until the end of the
-    /// list. Without a selection, selects the first item.
+    /// list. Without a selection, selects the first item shown.
     pub fn page_down(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -378,13 +379,13 @@ impl ListState {
                 let next = i.saturating_add(page)
                 self.select(if next < len { next } else { len - 1 })
             },
-            Option::None => self.select(0),
+            Option::None => self.select_next(),
         }
     }
 
     /// Moves the view and the selection up by the items the area shows,
     /// so the selection keeps its place in the view until the start of the
-    /// list. Without a selection, selects the last item.
+    /// list. Without a selection, selects the last item shown.
     pub fn page_up(mut self) {
         let len = self.len()
         if len == 0 { return }
@@ -395,13 +396,22 @@ impl ListState {
                 let last = if i < len { i } else { len - 1 }
                 self.select(last.saturating_sub(page))
             },
-            Option::None => self.select(len - 1),
+            Option::None => self.select_previous(),
         }
     }
 
-    /// Scrolls the view by `delta` items, leaving the selection where it is.
+    /// Scrolls the view by `delta` items, forward if it is positive,
+    /// leaving the selection where it is.
     pub fn scroll_by(mut self, _ delta: isize) {
         self.scroll.scroll_by(delta)
+        self.follow = false
+    }
+
+    /// Scrolls the view to show item `position` first, or as near as the
+    /// items allow, leaving the selection where it is: to follow a dragged
+    /// scrollbar (`Scrollbar::position_at`).
+    pub fn scroll_to(mut self, _ position: usize) {
+        self.scroll.scroll_to(position)
         self.follow = false
     }
 
@@ -418,11 +428,11 @@ impl ListState {
         }
     }
 
-    /// Moves the selection for a key press: Up and Down by an item, Home
-    /// and End to the first and last, PageUp and PageDown by a page, and
-    /// with `vi_keys` also `k`, `j`, `g` and `G`. Returns whether the key
-    /// is one of these, which the list takes even where the selection
-    /// cannot move.
+    /// Moves the selection for a key press without modifiers: Up and Down
+    /// by an item, Home and End to the first and last, PageUp and PageDown
+    /// by a page, and with `vi_keys` also `k`, `j`, `g` and `G`. Returns
+    /// whether the key is one of these, which the list takes even where the
+    /// selection cannot move, so it does not reach what handles keys next.
     pub fn handle_key(mut self, _ key: Key) -> bool {
         let vi = self.vi_keys
         if key.is(KeyCode::Up) || (vi && key.is_char(b'k')) {
@@ -443,29 +453,37 @@ impl ListState {
         true
     }
 
-    /// Handles a mouse event over the area the last render drew in: the
-    /// wheel scrolls the view, and a left click on an item selects it and
-    /// returns its index. Events elsewhere do nothing.
+    /// Handles a mouse event over the area the last render drew in: each
+    /// notch of the wheel scrolls the view by `WHEEL_ROWS` rows, at least an
+    /// item, and a left click on an item selects it and returns its index.
+    /// Events elsewhere do nothing.
     pub fn handle_mouse(mut self, _ mouse: Mouse) -> Option<usize> {
         if !self.area.contains(mouse.pos) {
             return Option::None
         }
+        if !self.wheel(mouse.kind) && mouse.kind == MouseKind::Down(MouseButton::Left) {
+            let index = self.index_at(mouse.pos)?
+            self.select(index)
+            return Option::Some(index)
+        }
+        Option::None
+    }
+
+    // Scrolls for a notch of the wheel, if `kind` is one: whether it is.
+    pub(ingot) fn wheel(mut self, _ kind: MouseKind) -> bool {
         let step = (if WHEEL_ROWS > self.item_height {
             WHEEL_ROWS / self.item_height
         } else {
             1
         }) as isize
-        match mouse.kind {
+        match kind {
             MouseKind::ScrollDown => self.scroll_by(step),
             MouseKind::ScrollUp => self.scroll_by(-step),
-            MouseKind::Down(MouseButton::Left) => {
-                let index = self.index_at(mouse.pos)?
-                self.select(index)
-                return Option::Some(index)
+            _ => {
+                return false
             },
-            _ => {},
         }
-        Option::None
+        true
     }
 
     // The items the area shows whole, at least one.
@@ -474,10 +492,16 @@ impl ListState {
         if viewport > 0 { viewport } else { 1 }
     }
 
+    // The last item shown.
+    fn last_shown(self) -> usize {
+        let end = self.scroll.position().saturating_add(self.page())
+        (if end < self.len() { end } else { self.len() }) - 1
+    }
+
     // Records what a render lays out: `len` items in `area`, `item_height`
     // rows each. Clamps the selection to the items and the scroll position
     // to the rows, then follows the selection.
-    fn lay_out(mut self, _ len: usize, _ area: Rect, _ item_height: u16) {
+    pub(ingot) fn lay_out(mut self, _ len: usize, _ area: Rect, _ item_height: u16) {
         self.area = area
         self.item_height = item_height
         match self.selected {
@@ -686,10 +710,35 @@ fn pages_move_the_view_and_the_selection_together() {
     )
     var fresh = ListState::new()
     press(mut fresh, KeyCode::Home)
+    // Without a selection, pages start from the view: PageUp selects the
+    // last item shown.
     fresh.deselect()
     assert(
-        press(mut fresh, KeyCode::PageUp) == 7 && fresh.selected() == Option::Some(9),
+        press(mut fresh, KeyCode::PageUp) == 0 && fresh.selected() == Option::Some(2),
     )
+}
+
+#[test]
+fn keys_without_a_selection_start_from_the_view() {
+    var state = ListState::new()
+    press(mut state, KeyCode::Home)
+    state.deselect()
+    state.scroll_by(4)
+    assert(
+        press(mut state, KeyCode::Down) == 4 && state.selected() == Option::Some(4),
+    )
+    state.deselect()
+    assert(
+        press(mut state, KeyCode::Up) == 4 && state.selected() == Option::Some(6),
+    )
+    state.deselect()
+    state.scroll_to(7)
+    assert(
+        press(mut state, KeyCode::PageDown) == 7 && state.selected() == Option::Some(7),
+    )
+    // A selection scrolls into view as it is made, before a render.
+    state.select(1)
+    assert(state.scroll().position() == 1)
 }
 
 #[test]

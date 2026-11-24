@@ -25,11 +25,11 @@ pub use clear::{clear, popup}
 pub use gauge::{Gauge, LineGauge}
 pub use list::{List, ListRow, ListState}
 pub use paragraph::Paragraph
-pub use scroll::ScrollState
+pub use scroll::{ScrollState, WHEEL_ROWS}
 pub use scrollbar::{Orientation, Scrollbar}
 pub use sparkline::Sparkline
 pub use spinner::Spinner
-pub use table::{Column, MAX_COLUMNS, Table, TableCell, TableHit, TableRow, TableState, WHEEL_ROWS}
+pub use table::{Column, MAX_COLUMNS, Table, TableCell, TableHit, TableRow, TableState}
 pub use tabs::{Tabs, TabsState}
 pub use text_input::{TextInput, TextInputState, TextLimit}
 

@@ -27,6 +27,9 @@
 //! takes its three numbers from `content()`, `viewport()` and `position()`.
 use core::ops::Eq
 
+/// The rows a notch of the mouse wheel scrolls a list or a table by.
+pub const WHEEL_ROWS: u16 = 3
+
 /// The position of a viewport over content: the first unit shown, and the
 /// lengths of the viewport and the content the last render recorded.
 pub struct ScrollState { position: usize, viewport: usize, content: usize }

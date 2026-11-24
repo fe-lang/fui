@@ -12,13 +12,12 @@ use ingot::layout::Constraint::{Fill, Length}
 use ingot::style::{Color, Modifier, Style}
 use ingot::text::{Alignment, ELLIPSIS, truncate, truncate_with_ellipsis, width}
 use ingot::theme::Theme
+use super::list::ListState
+use super::scroll::ScrollState
 
 /// The most columns a `TableState` records for hit-testing. A table may
 /// have more, and a click on a later one reports no column.
 pub const MAX_COLUMNS: usize = 16
-
-/// The rows one step of the mouse wheel scrolls a table by.
-pub const WHEEL_ROWS: usize = 3
 
 /// A column of a `Table`: its title, the constraint its width is solved
 /// from, and where its title and cells sit in it. The title is any
@@ -224,10 +223,11 @@ impl Table {
         var scratch = MemBuffer::empty()
         let rects = self.prepare(area, columns, rows.len(), mut state, mut scratch)
         if area.is_empty() { return }
-        let first = state.offset
-        for row in first .. min(first + state.viewport, rows.len()) {
-            let y = row_y(state.body, row - first)
-            let selected = state.selected == Option::Some(row)
+        let scroll = state.rows.scroll()
+        let first = scroll.position()
+        for row in first .. scroll.visible_end() {
+            let y = row_y(state.rows.area(), row - first)
+            let selected = state.rows.selected() == Option::Some(row)
             for (column, rect) in rects.enumerate() {
                 let cell = cell_at(rect, y)
                 // `with (Frame = clipped(cell))` would not reach `draw`; see
@@ -269,8 +269,7 @@ impl Table {
         let (line, body) = rest.split_top(if self.separator { 1 } else { 0 })
         state.area = area
         state.header = header
-        state.body = body
-        state.fit(rows, body.height as usize)
+        state.rows.lay_out(rows, body, 1)
         if area.is_empty() {
             return rects
         }
@@ -347,14 +346,6 @@ fn cell_at(_ column: Rect, _ y: u16) -> Rect {
     Rect { x: column.x, y, width: column.width, height: 1 }
 }
 
-fn min(_ a: usize, _ b: usize) -> usize {
-    if a < b { a } else { b }
-}
-
-fn max(_ a: usize, _ b: usize) -> usize {
-    if a > b { a } else { b }
-}
-
 /// What a position in a table lands on.
 pub enum TableHit {
     /// The header, in the column there if not between columns.
@@ -376,68 +367,74 @@ impl Eq for TableHit {
 }
 
 /// The state of a `Table` that outlives a frame: the selected row and the
-/// scroll offset, which the program changes, and the layout of the last
-/// render, which event handling reads.
+/// scroll position, which move as a `ListState`'s do, and the layout of the
+/// last render, which event handling reads.
 ///
-/// The selection moves within the rows of the last render, and each move
-/// scrolls the rows as little as keeps the selected one in view; so does a
-/// render, after it clamps the selection to the rows there are (no rows,
-/// no selection) and the offset to leave no empty rows below the last. The
-/// mouse wheel scrolls without moving the selection unless it would leave
-/// the view, and a click selects the row under it.
-///
-/// The layout records the area, the header and the rows of the last render,
-/// and the rectangles of its first `MAX_COLUMNS` columns.
+/// The rows are a `ListState` of one row per item: see it for how the
+/// selection moves, clamps and keeps in view, and how the wheel scrolls.
+/// The layout records the area, the header and the rows of the last
+/// render, and the rectangles of its first `MAX_COLUMNS` columns.
 pub struct TableState {
-    selected: Option<usize>,
-    offset: usize,
-    viewport: usize,
-    rows: usize,
+    rows: ListState,
     area: Rect,
     header: Rect,
-    body: Rect,
     columns: [Rect; MAX_COLUMNS],
     column_count: usize,
 }
 
 impl Copy for TableState {}
 
+/// A state without a selection.
+impl Default for TableState {
+    fn default() -> Self {
+        TableState::new()
+    }
+}
+
 impl TableState {
     /// A state with no row selected, scrolled to the top, before any render.
     pub fn new() -> Self {
         TableState {
-            selected: Option::None,
-            offset: 0,
-            viewport: 0,
-            rows: 0,
+            rows: ListState::new(),
             area: Rect::ZERO,
             header: Rect::ZERO,
-            body: Rect::ZERO,
             columns: [Rect::ZERO; MAX_COLUMNS],
             column_count: 0,
         }
     }
 
+    /// This state with `j`, `k`, `g` and `G` moving the selection; see
+    /// `ListState::vi_keys`.
+    pub fn vi_keys(var own self) -> Self {
+        self.rows = self.rows.vi_keys()
+        self
+    }
+
+    /// This state with the selection wrapping around; see
+    /// `ListState::wrap_around`.
+    pub fn wrap_around(var own self) -> Self {
+        self.rows = self.rows.wrap_around()
+        self
+    }
+
     /// The selected row.
     pub fn selected(self) -> Option<usize> {
-        self.selected
+        self.rows.selected()
     }
 
-    /// Selects `row`, or no row, scrolling to keep it in view. The next
-    /// render clamps it to the rows there are.
-    pub fn select(mut self, _ row: Option<usize>) {
-        self.selected = row
-        self.follow()
+    /// The number of rows, as the last render drew them.
+    pub fn len(self) -> usize {
+        self.rows.len()
     }
 
-    /// The first row shown.
-    pub fn offset(self) -> usize {
-        self.offset
+    /// Whether the last render drew no rows.
+    pub fn is_empty(self) -> bool {
+        self.rows.is_empty()
     }
 
-    /// The rows shown at once in the last render.
-    pub fn viewport(self) -> usize {
-        self.viewport
+    /// The scroll position in rows, with the rows and the rows shown.
+    pub fn scroll(self) -> ScrollState {
+        self.rows.scroll()
     }
 
     /// The area of the last render.
@@ -455,104 +452,64 @@ impl TableState {
         }
     }
 
-    /// Selects the row below the selected one, or the first one shown.
-    pub fn select_next(mut self) {
-        if self.rows == 0 { return }
-        let row = match self.selected {
-            Option::Some(row) => row + 1,
-            Option::None => self.offset,
-        }
-        self.select(Option::Some(min(row, self.rows - 1)))
+    /// Selects row `index`; see `ListState::select`.
+    pub fn select(mut self, _ index: usize) {
+        self.rows.select(index)
     }
 
-    /// Selects the row above the selected one, or the last one shown.
+    /// Selects no row.
+    pub fn deselect(mut self) {
+        self.rows.deselect()
+    }
+
+    /// Selects the row below the selected one; see `ListState::select_next`.
+    pub fn select_next(mut self) {
+        self.rows.select_next()
+    }
+
+    /// Selects the row above the selected one; see
+    /// `ListState::select_previous`.
     pub fn select_previous(mut self) {
-        if self.rows == 0 { return }
-        let row = match self.selected {
-            Option::Some(row) => row.saturating_sub(1),
-            Option::None => self.last_shown(),
-        }
-        self.select(Option::Some(row))
+        self.rows.select_previous()
     }
 
     /// Selects the first row.
     pub fn select_first(mut self) {
-        if self.rows > 0 {
-            self.select(Option::Some(0))
-        }
+        self.rows.select_first()
     }
 
     /// Selects the last row.
     pub fn select_last(mut self) {
-        if self.rows > 0 {
-            self.select(Option::Some(self.rows - 1))
-        }
+        self.rows.select_last()
     }
 
-    /// Moves the selection and the rows shown down by a page, the rows the
-    /// last render showed, keeping the selected row's place in the view
-    /// where the rows allow. Without a selection, selects the first row
-    /// shown.
+    /// Moves the view and the selection down by a page; see
+    /// `ListState::page_down`.
     pub fn page_down(mut self) {
-        if self.rows == 0 { return }
-        match self.selected {
-            Option::Some(row) => {
-                let page = max(self.viewport, 1)
-                self.offset = min(self.offset + page, self.max_offset())
-                self.select(Option::Some(min(row + page, self.rows - 1)))
-            },
-            Option::None => self.select_next(),
-        }
+        self.rows.page_down()
     }
 
-    /// Moves the selection and the rows shown up by a page; see
-    /// `page_down`. Without a selection, selects the last row shown.
+    /// Moves the view and the selection up by a page; see
+    /// `ListState::page_up`.
     pub fn page_up(mut self) {
-        if self.rows == 0 { return }
-        match self.selected {
-            Option::Some(row) => {
-                let page = max(self.viewport, 1)
-                self.offset = self.offset.saturating_sub(page)
-                self.select(Option::Some(row.saturating_sub(page)))
-            },
-            Option::None => self.select_previous(),
-        }
+        self.rows.page_up()
     }
 
-    /// Scrolls the rows shown down by `rows`, as far as the last row. The
-    /// selection moves only to stay in view.
-    pub fn scroll_down(mut self, _ rows: usize) {
-        self.offset = min(self.offset + rows, self.max_offset())
-        self.drag()
+    /// Scrolls the view by `delta` rows, leaving the selection where it is.
+    pub fn scroll_by(mut self, _ delta: isize) {
+        self.rows.scroll_by(delta)
     }
 
-    /// Scrolls the rows shown up by `rows`, as far as the first row. The
-    /// selection moves only to stay in view.
-    pub fn scroll_up(mut self, _ rows: usize) {
-        self.offset = self.offset.saturating_sub(rows)
-        self.drag()
+    /// Scrolls the view to show row `position` first, or as near as the
+    /// rows allow, leaving the selection where it is.
+    pub fn scroll_to(mut self, _ position: usize) {
+        self.rows.scroll_to(position)
     }
 
-    /// Moves the selection for a key press without modifiers: Up and Down
-    /// by a row, Page Up and Page Down by a page, Home and End to the first
-    /// and last rows. Returns whether the key is one of these.
+    /// Moves the selection for a key press, as `ListState::handle_key`
+    /// does. Returns whether the key is one of the table's.
     pub fn handle_key(mut self, _ key: Key) -> bool {
-        if key.is(KeyCode::Up) {
-            self.select_previous()
-        } else if key.is(KeyCode::Down) {
-            self.select_next()
-        } else if key.is(KeyCode::PageUp) {
-            self.page_up()
-        } else if key.is(KeyCode::PageDown) {
-            self.page_down()
-        } else if key.is(KeyCode::Home) {
-            self.select_first()
-        } else if key.is(KeyCode::End) {
-            self.select_last()
-        } else {
-            return false
-        }
-        true
+        self.rows.handle_key(key)
     }
 
     /// What `pos` lands on in the last render: the header or a row, with
@@ -571,96 +528,26 @@ impl TableState {
         if self.header.contains(pos) {
             return Option::Some(TableHit::Header(column))
         }
-        if self.body.contains(pos) {
-            let row = self.offset + (pos.y - self.body.y) as usize
-            if row < self.rows {
-                return Option::Some(TableHit::Row(row, column))
-            }
-        }
-        Option::None
+        let row = self.rows.index_at(pos)?
+        Option::Some(TableHit::Row(row, column))
     }
 
-    /// Handles a mouse event over the last render: a left click selects the
-    /// row under it, and the wheel scrolls by `WHEEL_ROWS`. Returns what a
-    /// left click lands on; see `hit`.
+    /// Handles a mouse event over the last render: the wheel scrolls as a
+    /// list's does, and a left click selects the row under it. Returns what
+    /// a left click lands on; see `hit`.
     pub fn handle_mouse(mut self, _ mouse: Mouse) -> Option<TableHit> {
-        if !self.area.contains(mouse.pos) {
+        if !self.area.contains(mouse.pos) || self.rows.wheel(mouse.kind) {
             return Option::None
         }
-        match mouse.kind {
-            MouseKind::Down(MouseButton::Left) => {
-                let hit = self.hit(mouse.pos)
-                match hit {
-                    Option::Some(TableHit::Row(row, _)) => self.select(Option::Some(row)),
-                    _ => {},
-                }
-                hit
-            },
-            MouseKind::ScrollDown => {
-                self.scroll_down(WHEEL_ROWS)
-                Option::None
-            },
-            MouseKind::ScrollUp => {
-                self.scroll_up(WHEEL_ROWS)
-                Option::None
-            },
-            _ => Option::None,
+        if mouse.kind != MouseKind::Down(MouseButton::Left) {
+            return Option::None
         }
-    }
-
-    // Fits the selection and offset to `rows` rows, `viewport` of them
-    // shown.
-    fn fit(mut self, _ rows: usize, _ viewport: usize) {
-        self.rows = rows
-        self.viewport = viewport
-        match self.selected {
-            Option::Some(row) => if rows == 0 {
-                self.selected = Option::None
-            } else if row >= rows {
-                self.selected = Option::Some(rows - 1)
-            },
-            Option::None => {},
+        let hit = self.hit(mouse.pos)
+        match hit {
+            Option::Some(TableHit::Row(row, _)) => self.rows.select(row),
+            _ => {},
         }
-        self.offset = min(self.offset, self.max_offset())
-        self.follow()
-    }
-
-    // Scrolls as little as shows the selected row.
-    fn follow(mut self) {
-        match self.selected {
-            Option::Some(row) => if self.viewport > 0 {
-                if row < self.offset {
-                    self.offset = row
-                } else if row >= self.offset + self.viewport {
-                    self.offset = row + 1 - self.viewport
-                }
-            },
-            Option::None => {},
-        }
-    }
-
-    // Moves the selection as little as keeps it in view.
-    fn drag(mut self) {
-        match self.selected {
-            Option::Some(row) => if self.viewport > 0 {
-                if row < self.offset {
-                    self.selected = Option::Some(self.offset)
-                } else if row >= self.offset + self.viewport {
-                    self.selected = Option::Some(self.offset + self.viewport - 1)
-                }
-            },
-            Option::None => {},
-        }
-    }
-
-    // The offset that shows the last row at the bottom.
-    fn max_offset(self) -> usize {
-        self.rows.saturating_sub(self.viewport)
-    }
-
-    // The last row shown.
-    fn last_shown(self) -> usize {
-        min(self.offset + max(self.viewport, 1), self.rows) - 1
+        hit
     }
 }
 
@@ -846,7 +733,7 @@ fn headers_and_separators_take_their_rows() {
         mut state,
     )
     assert(bare.to_text() == "a   1\nb   2\n")
-    assert(state.viewport() == 3)
+    assert(state.scroll().viewport() == 3)
 }
 
 #[test]
@@ -854,7 +741,7 @@ fn the_selected_row_is_highlighted_across_its_gaps() {
     let columns = [Column::new("A", Length(2)), Column::new("B", Length(2))]
     let rows = [["a", "1"], ["b", "2"], ["c", "3"]]
     var state = TableState::new()
-    state.select(Option::Some(1))
+    state.select(1)
     let buffer = rendered(
         Table::new().column_spacing(2).highlight_style(Style::new().fg(Color::GREEN)),
         width: 8,
@@ -887,12 +774,14 @@ fn scrolling_follows_the_selection_without_jumps() {
         rows,
         mut state,
     )
-    assert(state.viewport() == 3 && state.selected().is_none())
+    assert(
+        state.scroll().viewport() == 3 && state.selected().is_none(),
+    )
     // Down from no selection selects the first row shown.
     let down = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 7]
     for expected in down {
         assert(state.handle_key(Key::new(KeyCode::Down, Modifiers::NONE)))
-        assert(state.offset() == expected)
+        assert(state.scroll().position() == expected)
     }
     assert(state.selected() == Option::Some(9))
     let buffer = rendered(
@@ -907,20 +796,30 @@ fn scrolling_follows_the_selection_without_jumps() {
     let up = [7, 7, 6, 5, 4, 3, 2, 1, 0, 0]
     for expected in up {
         state.select_previous()
-        assert(state.offset() == expected)
+        assert(state.scroll().position() == expected)
     }
     assert(state.selected() == Option::Some(0))
     state.page_down()
-    assert(state.selected() == Option::Some(3) && state.offset() == 3)
+    assert(
+        state.selected() == Option::Some(3) && state.scroll().position() == 3,
+    )
     state.page_down()
     state.page_down()
-    assert(state.selected() == Option::Some(9) && state.offset() == 7)
+    assert(
+        state.selected() == Option::Some(9) && state.scroll().position() == 7,
+    )
     state.page_up()
-    assert(state.selected() == Option::Some(6) && state.offset() == 4)
+    assert(
+        state.selected() == Option::Some(6) && state.scroll().position() == 4,
+    )
     assert(state.handle_key(Key::new(KeyCode::Home, Modifiers::NONE)))
-    assert(state.selected() == Option::Some(0) && state.offset() == 0)
+    assert(
+        state.selected() == Option::Some(0) && state.scroll().position() == 0,
+    )
     assert(state.handle_key(Key::new(KeyCode::End, Modifiers::NONE)))
-    assert(state.selected() == Option::Some(9) && state.offset() == 7)
+    assert(
+        state.selected() == Option::Some(9) && state.scroll().position() == 7,
+    )
     assert(
         !state.handle_key(Key::new(KeyCode::Down, Modifiers::SHIFT)),
     )
@@ -930,11 +829,57 @@ fn scrolling_follows_the_selection_without_jumps() {
     // Fewer rows: the selection and the offset clamp to them.
     let few: [[u16; 2]; 5] = [[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]]
     let shrunk = rendered(Table::new(), width: 6, height: 4, columns, few, mut state)
-    assert(state.selected() == Option::Some(4) && state.offset() == 2)
+    assert(
+        state.selected() == Option::Some(4) && state.scroll().position() == 2,
+    )
     assert(shrunk.to_text() == "N  T\n3  30\n4  40\n5  50")
     // A taller area shows more rows, and the offset leaves none empty.
     rendered(Table::new(), width: 6, height: 9, columns, few, mut state)
-    assert(state.offset() == 0 && state.viewport() == 8)
+    assert(
+        state.scroll().position() == 0 && state.scroll().viewport() == 8,
+    )
+}
+
+#[test]
+fn keys_move_the_selection_as_in_a_list() {
+    let columns = [Column::new("N", Length(2)), Column::new("T", Length(3))]
+    let rows = ten_rows()
+    var state = TableState::new().vi_keys().wrap_around()
+    rendered(
+        Table::new(),
+        width: 6,
+        height: 4,
+        columns,
+        rows,
+        mut state,
+    )
+    assert(state.len() == 10 && !state.is_empty())
+    // Without a selection, Down selects the first row shown.
+    state.scroll_by(5)
+    let key = |code: KeyCode| Key::new(code, Modifiers::NONE)
+    assert(state.handle_key(key(KeyCode::Char(b'j'))))
+    assert(
+        state.selected() == Option::Some(5) && state.scroll().position() == 5,
+    )
+    assert(state.handle_key(key(KeyCode::Char(b'G'))))
+    assert(
+        state.selected() == Option::Some(9) && state.scroll().position() == 7,
+    )
+    assert(state.handle_key(key(KeyCode::Char(b'j'))))
+    assert(
+        state.selected() == Option::Some(0) && state.scroll().position() == 0,
+    )
+    assert(state.handle_key(key(KeyCode::Char(b'k'))))
+    assert(state.selected() == Option::Some(9))
+    // Up without a selection selects the last row shown.
+    state.deselect()
+    state.scroll_to(2)
+    assert(state.handle_key(key(KeyCode::Up)))
+    assert(
+        state.selected() == Option::Some(4) && state.scroll().position() == 2,
+    )
+    assert(state.handle_key(key(KeyCode::Char(b'g'))))
+    assert(state.selected() == Option::Some(0))
 }
 
 #[test]
@@ -979,25 +924,44 @@ fn clicks_hit_rows_and_columns() {
         state.handle_mouse(click) == Option::Some(TableHit::Row(2, Option::Some(0))),
     )
     assert(state.selected() == Option::Some(2))
-    // The wheel scrolls, dragging the selection only to keep it shown.
+    // The wheel scrolls the view, over the header too, and leaves the
+    // selection where it is, out of view.
     let wheel = Mouse::new(
         MouseKind::ScrollDown,
-        Pos::new(x: 2, y: 4),
+        Pos::new(x: 2, y: 1),
         Modifiers::NONE,
     )
     assert(state.handle_mouse(wheel).is_none())
-    assert(state.offset() == 3 && state.selected() == Option::Some(3))
+    assert(
+        state.scroll().position() == 3 && state.selected() == Option::Some(2),
+    )
     state.handle_mouse(wheel)
     state.handle_mouse(wheel)
-    assert(state.offset() == 7 && state.selected() == Option::Some(7))
+    assert(
+        state.scroll().position() == 7 && state.selected() == Option::Some(2),
+    )
     assert(
         state.hit(Pos::new(x: 1, y: 5)) == Option::Some(TableHit::Row(9, Option::Some(0))),
     )
-    state.scroll_up(1)
-    assert(state.offset() == 6 && state.selected() == Option::Some(7))
+    state.scroll_by(-1)
+    assert(
+        state.scroll().position() == 6 && state.selected() == Option::Some(2),
+    )
+    // A render keeps the view where the wheel left it.
+    with (frame) {
+        Table::new()
+            .separator(true)
+            .render(
+                Rect::new(x: 1, y: 1, width: 6, height: 5),
+                columns,
+                rows,
+                mut state,
+            )
+    }
+    assert(state.scroll().position() == 6)
     let outside = Mouse::new(MouseKind::ScrollUp, Pos::new(x: 0, y: 0), Modifiers::NONE)
     state.handle_mouse(outside)
-    assert(state.offset() == 6)
+    assert(state.scroll().position() == 6)
     // Below the last row there is none.
     let few: [[u16; 2]; 1] = [[1, 1]]
     with (frame) {
@@ -1019,7 +983,7 @@ fn zero_rows_show_the_header_and_select_nothing() {
     let columns = [Column::new("Name", Fill(1))]
     let rows: [[u8; 1]; 0] = []
     var state = TableState::new()
-    state.select(Option::Some(3))
+    state.select(3)
     let buffer = rendered(
         Table::new().separator(true),
         width: 6,
@@ -1033,7 +997,9 @@ fn zero_rows_show_the_header_and_select_nothing() {
     assert(state.handle_key(Key::new(KeyCode::Down, Modifiers::NONE)))
     state.select_last()
     state.page_down()
-    assert(state.selected().is_none() && state.offset() == 0)
+    assert(
+        state.selected().is_none() && state.scroll().position() == 0,
+    )
     assert(state.hit(Pos::new(x: 0, y: 2)).is_none())
 }
 
@@ -1042,7 +1008,7 @@ fn zero_columns_draw_no_cells() {
     let columns: [Column<String<1>>; 0] = []
     let rows: [[u8; 1]; 2] = [[1], [2]]
     var state = TableState::new()
-    state.select(Option::Some(0))
+    state.select(0)
     let buffer = rendered(
         Table::new(),
         width: 4,
@@ -1064,7 +1030,7 @@ fn tiny_areas_draw_what_fits() {
     let columns = [Column::new("Name", Fill(1)), Column::new("N", Length(2))]
     let rows = ten_rows()
     var state = TableState::new()
-    state.select(Option::Some(5))
+    state.select(5)
     let sizes: [(u16, u16); 3] = [(0, 0), (0, 5), (5, 0)]
     for size in sizes {
         let (width, height) = size
@@ -1077,7 +1043,9 @@ fn tiny_areas_draw_what_fits() {
             mut state,
         )
         assert(buffer.to_text().is_empty())
-        assert(state.viewport() == height.saturating_sub(2) as usize)
+        assert(
+            state.scroll().viewport() == height.saturating_sub(2) as usize,
+        )
     }
     let one = rendered(
         Table::new().separator(true),
@@ -1089,7 +1057,7 @@ fn tiny_areas_draw_what_fits() {
     )
     assert(one.to_text().is_empty())
     assert(
-        state.viewport() == 0 && state.selected() == Option::Some(5),
+        state.scroll().viewport() == 0 && state.selected() == Option::Some(5),
     )
     let two = rendered(
         Table::new(),
@@ -1100,7 +1068,7 @@ fn tiny_areas_draw_what_fits() {
         mut state,
     )
     assert(two.to_text() == " N\n 50")
-    assert(state.offset() == 5)
+    assert(state.scroll().position() == 5)
 }
 
 fn draw_numbers(_ area: Rect, _ rows: [[u16; 2]; 10], _ state: mut TableState)
@@ -1129,7 +1097,7 @@ uses (frame: mut Frame)
 #[test]
 fn closures_draw_each_cell_clipped_to_it() {
     var state = TableState::new()
-    state.select(Option::Some(1))
+    state.select(1)
     var frame = blank(width: 7, height: 3)
     let area = frame.area()
     with (frame) {
