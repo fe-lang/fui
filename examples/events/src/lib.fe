@@ -1,0 +1,130 @@
+//! Shows each event the terminal sends, newest last: a tool for checking
+//! what a terminal reports for keys, the mouse, pastes, resizes and focus.
+//!
+//! It turns on every mouse report, focus reports, bracketed paste, and the
+//! kitty keyboard enhancements that report every key with its modifiers and
+//! its releases, so a terminal with the protocol shows more than one
+//! without. `q` alone or Ctrl+C quits.
+use std::term::Tty
+use std::time::Clock
+use tui::{App, Event, Flow, Frame, KeyboardFlags, MouseTracking, Options, Pos, Rect}
+use tui::frame::{print, theme}
+
+// The most lines kept: more than any screen shows.
+const KEPT: usize = 500
+
+/// The events seen, as text, oldest first.
+pub struct Events { pub lines: MemVec<MemBuffer>, pub count: u64 }
+
+impl Events {
+    pub fn new() -> Self {
+        Events { lines: MemVec::new(), count: 0 }
+    }
+}
+
+impl App for Events {
+    uses E = ()
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        if let Event::Key(key) = event && key.is_char(b'q') {
+            return Flow::Quit
+        }
+        self.count += 1
+        if self.lines.len() == KEPT {
+            // Drop the oldest: move it to the end and take it.
+            for i in 1 .. KEPT {
+                self.lines.swap(i - 1, i)
+            }
+            let _ = self.lines.pop()
+        }
+        self.lines.push(format!(self.count, "  ", event))
+        Flow::Redraw
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let (head, body) = area.split_top(1)
+        let theme = theme()
+        print(head.pos(), "Events (q or Ctrl+C quits)", theme.title)
+        // The newest lines that fit, oldest at the top.
+        let shown = if self.lines.len() < body.height as usize {
+            self.lines.len()
+        } else {
+            body.height as usize
+        }
+        let first = self.lines.len() - shown
+        for (i, ref line) in self.lines.enumerate().skip(first) {
+            let y: u16 = (i - first).downcast_truncate()
+            print(Pos::new(x: body.x, y: body.y + y), line, theme.text)
+        }
+    }
+}
+
+/// Every report the terminal can send.
+pub fn options() -> Options {
+    Options::new()
+        .mouse(MouseTracking::Motion)
+        .focus_events(true)
+        .keyboard(
+            KeyboardFlags::DISAMBIGUATE
+                | KeyboardFlags::REPORT_EVENT_TYPES
+                | KeyboardFlags::REPORT_ALL_KEYS,
+        )
+}
+
+pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
+    var events = Events::new()
+    match tui::run(mut events, options()) {
+        Result::Ok(()) => 0,
+        Result::Err(_) => 1,
+    }
+}
+
+#[test]
+fn events_are_listed_newest_last() {
+    use tui::{Harness, KeyCode, Modifiers, Size}
+
+    var harness = Harness::with_options(Events::new(), Size::new(width: 40, height: 4), options())
+    assert(harness.screen() == "Events (q or Ctrl+C quits)\n\n\n")
+    harness.key(KeyCode::Char(b'a'))
+    harness.key_with(KeyCode::Up, Modifiers::CTRL)
+    assert(
+        harness.screen() == "Events (q or Ctrl+C quits)\n1  Key(a)\n2  Key(Ctrl+Up)\n",
+    )
+    harness.paste("hello")
+    harness.resize(Size::new(width: 30, height: 3))
+    assert(
+        harness.screen() == "Events (q or Ctrl+C quits)\n3  Paste(5 bytes)\n4  Resize(30x3)",
+    )
+    harness.key(KeyCode::Char(b'q'))
+    assert(harness.quit_requested())
+}
+
+#[test]
+fn raw_reports_are_decoded() {
+    use tui::{Harness, Size}
+
+    var harness = Harness::with_options(Events::new(), Size::new(width: 40, height: 4), options())
+    var input = MemBuffer::empty()
+    // A mouse press at the third column of the second row, focus lost, and
+    // a kitty release of `a`.
+    input.push(0x1b)
+    write!(mut input, "[<0;3;2M")
+    input.push(0x1b)
+    write!(mut input, "[O")
+    input.push(0x1b)
+    write!(mut input, "[97;1:3u")
+    harness.input(input.span())
+    assert(
+        harness.screen()
+            == "Events (q or Ctrl+C quits)\n1  Mouse(Down(Left) at 2,1)\n2  FocusLost\n3  Key(a (release))",
+    )
+}
+
+#[test]
+fn the_log_keeps_the_newest_lines() {
+    var events = Events::new()
+    for _ in 0 .. KEPT + 3 {
+        let _ = events.update(Event::Tick)
+    }
+    assert(events.lines.len() == KEPT && events.lines[0] == "4  Tick")
+}

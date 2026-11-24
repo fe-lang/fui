@@ -1,0 +1,97 @@
+//! The smallest complete app: a number that keys change.
+//!
+//! Up or `+` adds one, Down or `-` takes one away, `r` resets, and `q`, Esc
+//! or Ctrl+C quits. Ctrl+Z suspends, as in any program.
+use std::term::Tty
+use std::time::Clock
+use tui::{App, Event, Flow, Frame, Key, KeyCode, KeyKind, Options, Rect}
+use tui::frame::{print, theme}
+use tui::layout::Constraint::{Fill, Length}
+
+/// The model: the count.
+pub struct Counter { pub count: u64 }
+
+impl Counter {
+    // Sets the count, which is then drawn.
+    fn set(mut self, _ count: u64) -> Flow {
+        self.count = count
+        Flow::Redraw
+    }
+}
+
+impl App for Counter {
+    uses E = ()
+
+    fn update(mut self, _ event: Event) -> Flow uses E {
+        match event {
+            Event::Key(Key { code, mods, kind: KeyKind::Press }) => if mods.is_empty() {
+                match code {
+                    KeyCode::Up | KeyCode::Char(b'+') => self.set(self.count + 1),
+                    KeyCode::Down | KeyCode::Char(b'-') => self.set(self.count.saturating_sub(1)),
+                    KeyCode::Char(b'r') => self.set(0),
+                    KeyCode::Char(b'q') | KeyCode::Esc => Flow::Quit,
+                    _ => Flow::Unchanged,
+                }
+            } else {
+                Flow::Unchanged
+            },
+            _ => Flow::Unchanged,
+        }
+    }
+
+    fn view(mut self, _ area: Rect) uses (frame: mut Frame) {
+        let (head, body, foot) = area.rows((Length(1), Fill(1), Length(1)))
+        let theme = theme()
+        print(head.pos(), "Counter", theme.title)
+        let text = format!("Count: ", self.count)
+        // The text is ASCII: one column a byte.
+        let line = body.centered(width: text.len().downcast_truncate(), height: 1)
+        print(line.pos(), text, theme.accent)
+        print(
+            foot.pos(),
+            "Up/+ add  Down/- subtract  r reset  q quit",
+            theme.muted,
+        )
+    }
+}
+
+pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
+    var counter = Counter { count: 0 }
+    match tui::run(mut counter, Options::new()) {
+        Result::Ok(()) => 0,
+        Result::Err(_) => 1,
+    }
+}
+
+#[test]
+fn keys_change_the_count() {
+    use tui::{Harness, Modifiers, Size}
+
+    var harness = Harness::new(Counter { count: 0 }, Size::new(width: 24, height: 5))
+    assert(
+        harness.screen() == "Counter\n\n        Count: 0\n\nUp/+ add  Down/- subtrac",
+    )
+    harness.key(KeyCode::Up)
+    harness.type_text("++")
+    assert(harness.app().count == 3)
+    assert(
+        harness.screen() == "Counter\n\n        Count: 3\n\nUp/+ add  Down/- subtrac",
+    )
+    harness.key(KeyCode::Down)
+    harness.type_text("r-")
+    assert(harness.app().count == 0)
+    // Keys with modifiers are not the app's.
+    harness.key_with(KeyCode::Up, Modifiers::SHIFT)
+    assert(harness.app().count == 0 && !harness.quit_requested())
+    harness.key(KeyCode::Char(b'q'))
+    assert(harness.quit_requested())
+}
+
+#[test]
+fn the_count_stays_centered_when_the_terminal_resizes() {
+    use tui::{Harness, Size}
+
+    var harness = Harness::new(Counter { count: 7 }, Size::new(width: 24, height: 5))
+    harness.resize(Size::new(width: 12, height: 3))
+    assert(harness.screen() == "Counter\n  Count: 7\nUp/+ add  Do")
+}
