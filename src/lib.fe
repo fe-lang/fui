@@ -7,3 +7,4 @@ pub use text
 pub use buffer
 pub use frame
 pub use theme
+pub use layout

@@ -1,0 +1,397 @@
+//! Splitting a rectangle into rows or columns by constraints.
+//!
+//! ```fe
+//! use tui::layout::Constraint::{Fill, Length}
+//!
+//! let (head, body, status) = area.rows((Length(1), Fill(1), Length(1)))
+//! let parts = area.columns([Length(20), Fill(1)])   // [Rect; 2]
+//! let (left, right) = Layout::columns().spacing(1).split(area, (Fill(1), Fill(2)))
+//! ```
+//!
+//! A split takes the constraints as a tuple of 2 to 6, which gives a tuple
+//! of rectangles; an array `[Constraint; N]`, which gives `[Rect; N]`; or a
+//! `MemSlice<Constraint>`, which gives a `MemVec<Rect>`. Each constraint
+//! makes one segment, in order: top to bottom for rows, left to right for
+//! columns. The solver works in integers, and the same input always gives
+//! the same output.
+//!
+//! The *length* is the area's height for rows and its width for columns,
+//! after the margin. The gaps of `spacing` come out of it first; if they
+//! take more than all of it, each gap shrinks to `length / (n - 1)`. What is
+//! left is the *room* the segments share:
+//!
+//! 1. Each segment asks for a size: `Length(n)`, `Min(n)` and `Max(n)` ask
+//!    for `n`, `Percent(p)` for `room * p / 100` and `Ratio(a, b)` for
+//!    `room * a / b` (rounded down; at most the room; 0 if `b` is 0), and
+//!    `Fill(w)` for nothing.
+//! 2. The room goes to the requests in this order of priority: every
+//!    `Length`, then every `Min`, then every `Percent` and `Ratio`, then
+//!    every `Max`; within each, from the first segment on. When the room
+//!    runs out, the segment it runs out at gets what is left and the later
+//!    ones nothing.
+//! 3. The room left grows the `Fill` segments, in proportion to their
+//!    weights: each gets `left * w / total_weight`, rounded down, and the
+//!    units the rounding leaves go one each to the first `Fill` segments of
+//!    weight above 0. The sizes then sum to the length exactly. Without a
+//!    `Fill` of weight above 0, the `Min` segments grow instead, equally,
+//!    the same way.
+//! 4. Without segments to grow, the room left is placed by the `Flex`:
+//!    after the segments (`Start`, the default), before them (`End`), half
+//!    before, rounded down, and the rest after (`Center`), or spread over
+//!    the gaps, the units of rounding going to the first gaps
+//!    (`SpaceBetween`, which is `Start` for one segment).
+//!
+//! So `Length`, `Percent` and `Ratio` segments get their size whenever it
+//! fits, a `Min(n)` segment is at least `n` and a `Max(n)` one at most `n`
+//! whenever the room holds every `Length` and `Min`, and segments never
+//! overlap or leave the area. Every segment spans the area's other side
+//! whole. An empty list of constraints makes no segments, and an area
+//! without length makes segments without length at its start.
+use core::iter::Collection
+use core::ops::{Eq, Index, Len}
+use super::geom::Rect
+
+/// What one segment of a split asks for.
+pub enum Constraint {
+    /// Exactly this many cells.
+    Length(u16),
+    /// At least this many cells; grows when no `Fill` takes the room left.
+    Min(u16),
+    /// At most this many cells, and this many if they are left.
+    Max(u16),
+    /// This share of the room, in percent.
+    Percent(u16),
+    /// This share of the room: the first number over the second.
+    Ratio(u32, u32),
+    /// A share of the room left over, in proportion to this weight.
+    Fill(u16),
+}
+
+impl Copy for Constraint {}
+
+impl Eq for Constraint {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (Constraint::Length(a), Constraint::Length(b)) => a == b,
+            (Constraint::Min(a), Constraint::Min(b)) => a == b,
+            (Constraint::Max(a), Constraint::Max(b)) => a == b,
+            (Constraint::Percent(a), Constraint::Percent(b)) => a == b,
+            (Constraint::Ratio(a, b), Constraint::Ratio(c, d)) => a == c && b == d,
+            (Constraint::Fill(a), Constraint::Fill(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Where the room the segments leave goes.
+pub enum Flex {
+    /// After the segments.
+    Start,
+    /// Half before them and half after.
+    Center,
+    /// Before them.
+    End,
+    /// Between them.
+    SpaceBetween,
+}
+
+impl Copy for Flex {}
+
+impl Eq for Flex {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (Flex::Start, Flex::Start) => true,
+            (Flex::Center, Flex::Center) => true,
+            (Flex::End, Flex::End) => true,
+            (Flex::SpaceBetween, Flex::SpaceBetween) => true,
+            _ => false,
+        }
+    }
+}
+
+// Which side of the area a split divides.
+enum Direction {
+    Rows,
+    Columns,
+}
+
+impl Copy for Direction {}
+
+/// How to split an area: into rows or columns, with a margin around them,
+/// spacing between them and a `Flex` for the room they leave.
+pub struct Layout { direction: Direction, margin: u16, spacing: u16, flex: Flex }
+
+impl Copy for Layout {}
+
+impl Layout {
+    /// Rows, top to bottom, without margin or spacing.
+    pub fn rows() -> Self {
+        Layout { direction: Direction::Rows, margin: 0, spacing: 0, flex: Flex::Start }
+    }
+
+    /// Columns, left to right, without margin or spacing.
+    pub fn columns() -> Self {
+        Layout { direction: Direction::Columns, margin: 0, spacing: 0, flex: Flex::Start }
+    }
+
+    /// This layout, leaving `margin` cells on every side of the area.
+    pub fn margin(own self, _ margin: u16) -> Self {
+        Layout { direction: self.direction, margin, spacing: self.spacing, flex: self.flex }
+    }
+
+    /// This layout, with `spacing` cells between segments.
+    pub fn spacing(own self, _ spacing: u16) -> Self {
+        Layout { direction: self.direction, margin: self.margin, spacing, flex: self.flex }
+    }
+
+    /// This layout, placing the room the segments leave by `flex`.
+    pub fn flex(own self, _ flex: Flex) -> Self {
+        Layout { direction: self.direction, margin: self.margin, spacing: self.spacing, flex }
+    }
+
+    /// The segments of `area` for `constraints`: a tuple of 2 to 6
+    /// constraints, an array or a slice of them.
+    pub fn split<S: Split>(self, _ area: Rect, _ constraints: S) -> S::Output {
+        constraints.split(self, area)
+    }
+
+    // Writes the segments of `area` for `constraints` into `out`, which
+    // holds as many rectangles. The sizes are kept in the rectangles'
+    // widths until the last pass places them.
+    fn solve<C: Collection<Item = Constraint> + Len, O: mut Index<usize, Output = Rect>>(
+        self,
+        _ area: Rect,
+        _ constraints: C,
+        _ out: mut O,
+    )
+    uses (C::E, O::E)
+    {
+        let n = constraints.len()
+        if n == 0 { return }
+        let inner = area.inner(self.margin)
+        let length: u32 = match self.direction {
+            Direction::Rows => inner.height as u32,
+            Direction::Columns => inner.width as u32,
+        }
+        let gaps: u32 = (n - 1).downcast_saturate()
+        var spacing = self.spacing as u32
+        if gaps > 0 && spacing * gaps > length {
+            spacing = length / gaps
+        }
+        let room = length - spacing * gaps
+
+        // The requests, by priority.
+        var left = room
+        for rank in [0, 1, 2, 3] {
+            for (i, constraint) in constraints.enumerate() {
+                if priority(constraint) == rank {
+                    let size = min(request(constraint, room), left)
+                    out[i] = sized(size)
+                    left -= size
+                }
+            }
+        }
+
+        // Growth: the `Fill` segments, or else the `Min` ones.
+        var by_min = false
+        var weights = total_weight(constraints, by_min)
+        if weights == 0 {
+            by_min = true
+            weights = total_weight(constraints, by_min)
+        }
+        if weights > 0 && left > 0 {
+            var given: u32 = 0
+            for (i, constraint) in constraints.enumerate() {
+                let share: u32 = (left as u64 * weight(constraint, by_min) / weights)
+                    .downcast_truncate()
+                out[i] = sized(out[i].width as u32 + share)
+                given += share
+            }
+            var units = left - given
+            for (i, constraint) in constraints.enumerate() {
+                if units > 0 && weight(constraint, by_min) > 0 {
+                    out[i] = sized(out[i].width as u32 + 1)
+                    units -= 1
+                }
+            }
+            left = 0
+        }
+
+        // Placement.
+        let (lead, extra, extra_units): (u32, u32, u32) = match self.flex {
+            Flex::Start => (0, 0, 0),
+            Flex::Center => (left / 2, 0, 0),
+            Flex::End => (left, 0, 0),
+            Flex::SpaceBetween => if gaps > 0 {
+                (0, left / gaps, left % gaps)
+            } else {
+                (0, 0, 0)
+            },
+        }
+        let start: u32 = match self.direction {
+            Direction::Rows => inner.y as u32,
+            Direction::Columns => inner.x as u32,
+        }
+        var offset = start + lead
+        for (i, _) in constraints.enumerate() {
+            let size = out[i].width
+            let at: u16 = offset.downcast_truncate()
+            out[i] = match self.direction {
+                Direction::Rows => Rect { x: inner.x, y: at, width: inner.width, height: size },
+                Direction::Columns => Rect { x: at, y: inner.y, width: size, height: inner.height },
+            }
+            let gap: u32 = i.downcast_saturate()
+            offset += size as u32 + spacing + extra + if gap < extra_units { 1 } else { 0 }
+        }
+    }
+}
+
+// The rank of the constraint's request: 0 is served first; 4 asks nothing.
+fn priority(_ constraint: Constraint) -> u8 {
+    match constraint {
+        Constraint::Length(_) => 0,
+        Constraint::Min(_) => 1,
+        Constraint::Percent(_) => 2,
+        Constraint::Ratio(_, _) => 2,
+        Constraint::Max(_) => 3,
+        Constraint::Fill(_) => 4,
+    }
+}
+
+// The size the constraint asks for out of `room`.
+fn request(_ constraint: Constraint, _ room: u32) -> u32 {
+    match constraint {
+        Constraint::Length(n) => n as u32,
+        Constraint::Min(n) => n as u32,
+        Constraint::Max(n) => n as u32,
+        Constraint::Percent(p) => min(room * p as u32 / 100, room),
+        Constraint::Ratio(a, b) => {
+            if b == 0 {
+                0
+            } else {
+                let share: u64 = room as u64 * a as u64 / b as u64
+                if share < room as u64 {
+                    share.downcast_truncate()
+                } else {
+                    room
+                }
+            }
+        },
+        Constraint::Fill(_) => 0,
+    }
+}
+
+// The constraint's weight in growth by `Fill` weights, or by `Min` if
+// `by_min`.
+fn weight(_ constraint: Constraint, _ by_min: bool) -> u64 {
+    match constraint {
+        Constraint::Fill(w) => if by_min { 0 } else { w as u64 },
+        Constraint::Min(_) => if by_min { 1 } else { 0 },
+        _ => 0,
+    }
+}
+
+fn total_weight<C: Collection<Item = Constraint>>(_ constraints: C, _ by_min: bool) -> u64
+uses C::E
+{
+    constraints.fold(0, |total, constraint| total + weight(constraint, by_min))
+}
+
+// A rectangle holding a segment's size, `size` being at most a length.
+fn sized(_ size: u32) -> Rect {
+    Rect { x: 0, y: 0, width: size.downcast_truncate(), height: 0 }
+}
+
+fn min(_ a: u32, _ b: u32) -> u32 {
+    if a < b { a } else { b }
+}
+
+/// Constraints a `Layout` splits an area by, and the segments that gives.
+pub trait Split {
+    /// The segments: one rectangle for each constraint.
+    type Output
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> Self::Output
+}
+
+/// `N` constraints give `N` rectangles.
+impl<const N: usize> Split for [Constraint; N] {
+    type Output = [Rect; N]
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> [Rect; N] {
+        var out: [Rect; N] = [Rect::ZERO; N]
+        layout.solve(area, self, mut out)
+        out
+    }
+}
+
+/// Constraints counted at run time give a rectangle for each.
+impl Split for MemSlice<Constraint> {
+    type Output = MemVec<Rect>
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> MemVec<Rect> {
+        var out = MemVec::with_capacity(self.len())
+        for _ in self {
+            out.push(Rect::ZERO)
+        }
+        layout.solve(area, self, mut out)
+        out
+    }
+}
+
+impl Split for (Constraint, Constraint) {
+    type Output = (Rect, Rect)
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> (Rect, Rect) {
+        let r = layout.split(area, [self.0, self.1])
+        (r[0], r[1])
+    }
+}
+
+impl Split for (Constraint, Constraint, Constraint) {
+    type Output = (Rect, Rect, Rect)
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> (Rect, Rect, Rect) {
+        let r = layout.split(area, [self.0, self.1, self.2])
+        (r[0], r[1], r[2])
+    }
+}
+
+impl Split for (Constraint, Constraint, Constraint, Constraint) {
+    type Output = (Rect, Rect, Rect, Rect)
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> (Rect, Rect, Rect, Rect) {
+        let r = layout.split(area, [self.0, self.1, self.2, self.3])
+        (r[0], r[1], r[2], r[3])
+    }
+}
+
+impl Split for (Constraint, Constraint, Constraint, Constraint, Constraint) {
+    type Output = (Rect, Rect, Rect, Rect, Rect)
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
+        let r = layout.split(area, [self.0, self.1, self.2, self.3, self.4])
+        (r[0], r[1], r[2], r[3], r[4])
+    }
+}
+
+impl Split for (Constraint, Constraint, Constraint, Constraint, Constraint, Constraint) {
+    type Output = (Rect, Rect, Rect, Rect, Rect, Rect)
+
+    fn split(self, _ layout: Layout, _ area: Rect) -> (Rect, Rect, Rect, Rect, Rect, Rect) {
+        let r = layout.split(area, [self.0, self.1, self.2, self.3, self.4, self.5])
+        (r[0], r[1], r[2], r[3], r[4], r[5])
+    }
+}
+
+impl Rect {
+    /// This rectangle split into rows by `constraints`; see `Layout`.
+    pub fn rows<S: Split>(self, _ constraints: S) -> S::Output {
+        constraints.split(Layout::rows(), self)
+    }
+
+    /// This rectangle split into columns by `constraints`; see `Layout`.
+    pub fn columns<S: Split>(self, _ constraints: S) -> S::Output {
+        constraints.split(Layout::columns(), self)
+    }
+}
