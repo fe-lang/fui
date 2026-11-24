@@ -1,0 +1,47 @@
+//! Text as terminals show it: UTF-8 scalars, grapheme clusters and the
+//! columns they take.
+use core::MemSpan
+
+/// A grapheme cluster at the start of some text: what a terminal shows in
+/// one place, such as a letter with its combining marks or an emoji sequence.
+pub struct Cluster {
+    /// Its bytes.
+    pub len: usize,
+    /// The columns it takes: 0, 1 or 2.
+    pub width: u8,
+}
+
+impl Copy for Cluster {}
+
+/// The cluster of `text` that starts at byte `offset`, which must be less
+/// than `text.len()`. Invalid UTF-8 is one cluster per byte, of width 1.
+pub fn next_cluster(_ text: MemSpan, _ offset: usize) -> Cluster {
+    // Placeholder: one scalar per cluster, each of width 1.
+    let lead = text[offset]
+    let len: usize = if lead < 0x80 {
+        1
+    } else if lead >= 0xf0 {
+        4
+    } else if lead >= 0xe0 {
+        3
+    } else if lead >= 0xc0 { 2 } else { 1 }
+    let rest = text.len() - offset
+    Cluster { len: if len > rest { 1 } else { len }, width: 1 }
+}
+
+/// The columns `text` takes.
+pub fn width(_ text: MemSpan) -> usize {
+    var columns: usize = 0
+    var offset: usize = 0
+    while offset < text.len() {
+        let cluster = next_cluster(text, offset)
+        columns += cluster.width as usize
+        offset += cluster.len
+    }
+    columns
+}
+
+#[test]
+fn ascii_takes_one_column_a_byte() {
+    assert(width(format!("hello").span()) == 5)
+}
