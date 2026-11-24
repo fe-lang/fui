@@ -128,13 +128,8 @@ impl Items {
     }
 
     fn handle_mouse(mut self, _ mouse: Mouse) {
-        if self.detail_area.contains(mouse.pos) {
-            match mouse.kind {
-                MouseKind::ScrollDown => self.detail.scroll_by(3),
-                MouseKind::ScrollUp => self.detail.scroll_by(-3),
-                _ => {},
-            }
-        } else if let Option::Some(_) = self.list.handle_mouse(mouse) {
+        if !self.detail.handle_mouse(mouse, self.detail_area)
+            && self.list.handle_mouse(mouse).is_some() {
             self.detail.to_start()
         }
     }

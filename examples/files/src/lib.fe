@@ -22,7 +22,6 @@ use std::term::Tty
 use std::time::Clock
 use tui::prelude::*
 use tui::text::valid_up_to
-use tui::widgets::WHEEL_ROWS
 
 // The bytes of a file the preview reads: more than a screen shows.
 const PREVIEW_BYTES: usize = 8192
@@ -231,13 +230,8 @@ impl App for Browser {
             Event::Mouse(mouse) => {
                 if self.list.handle_mouse(mouse).is_some() {
                     self.load_preview()
-                } else if self.preview_area.contains(mouse.pos) {
-                    match mouse.kind {
-                        MouseKind::ScrollDown => self.preview_scroll.scroll_by(WHEEL_ROWS as isize),
-                        MouseKind::ScrollUp => self.preview_scroll
-                            .scroll_by(-(WHEEL_ROWS as isize)),
-                        _ => {},
-                    }
+                } else {
+                    let _ = self.preview_scroll.handle_mouse(mouse, self.preview_area)
                 }
                 Flow::Redraw
             },
