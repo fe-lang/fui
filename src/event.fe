@@ -226,12 +226,21 @@ impl KeyKind {
 }
 
 /// A key. Keypad keys are reported as the keys they stand for: the keypad
-/// `5` as `Char('5')`, keypad Enter as `Enter`, keypad arrows as arrows.
+/// `5` as `Char(b'5')`, keypad Enter as `Enter`, keypad arrows as arrows.
+///
+/// A key that types a character is `Char` for printable ASCII, so that
+/// patterns can name it with a byte literal (`KeyCode::Char(b'q')`), and
+/// `Unicode` for any other character. Both hold the character as typed:
+/// Shift+A from a plain terminal is `Char(b'A')`, since only the kitty
+/// protocol reports Shift with a character key. A letter with Ctrl is
+/// lowercase, `Char(b'c')` with `Modifiers::CTRL` for Ctrl+C, and it holds
+/// `Modifiers::SHIFT` too only where the terminal reports Ctrl+Shift+C
+/// apart from Ctrl+C, which only the kitty protocol does.
 pub enum KeyCode {
-    /// A key that types a character: the Unicode scalar value it types, as
-    /// typed (`'A'` for Shift+A from a plain terminal). A key with Ctrl is
-    /// its lowercase letter: Ctrl+A is `Char('a')` with `Modifiers::CTRL`.
-    Char(u32),
+    /// A printable ASCII character, `b' '` to `b'~'`.
+    Char(u8),
+    /// A character outside ASCII: its Unicode scalar value.
+    Unicode(u32),
     Enter,
     Tab,
     /// Shift+Tab. Its `Key` does not hold `Modifiers::SHIFT` for the shift
@@ -274,16 +283,31 @@ impl Eq for KeyCode {
 }
 
 impl KeyCode {
-    /// The key that types the ASCII character `c`.
-    pub fn char(_ c: u8) -> Self {
-        KeyCode::Char(c as u32)
+    /// The key that types the Unicode scalar value `scalar`: `Char` for
+    /// printable ASCII, `Unicode` for anything else.
+    pub fn from_scalar(_ scalar: u32) -> Self {
+        if scalar >= 0x20 && scalar < 0x7f {
+            KeyCode::Char(scalar.downcast_truncate())
+        } else {
+            KeyCode::Unicode(scalar)
+        }
     }
 
-    // A number for each code: a character's scalar below 2^21, other keys
-    // above.
+    /// The character this key types, as a Unicode scalar value.
+    pub fn scalar(self) -> Option<u32> {
+        match self {
+            KeyCode::Char(c) => Option::Some(c as u32),
+            KeyCode::Unicode(c) => Option::Some(c),
+            _ => Option::None,
+        }
+    }
+
+    // A number for each code: an ASCII character's byte, another
+    // character's scalar above 2^24, other keys between.
     fn id(self) -> u32 {
         match self {
-            KeyCode::Char(c) => c & 0x1fffff,
+            KeyCode::Char(c) => c as u32,
+            KeyCode::Unicode(c) => 0x1000000 | c,
             KeyCode::F(n) => 0x400000 | n as u32,
             KeyCode::Modifier(m) => 0x800000 | m.bits() as u32,
             KeyCode::Enter => 0x200001,
@@ -358,26 +382,37 @@ impl Key {
     /// Whether this is a press or repeat of the key that types the ASCII
     /// character `c`, with no modifier: `key.is_char(b'q')`.
     pub fn is_char(self, _ c: u8) -> bool {
-        self.pressed(KeyCode::char(c), Modifiers::NONE)
+        self.pressed(KeyCode::Char(c), Modifiers::NONE)
     }
 
     /// Whether this is Ctrl and the ASCII character `c`, in either case:
     /// `key.ctrl(b'c')` is Ctrl+C.
     pub fn ctrl(self, _ c: u8) -> bool {
-        self.pressed(KeyCode::char(ascii_lower(c)), Modifiers::CTRL)
+        self.pressed(KeyCode::Char(ascii_lower(c)), Modifiers::CTRL)
     }
 
     /// Whether this is Alt and the ASCII character `c`, as typed: Alt+Shift+A
     /// from a plain terminal is `alt(b'A')`.
     pub fn alt(self, _ c: u8) -> bool {
-        self.pressed(KeyCode::char(c), Modifiers::ALT)
+        self.pressed(KeyCode::Char(c), Modifiers::ALT)
     }
 
-    /// The character this key types, whatever its modifiers.
-    pub fn char(self) -> Option<u32> {
-        match self.code {
-            KeyCode::Char(c) => Option::Some(c),
-            _ => Option::None,
+    /// The character this key types, as a Unicode scalar value, whatever
+    /// its modifiers.
+    pub fn scalar(self) -> Option<u32> {
+        self.code.scalar()
+    }
+
+    /// Appends the character this key types to `out` as UTF-8, if it types
+    /// one: whether it did. A text field calls this for a key press without
+    /// Ctrl, Alt or Super.
+    pub fn push_text(self, _ out: mut MemBuffer) -> bool {
+        match self.code.scalar() {
+            Option::Some(c) => {
+                push_utf8(mut out, c)
+                true
+            },
+            Option::None => false,
         }
     }
 }
@@ -390,13 +425,14 @@ impl Display for Key {
     fn fmt(self, _ out: mut MemBuffer) {
         write!(mut out, self.mods)
         match self.code {
-            KeyCode::Char(c) => if c == 32 {
+            KeyCode::Char(c) => if c == b' ' {
                 write!(mut out, "Space")
-            } else if self.mods.contains(Modifiers::CTRL) && c >= 97 && c <= 122 {
-                out.push((c - 32).downcast_truncate())
+            } else if self.mods.contains(Modifiers::CTRL) && c >= b'a' && c <= b'z' {
+                out.push(c - 32)
             } else {
-                push_utf8(mut out, c)
+                out.push(c)
             },
+            KeyCode::Unicode(c) => push_utf8(mut out, c),
             KeyCode::F(n) => write!(mut out, "F", n),
             KeyCode::Modifier(m) => {
                 // The modifier's name without its `+`.
@@ -589,7 +625,7 @@ pub enum Reply {
     /// The kitty keyboard protocol flags in effect, answering
     /// `request_keyboard_flags`. Terminals without the protocol do not
     /// answer.
-    KeyboardFlags(u8),
+    KeyboardFlags(KeyboardFlags),
     /// The primary device attributes, answering `request_device_attributes`.
     /// Every terminal answers, so a program sends this query after others
     /// to learn that they went unanswered.
@@ -648,12 +684,63 @@ impl Display for Reply {
                 pos.y,
                 ")",
             ),
-            Reply::KeyboardFlags(flags) => write!(mut out, "KeyboardFlags(", flags, ")"),
+            Reply::KeyboardFlags(flags) => write!(mut out, "KeyboardFlags(", flags.bits(), ")"),
             Reply::DeviceAttributes => write!(mut out, "DeviceAttributes"),
             Reply::Mode(mode, setting) => write!(mut out, "Mode(", mode, ",", setting.value(), ")"),
             Reply::Foreground(r, g, b) => write!(mut out, "Foreground(", r, ",", g, ",", b, ")"),
             Reply::Background(r, g, b) => write!(mut out, "Background(", r, ",", g, ",", b, ")"),
         }
+    }
+}
+
+/// The progressive enhancements of the kitty keyboard protocol, which
+/// `tui::input::push_keyboard_flags` asks for. The parser reads every form
+/// they produce, and ignores the alternate keys and the text they add.
+pub struct KeyboardFlags { bits: u8 }
+
+impl Copy for KeyboardFlags {}
+
+impl Eq for KeyboardFlags {
+    fn eq(self, _ other: Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+impl BitOr for KeyboardFlags {
+    fn bitor(own self, _ other: own Self) -> Self {
+        KeyboardFlags { bits: self.bits | other.bits }
+    }
+}
+
+impl KeyboardFlags {
+    /// The legacy encoding.
+    pub const NONE: KeyboardFlags = KeyboardFlags { bits: 0 }
+    /// Report Esc, keys with Ctrl or Alt, and keypad keys as unambiguous
+    /// `CSI u` sequences. Plain text, Enter, Tab and Backspace keep their
+    /// legacy bytes. A lone Esc then needs no timeout.
+    pub const DISAMBIGUATE: KeyboardFlags = KeyboardFlags { bits: 1 }
+    /// Report repeats and releases, of keys sent as sequences.
+    pub const REPORT_EVENT_TYPES: KeyboardFlags = KeyboardFlags { bits: 2 }
+    /// Add the shifted and base layout keys, which the parser ignores.
+    pub const REPORT_ALTERNATE_KEYS: KeyboardFlags = KeyboardFlags { bits: 4 }
+    /// Report every key as a sequence, text keys and modifier keys too. A
+    /// character key then holds its unshifted character with
+    /// `Modifiers::SHIFT`: Shift+A is `Char(b'a')` with Shift.
+    pub const REPORT_ALL_KEYS: KeyboardFlags = KeyboardFlags { bits: 8 }
+    /// Add the text a key types, which the parser ignores.
+    pub const REPORT_TEXT: KeyboardFlags = KeyboardFlags { bits: 16 }
+
+    pub fn from_bits(_ bits: u8) -> Self {
+        KeyboardFlags { bits: bits & 31 }
+    }
+
+    pub fn bits(self) -> u8 {
+        self.bits
+    }
+
+    /// Whether every flag of `other` is in this set.
+    pub fn contains(self, _ other: KeyboardFlags) -> bool {
+        self.bits & other.bits == other.bits
     }
 }
 
@@ -716,15 +803,15 @@ impl ModeSetting {
 fn keys_display_as_help_screens_show_them() {
     assert(
         format!(
-                Key::new(KeyCode::char(b'a'), Modifiers::CTRL | Modifiers::SHIFT),
+                Key::new(KeyCode::Char(b'a'), Modifiers::CTRL | Modifiers::SHIFT),
             )
             == "Ctrl+Shift+A",
     )
     assert(
-        format!(Key::new(KeyCode::char(b'x'), Modifiers::ALT)) == "Alt+x",
+        format!(Key::new(KeyCode::Char(b'x'), Modifiers::ALT)) == "Alt+x",
     )
     assert(
-        format!(Key::new(KeyCode::char(b' '), Modifiers::CTRL)) == "Ctrl+Space",
+        format!(Key::new(KeyCode::Char(b' '), Modifiers::CTRL)) == "Ctrl+Space",
     )
     assert(format!(Key::new(KeyCode::F(5), Modifiers::NONE)) == "F5")
     assert(format!(Key::new(KeyCode::Esc, Modifiers::NONE)) == "Esc")
@@ -737,7 +824,7 @@ fn keys_display_as_help_screens_show_them() {
             ) == "Shift+Shift",
     )
     assert(
-        format!(Key::new(KeyCode::Char(0xe9), Modifiers::NONE)) == "é",
+        format!(Key::new(KeyCode::Unicode(0xe9), Modifiers::NONE)) == "é",
     )
     assert(
         format!(
@@ -758,17 +845,17 @@ fn keys_display_as_help_screens_show_them() {
 
 #[test]
 fn key_predicates_match_presses_with_exact_modifiers() {
-    let ctrl_c = Key::new(KeyCode::char(b'c'), Modifiers::CTRL)
+    let ctrl_c = Key::new(KeyCode::Char(b'c'), Modifiers::CTRL)
     assert(ctrl_c.ctrl(b'c') && ctrl_c.ctrl(b'C'))
     assert(!ctrl_c.is_char(b'c') && !ctrl_c.alt(b'c'))
     assert(
-        !Key::new(KeyCode::char(b'c'), Modifiers::CTRL | Modifiers::SHIFT).ctrl(b'c'),
+        !Key::new(KeyCode::Char(b'c'), Modifiers::CTRL | Modifiers::SHIFT).ctrl(b'c'),
     )
     assert(!ctrl_c.with_kind(KeyKind::Release).ctrl(b'c'))
     assert(ctrl_c.with_kind(KeyKind::Repeat).ctrl(b'c'))
-    let q = Key::new(KeyCode::char(b'q'), Modifiers::NONE)
+    let q = Key::new(KeyCode::Char(b'q'), Modifiers::NONE)
     assert(
-        q.is_char(b'q') && !q.is_char(b'Q') && q.char() == Option::Some(113),
+        q.is_char(b'q') && !q.is_char(b'Q') && q.scalar() == Option::Some(113),
     )
     assert(
         Key::new(KeyCode::Enter, Modifiers::NONE).is(KeyCode::Enter),
@@ -779,9 +866,9 @@ fn key_predicates_match_presses_with_exact_modifiers() {
     assert(
         Key::new(KeyCode::Enter, Modifiers::SHIFT).pressed(KeyCode::Enter, Modifiers::SHIFT),
     )
-    assert(Key::new(KeyCode::Up, Modifiers::NONE).char().is_none())
+    assert(Key::new(KeyCode::Up, Modifiers::NONE).scalar().is_none())
     assert(
-        KeyCode::F(1) != KeyCode::F(2) && KeyCode::Char(1) != KeyCode::Enter,
+        KeyCode::F(1) != KeyCode::F(2) && KeyCode::Char(65) != KeyCode::Unicode(65),
     )
 }
 
@@ -830,4 +917,84 @@ fn events_compare_by_value() {
     assert(
         ModeSetting::from_value(3).is_set() && !ModeSetting::from_value(9).is_recognized(),
     )
+}
+
+// What a program's `update` would do with `event`, matched as programs match.
+fn action(_ event: Event) -> u8 {
+    match event {
+        Event::Key(
+            Key { code: KeyCode::Char(b'q'), mods, kind: KeyKind::Press },
+        ) => if mods.is_empty() {
+            1
+        } else if mods == Modifiers::CTRL { 2 } else { 3 },
+        Event::Key(Key { code: KeyCode::Unicode(0xe9), .. }) => 4,
+        Event::Key(Key { code: KeyCode::F(5), mods, .. }) => if mods.contains(Modifiers::SHIFT) {
+            6
+        } else {
+            5
+        },
+        Event::Mouse(Mouse { kind: MouseKind::Down(MouseButton::Left), pos, .. }) => if pos.x == 2 {
+            7
+        } else {
+            0
+        },
+        Event::Paste(ref text) => text.len().downcast_truncate(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn events_match_with_byte_literal_patterns() {
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'q'), Modifiers::NONE))) == 1,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'q'), Modifiers::CTRL))) == 2,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'q'), Modifiers::ALT))) == 3,
+    )
+    assert(
+        action(
+                Event::Key(
+                    Key::new(KeyCode::Char(b'q'), Modifiers::NONE).with_kind(KeyKind::Release),
+                ),
+            )
+            == 0,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::Char(b'Q'), Modifiers::NONE))) == 0,
+    )
+    assert(
+        action(
+                Event::Key(Key::new(KeyCode::from_scalar(0xe9), Modifiers::NONE)),
+            ) == 4,
+    )
+    assert(
+        action(Event::Key(Key::new(KeyCode::F(5), Modifiers::SHIFT))) == 6,
+    )
+    let click = Mouse::new(
+        MouseKind::Down(MouseButton::Left),
+        Pos::new(x: 2, y: 0),
+        Modifiers::NONE,
+    )
+    assert(action(Event::Mouse(click)) == 7)
+    assert(action(Event::Paste(format!("hello"))) == 5)
+    assert(KeyCode::from_scalar(0x41) == KeyCode::Char(b'A'))
+    assert(KeyCode::from_scalar(0x7f) == KeyCode::Unicode(0x7f))
+}
+
+#[test]
+fn keys_append_their_text() {
+    var text = MemBuffer::empty()
+    assert(
+        Key::new(KeyCode::Char(b'h'), Modifiers::NONE).push_text(mut text),
+    )
+    assert(
+        Key::new(KeyCode::Unicode(0x20ac), Modifiers::NONE).push_text(mut text),
+    )
+    assert(
+        !Key::new(KeyCode::Enter, Modifiers::NONE).push_text(mut text),
+    )
+    assert(text == "h€")
 }
