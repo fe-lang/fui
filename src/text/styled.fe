@@ -1,0 +1,244 @@
+//! Styled text: lines of text in runs of styles, and blocks of lines.
+use core::{MemBuffer, MemSlice, MemSpan, MemVec}
+use core::iter::Collection
+use core::ops::Eq
+use std::io::Display
+use ingot::style::Style
+use super::width
+
+/// Where content narrower than its area sits in it.
+pub enum Alignment {
+    Left,
+    Center,
+    Right,
+}
+
+impl Copy for Alignment {}
+
+impl Eq for Alignment {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (Alignment::Left, Alignment::Left) => true,
+            (Alignment::Center, Alignment::Center) => true,
+            (Alignment::Right, Alignment::Right) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Alignment {
+    /// The columns before content `width` columns wide in `available`
+    /// columns: none if it does not fit. Centered content that cannot sit
+    /// exactly in the middle leans left.
+    pub fn offset(self, width: usize, available: usize) -> usize {
+        if width >= available {
+            return 0
+        }
+        match self {
+            Alignment::Left => 0,
+            Alignment::Center => (available - width) / 2,
+            Alignment::Right => available - width,
+        }
+    }
+}
+
+/// A part of a line in one style: the bytes `start..end` of its text.
+pub struct Run { pub start: usize, pub end: usize, pub style: Style }
+
+impl Copy for Run {}
+
+impl Eq for Run {
+    fn eq(self, _ other: Self) -> bool {
+        self.start == other.start && self.end == other.end && self.style == other.style
+    }
+}
+
+// A run as a line stores it: it starts where the one before ends.
+struct Stored { end: usize, style: Style }
+
+impl Copy for Stored {}
+
+/// One line of text in runs of styles: its bytes and, for each run, where
+/// it ends and its style. Adjacent pushes in one style make one run, and an
+/// empty push makes none. A line is a collection of its runs, in order:
+/// `for run in line { draw(line.text().slice(offset: run.start, len:
+/// run.end - run.start), run.style) }`.
+///
+/// A line holds no line breaks: an LF in it is a control, which takes no
+/// column. `Text::from` splits text into lines.
+pub struct Line { text: MemBuffer, runs: MemVec<Stored> }
+
+impl Line {
+    /// An empty line.
+    pub fn new() -> Self {
+        Line { text: MemBuffer::empty(), runs: MemVec::new() }
+    }
+
+    /// A line of `value`'s text with no style.
+    pub fn from<T: Display>(_ value: T) -> Self {
+        Line::styled(value, Style::NONE)
+    }
+
+    /// A line of `value`'s text in `style`.
+    pub fn styled<T: Display>(_ value: T, _ style: Style) -> Self {
+        var line = Line::new()
+        line.push(value, style)
+        line
+    }
+
+    /// Appends `value`'s text in `style`.
+    pub fn push<T: Display>(mut self, _ value: T, _ style: Style) {
+        let start = self.text.len()
+        value.fmt(mut self.text)
+        let end = self.text.len()
+        if end == start { return }
+        let last = self.runs.len()
+        if last > 0 && self.runs[last - 1].style == style {
+            self.runs[last - 1].end = end
+        } else {
+            self.runs.push(Stored { end, style })
+        }
+    }
+
+    /// Empties the line, keeping its memory for the next text.
+    pub fn clear(mut self) {
+        self.text.clear()
+        self.runs.clear()
+    }
+
+    /// Its bytes.
+    pub fn text(self) -> ref MemSpan {
+        self.text.span()
+    }
+
+    /// Its length in bytes.
+    pub fn len(self) -> usize {
+        self.text.len()
+    }
+
+    /// Whether it has no text.
+    pub fn is_empty(self) -> bool {
+        self.text.len() == 0
+    }
+
+    /// The columns it takes.
+    pub fn width(self) -> usize {
+        width(self.text.span())
+    }
+
+    /// The number of runs.
+    pub fn run_count(self) -> usize {
+        self.runs.len()
+    }
+
+    /// The run at `index`, which must be less than `run_count()`.
+    pub fn run(self, _ index: usize) -> Run {
+        let start = if index == 0 {
+            0
+        } else {
+            self.runs[index - 1].end
+        }
+        let stored = self.runs[index]
+        Run { start, end: stored.end, style: stored.style }
+    }
+}
+
+impl Collection for Line {
+    type Cursor = usize
+    type Item = Run
+
+    fn start(self) -> usize {
+        0
+    }
+
+    fn has(self, _ c: usize) -> bool {
+        c < self.runs.len()
+    }
+
+    fn next(self, _ c: usize) -> usize {
+        c + 1
+    }
+
+    fn at(self, _ c: usize) -> ref Run {
+        self.run(c)
+    }
+}
+
+/// Its text, without styles.
+impl Display for Line {
+    fn fmt(self, _ out: mut MemBuffer) {
+        out.extend_from(self.text.span())
+    }
+}
+
+/// Lines of styled text, top to bottom.
+pub struct Text { lines: MemVec<Line> }
+
+impl Text {
+    /// A text without lines.
+    pub fn new() -> Self {
+        Text { lines: MemVec::new() }
+    }
+
+    /// The lines of `value`'s text with no style, split at each LF and
+    /// CR LF as `str::lines` splits: an empty text has no lines, and a
+    /// final line break starts none.
+    pub fn from<T: Display>(_ value: T) -> Self {
+        var bytes = MemBuffer::empty()
+        value.fmt(mut bytes)
+        let all = bytes.span()
+        var text = Text::new()
+        var start: usize = 0
+        var offset: usize = 0
+        while offset < all.len() {
+            if all[offset] == b'\n' {
+                let end = if offset > start && all[offset - 1] == b'\r' {
+                    offset - 1
+                } else {
+                    offset
+                }
+                text.push_line(Line::from(all.slice(offset: start, len: end - start)))
+                start = offset + 1
+            }
+            offset += 1
+        }
+        if start < all.len() {
+            text.push_line(
+                Line::from(all.slice(offset: start, len: all.len() - start)),
+            )
+        }
+        text
+    }
+
+    /// Appends `line` below the others.
+    pub fn push_line(mut self, _ line: own Line) {
+        self.lines.push(line)
+    }
+
+    /// Removes every line.
+    pub fn clear(mut self) {
+        self.lines.clear()
+    }
+
+    /// The lines, top to bottom.
+    pub fn lines(self) -> ref MemSlice<Line> {
+        self.lines.as_slice()
+    }
+
+    /// The number of lines.
+    pub fn height(self) -> usize {
+        self.lines.len()
+    }
+
+    /// The columns of the widest line.
+    pub fn width(self) -> usize {
+        var widest: usize = 0
+        for ref line in self.lines {
+            let columns = line.width()
+            if columns > widest {
+                widest = columns
+            }
+        }
+        widest
+    }
+}

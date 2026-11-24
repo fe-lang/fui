@@ -10,3 +10,4 @@ pub use theme
 pub use layout
 pub use event
 pub use input
+pub use vt

@@ -1,0 +1,974 @@
+//! A small terminal emulator for tests: `Vt` reads the bytes a program
+//! writes to a terminal, as xterm reads them, and keeps the screen they
+//! draw, so a test can check what a user would see.
+//!
+//! It knows the sequences a full-screen program writes: printable text in
+//! grapheme clusters (`ingot::text`), CR, LF, BS and TAB, cursor motion
+//! (`CSI H f A B C D E F G d`` `), erasure (`CSI J K X`), SGR attributes and
+//! colors, scrolling (`CSI S T`, `ESC D E M`), saving the cursor (`ESC 7 8`,
+//! `CSI s u`), the private modes a session toggles (`CSI ? .. h l`), the
+//! kitty keyboard flag stack (`CSI > u`, `CSI < u`, `CSI = u`) and `ESC c`.
+//! OSC, DCS, SOS, PM and APC strings are skipped up to BEL or ST, and any
+//! other sequence is read to its end and ignored. Scroll regions, insert
+//! and delete, autowrap mode, tab stops other than every 8 columns and
+//! scrollback are not modelled. Encoded C1 controls are ignored.
+//!
+//! Text follows xterm's rules at the right edge: a cluster written in the
+//! last column leaves the cursor there with a pending wrap, which the next
+//! printable cluster takes, moving to the next line (scrolling at the
+//! bottom); any cursor motion or erasure cancels it. A wide cluster takes
+//! two cells, its right half a cell of width 0. One that does not fit in
+//! the last column blanks it and wraps. Writing over either half of a wide
+//! cluster blanks the other half. A scalar that joins the cluster just
+//! written, such as a combining mark, VS16 or the second regional
+//! indicator of a flag, joins its cell, which widens if the cluster does;
+//! a zero-width scalar no cluster takes joins the cell before the cursor.
+use core::{MemBuffer, MemSpan, MemVec, Option}
+use core::mem::replace
+use ingot::geom::{Pos, Size}
+use ingot::style::{Color, Modifier}
+use ingot::text::{Grapheme, REPLACEMENT_CHARACTER, encode, is_control}
+
+/// A cell of the screen: the cluster it shows, the columns that takes,
+/// and its colors and attributes. The right half of a wide cluster is a
+/// cell of width 0 with no symbol; a blank cell shows a space.
+pub struct Cell {
+    symbol: MemBuffer,
+    /// 1, 2 for the left half of a wide cluster, 0 for its right half.
+    pub width: u8,
+    pub fg: Color,
+    pub bg: Color,
+    pub modifier: Modifier,
+}
+
+impl Cell {
+    fn new() -> Self {
+        var symbol = MemBuffer::with_capacity(4)
+        symbol.push(b' ')
+        Cell { symbol, width: 1, fg: Color::RESET, bg: Color::RESET, modifier: Modifier::NONE }
+    }
+
+    /// The UTF-8 of its cluster: empty for the right half of a wide one.
+    pub fn symbol(self) -> ref MemSpan {
+        self.symbol.span()
+    }
+
+    // Blanks the cell with `bg`, as an erasure does.
+    fn erase(mut self, _ bg: Color) {
+        self.clear_symbol()
+        self.fg = Color::RESET
+        self.bg = bg
+        self.modifier = Modifier::NONE
+    }
+
+    // Shows a space in the cell, keeping its colors and attributes.
+    fn clear_symbol(mut self) {
+        self.symbol.clear()
+        self.symbol.push(b' ')
+        self.width = 1
+    }
+
+    fn set(mut self, _ symbol: MemSpan, _ width: u8, _ pen: Pen) {
+        self.symbol.clear()
+        self.symbol.extend_from(symbol)
+        self.width = width
+        self.fg = pen.fg
+        self.bg = pen.bg
+        self.modifier = pen.modifier
+    }
+}
+
+// The colors and attributes text is written in.
+struct Pen { fg: Color, bg: Color, modifier: Modifier }
+
+impl Copy for Pen {}
+
+impl Pen {
+    const DEFAULT: Pen = Pen { fg: Color::RESET, bg: Color::RESET, modifier: Modifier::NONE }
+}
+
+// What `ESC 7` saves.
+struct Saved { x: u16, y: u16, pending_wrap: bool, pen: Pen }
+
+impl Copy for Saved {}
+
+// A grid of cells, row by row, with the state xterm keeps per screen.
+struct Screen {
+    cells: MemVec<Cell>,
+    width: u16,
+    saved: Option<Saved>,
+    // The kitty keyboard flags: the current ones last, above those pushed
+    // before. Never empty.
+    keyboard: MemVec<u32>,
+}
+
+impl Screen {
+    fn new(_ size: Size) -> Self {
+        var cells: MemVec<Cell> = MemVec::with_capacity(size.area())
+        var i: usize = 0
+        while i < size.area() {
+            cells.push(Cell::new())
+            i += 1
+        }
+        var keyboard: MemVec<u32> = MemVec::new()
+        keyboard.push(0)
+        Screen { cells, width: size.width, saved: Option::None, keyboard }
+    }
+
+    fn index(self, _ x: u16, _ y: u16) -> usize {
+        y as usize * self.width as usize + x as usize
+    }
+
+    // Prepares the cells `from..to` of one row, or of whole rows, for new
+    // contents: a wide cluster they cut in half leaves a blank.
+    fn split_edges(mut self, _ from: usize, _ to: usize) {
+        let width = self.width as usize
+        if from < to && self.cells[from].width == 0 && from % width != 0 {
+            self.cells[from - 1].clear_symbol()
+        }
+        if from < to && self.cells[to - 1].width == 2 && to % width != 0 {
+            self.cells[to].clear_symbol()
+        }
+    }
+
+    // Erases the cells `from..to`.
+    fn erase(mut self, _ from: usize, _ to: usize, _ bg: Color) {
+        self.split_edges(from, to)
+        var i = from
+        while i < to {
+            self.cells[i].erase(bg)
+            i += 1
+        }
+    }
+
+    // Moves the rows up by `n`, erasing the rows that come in at the bottom.
+    fn scroll_up(mut self, _ n: usize, _ bg: Color) {
+        let len = self.cells.len()
+        if len == 0 { return }
+        let shift = min(n, len / self.width as usize) * self.width as usize
+        var i: usize = 0
+        while i + shift < len {
+            self.cells.swap(i, i + shift)
+            i += 1
+        }
+        self.erase(len - shift, len, bg)
+    }
+
+    // Moves the rows down by `n`, erasing the rows that come in at the top.
+    fn scroll_down(mut self, _ n: usize, _ bg: Color) {
+        let len = self.cells.len()
+        if len == 0 { return }
+        let shift = min(n, len / self.width as usize) * self.width as usize
+        var i = len
+        while i > shift {
+            i -= 1
+            self.cells.swap(i, i - shift)
+        }
+        self.erase(0, shift, bg)
+    }
+}
+
+fn min(_ a: usize, _ b: usize) -> usize {
+    if a < b { a } else { b }
+}
+
+// The cluster just written, which the next scalar may join: its cell and
+// what decides the joining.
+struct Last { x: u16, y: u16, cluster: Grapheme }
+
+impl Copy for Last {}
+
+// Where the parser is in a sequence.
+enum State {
+    Ground,
+    // After ESC.
+    Escape,
+    // After ESC and intermediate bytes, up to the final byte.
+    EscapeIntermediate,
+    Csi,
+    // A malformed CSI sequence, read to its final byte and ignored.
+    CsiIgnore,
+    // An OSC, DCS, SOS, PM or APC string, skipped.
+    Skip,
+    // ESC in a skipped string: ST if `\` follows.
+    SkipEscape,
+}
+
+impl Copy for State {}
+
+const MAX_PARAMS: usize = 16
+
+// The private modes `Vt` tracks, as bits of `Vt::modes`.
+fn mode_bit(_ mode: u32) -> u32 {
+    match mode {
+        25 => 1,
+        1000 => 2,
+        1002 => 4,
+        1003 => 8,
+        1004 => 16,
+        1006 => 32,
+        1049 => 64,
+        2004 => 128,
+        2026 => 256,
+        _ => 0,
+    }
+}
+
+/// A terminal screen fed with bytes: `vt.feed(bytes.span())`, then
+/// `vt.to_text()` or `vt.cell(pos)`. A sequence may be split across feeds.
+pub struct Vt {
+    size: Size,
+    // The screen shown, and the other one: the alternate screen while the
+    // primary shows, and the primary while the alternate does.
+    grid: Screen,
+    other: Screen,
+    x: u16,
+    y: u16,
+    pending_wrap: bool,
+    pen: Pen,
+    modes: u32,
+    last: Option<Last>,
+    state: State,
+    // A UTF-8 sequence in progress: its value so far, the bytes still to
+    // come and the range of the next one.
+    utf8_value: u32,
+    utf8_need: u8,
+    utf8_low: u8,
+    utf8_high: u8,
+    // A CSI sequence in progress: its parameters, those that a colon
+    // introduced as bits, its private marker and intermediate byte.
+    params: [u32; MAX_PARAMS],
+    param_count: usize,
+    colons: u32,
+    marker: u8,
+    intermediate: u8,
+    // The UTF-8 of the scalar or the cluster being written.
+    scratch: MemBuffer,
+}
+
+impl Vt {
+    /// A terminal of `size`, blank, with the cursor at the top left and
+    /// shown, and default colors.
+    pub fn new(_ size: Size) -> Self {
+        Vt {
+            size,
+            grid: Screen::new(size),
+            other: Screen::new(size),
+            x: 0,
+            y: 0,
+            pending_wrap: false,
+            pen: Pen::DEFAULT,
+            modes: mode_bit(25),
+            last: Option::None,
+            state: State::Ground,
+            utf8_value: 0,
+            utf8_need: 0,
+            utf8_low: 0,
+            utf8_high: 0,
+            params: [0; MAX_PARAMS],
+            param_count: 0,
+            colons: 0,
+            marker: 0,
+            intermediate: 0,
+            scratch: MemBuffer::empty(),
+        }
+    }
+
+    /// The columns and rows of the screen.
+    pub fn size(self) -> Size {
+        self.size
+    }
+
+    /// The cursor. With a pending wrap it is on the last column.
+    pub fn cursor(self) -> Pos {
+        Pos { x: self.x, y: self.y }
+    }
+
+    /// Whether the cursor is on the last column with a wrap pending, which
+    /// the next printable cluster takes before it is written.
+    pub fn pending_wrap(self) -> bool {
+        self.pending_wrap
+    }
+
+    /// Whether the cursor shows (private mode 25).
+    pub fn cursor_visible(self) -> bool {
+        self.mode(25)
+    }
+
+    /// Whether the alternate screen shows (private mode 1049).
+    pub fn alternate_screen(self) -> bool {
+        self.mode(1049)
+    }
+
+    /// Whether the private mode `mode` is set. The modes tracked are 25
+    /// (cursor shown, set at the start), 1000, 1002, 1003 and 1006 (mouse
+    /// reports), 1004 (focus reports), 1049 (alternate screen), 2004
+    /// (bracketed paste) and 2026 (synchronized output); any other is never
+    /// set.
+    pub fn mode(self, _ mode: u32) -> bool {
+        let bit = mode_bit(mode)
+        bit != 0 && self.modes & bit != 0
+    }
+
+    /// The kitty keyboard flags in force on the screen shown.
+    pub fn keyboard_flags(self) -> u32 {
+        self.grid.keyboard[self.grid.keyboard.len() - 1]
+    }
+
+    /// How many kitty keyboard flag sets the screen shown has pushed and
+    /// not popped.
+    pub fn keyboard_depth(self) -> usize {
+        self.grid.keyboard.len() - 1
+    }
+
+    /// The cell at `pos` of the screen shown, which must be inside it.
+    pub fn cell(self, _ pos: Pos) -> ref Cell {
+        assert(pos.x < self.size.width && pos.y < self.size.height)
+        ref self.grid.cells[self.grid.index(pos.x, pos.y)]
+    }
+
+    /// The text of the screen shown: its rows, without trailing spaces,
+    /// joined by LF. A wide cluster appears once.
+    pub fn to_text(self) -> MemBuffer {
+        var out = MemBuffer::empty()
+        var y: u16 = 0
+        while y < self.size.height {
+            if y > 0 { out.push(b'\n') }
+            let start = out.len()
+            var x: u16 = 0
+            while x < self.size.width {
+                out.extend_from(self.grid.cells[self.grid.index(x, y)].symbol.span())
+                x += 1
+            }
+            var end = out.len()
+            while end > start && out[end - 1] == b' ' {
+                end -= 1
+            }
+            out.truncate(end)
+            y += 1
+        }
+        out
+    }
+
+    /// Reads `bytes` as the terminal would.
+    pub fn feed(mut self, _ bytes: MemSpan) {
+        for byte in bytes {
+            self.byte(byte)
+        }
+    }
+
+    fn byte(mut self, _ byte: u8) {
+        // DEL is ignored everywhere.
+        if byte == 0x7f { return }
+        match self.state {
+            State::Ground => self.ground(byte),
+            State::Escape => self.escape(byte),
+            State::EscapeIntermediate => {
+                if byte >= 0x30 && byte < 0x7f {
+                    self.state = State::Ground
+                } else if byte < 0x20 || byte >= 0x80 {
+                    self.interrupt(byte)
+                }
+            },
+            State::Csi => self.csi(byte),
+            State::CsiIgnore => {
+                if byte >= 0x40 && byte < 0x7f {
+                    self.state = State::Ground
+                } else if byte < 0x20 || byte >= 0x80 {
+                    self.interrupt(byte)
+                }
+            },
+            State::Skip => {
+                if byte == 0x1b {
+                    self.state = State::SkipEscape
+                } else if byte == 0x07 || byte == 0x18 || byte == 0x1a {
+                    self.state = State::Ground
+                }
+            },
+            State::SkipEscape => {
+                // ST ends the string; any other ESC ends it and starts a
+                // sequence, as in xterm.
+                self.state = State::Ground
+                if byte != b'\\' {
+                    self.state = State::Escape
+                    self.escape(byte)
+                }
+            },
+        }
+    }
+
+    // A byte other than a sequence's own inside one: C0 controls run, CAN
+    // and SUB cancel the sequence, ESC starts a new one, and any other byte
+    // cancels it and is read as text.
+    fn interrupt(mut self, _ byte: u8) {
+        if byte == 0x1b {
+            self.state = State::Escape
+        } else if byte == 0x18 || byte == 0x1a {
+            self.state = State::Ground
+        } else if byte < 0x20 {
+            self.control(byte)
+        } else {
+            self.state = State::Ground
+            self.ground(byte)
+        }
+    }
+
+    fn ground(mut self, _ byte: u8) {
+        if self.utf8_need > 0 {
+            if byte >= self.utf8_low && byte <= self.utf8_high {
+                self.utf8_value = self.utf8_value << 6 | (byte & 0x3f) as u32
+                self.utf8_need -= 1
+                self.utf8_low = 0x80
+                self.utf8_high = 0xbf
+                if self.utf8_need == 0 {
+                    self.print(self.utf8_value)
+                }
+                return
+            }
+            // The maximal subpart so far is one replacement; the byte
+            // starts afresh.
+            self.utf8_need = 0
+            self.print(REPLACEMENT_CHARACTER)
+        }
+        if byte == 0x1b {
+            self.state = State::Escape
+        } else if byte < 0x20 {
+            self.control(byte)
+        } else if byte < 0x80 {
+            self.print(byte as u32)
+        } else if byte < 0xc2 || byte > 0xf4 {
+            self.print(REPLACEMENT_CHARACTER)
+        } else {
+            // As `text::decode` reads a lead byte.
+            self.utf8_need = if byte < 0xe0 {
+                1
+            } else if byte < 0xf0 { 2 } else { 3 }
+            self.utf8_value = (byte & (0x3f >> self.utf8_need)) as u32
+            self.utf8_low = if byte == 0xe0 {
+                0xa0
+            } else if byte == 0xf0 { 0x90 } else { 0x80 }
+            self.utf8_high = if byte == 0xed {
+                0x9f
+            } else if byte == 0xf4 { 0x8f } else { 0xbf }
+        }
+    }
+
+    fn control(mut self, _ byte: u8) {
+        self.last = Option::None
+        match byte {
+            0x08 => {
+                if self.x > 0 { self.x -= 1 }
+                self.pending_wrap = false
+            },
+            0x09 => {
+                let next = (self.x / 8 + 1) * 8
+                self.move_to(
+                    if next < self.size.width {
+                        next
+                    } else {
+                        self.size.width
+                    },
+                    self.y,
+                )
+            },
+            0x0a | 0x0b | 0x0c => {
+                self.pending_wrap = false
+                self.line_feed()
+            },
+            0x0d => self.move_to(0, self.y),
+            _ => {},
+        }
+    }
+
+    fn escape(mut self, _ byte: u8) {
+        self.state = State::Ground
+        match byte {
+            b'[' => {
+                self.state = State::Csi
+                self.param_count = 0
+                self.colons = 0
+                self.marker = 0
+                self.intermediate = 0
+                self.params = [0; MAX_PARAMS]
+            },
+            b']' | b'P' | b'X' | b'^' | b'_' => self.state = State::Skip,
+            b'7' => self.save_cursor(),
+            b'8' => self.restore_cursor(),
+            b'D' => {
+                self.last = Option::None
+                self.pending_wrap = false
+                self.line_feed()
+            },
+            b'E' => {
+                self.move_to(0, self.y)
+                self.line_feed()
+            },
+            b'M' => {
+                if self.y > 0 {
+                    self.move_to(self.x, self.y - 1)
+                } else {
+                    self.last = Option::None
+                    self.pending_wrap = false
+                    self.grid.scroll_down(1, self.pen.bg)
+                }
+            },
+            b'c' => self.reset(),
+            _ => {
+                if byte >= 0x20 && byte < 0x30 {
+                    self.state = State::EscapeIntermediate
+                } else if byte < 0x20 || byte >= 0x80 {
+                    self.state = State::Escape
+                    self.interrupt(byte)
+                }
+            },
+        }
+    }
+
+    fn csi(mut self, _ byte: u8) {
+        if byte >= b'0' && byte <= b'9' && self.intermediate == 0 {
+            if self.param_count == 0 {
+                self.param_count = 1
+            }
+            if self.param_count <= MAX_PARAMS {
+                let i = self.param_count - 1
+                let value = self.params[i] * 10 + (byte - b'0') as u32
+                self.params[i] = if value > 65535 { 65535 } else { value }
+            }
+        } else if (byte == b';' || byte == b':') && self.intermediate == 0 {
+            if self.param_count == 0 {
+                self.param_count = 1
+            }
+            self.param_count += 1
+            if byte == b':' && self.param_count <= MAX_PARAMS {
+                let bit: u32 = (self.param_count - 1).downcast_truncate()
+                self.colons |= 1 << bit
+            }
+        } else if byte >= 0x3c && byte <= 0x3f {
+            if self.param_count > 0 || self.marker != 0 || self.intermediate != 0 {
+                self.state = State::CsiIgnore
+            } else {
+                self.marker = byte
+            }
+        } else if byte >= 0x20 && byte < 0x30 {
+            if self.intermediate != 0 {
+                self.state = State::CsiIgnore
+            } else {
+                self.intermediate = byte
+            }
+        } else if byte >= 0x40 && byte < 0x7f {
+            self.state = State::Ground
+            if self.intermediate == 0 {
+                self.dispatch(byte)
+            }
+        } else if byte >= 0x30 && byte < 0x40 {
+            self.state = State::CsiIgnore
+        } else {
+            self.interrupt(byte)
+        }
+    }
+
+    // The CSI parameter `i`, or 0 if it is missing.
+    fn param(self, _ i: usize) -> u32 {
+        if i < self.param_count && i < MAX_PARAMS {
+            self.params[i]
+        } else {
+            0
+        }
+    }
+
+    // The CSI parameter `i` as a count or a 1-based position: at least 1.
+    fn count(self, _ i: usize) -> u16 {
+        let value = self.param(i)
+        if value == 0 {
+            1
+        } else {
+            value.downcast_truncate()
+        }
+    }
+
+    fn dispatch(mut self, _ final: u8) {
+        if self.marker == b'?' {
+            if final == b'h' || final == b'l' {
+                var i: usize = 0
+                while i < self.param_count && i < MAX_PARAMS {
+                    self.set_mode(self.params[i], final == b'h')
+                    i += 1
+                }
+            }
+            return
+        }
+        if final == b'u' && self.marker != 0 {
+            self.keyboard(self.marker)
+            return
+        }
+        if self.marker != 0 { return }
+        let width = self.size.width
+        match final {
+            b'H' | b'f' => self.move_to(self.count(1) - 1, self.count(0) - 1),
+            b'A' => self.move_to(self.x, self.y - min16(self.count(0), self.y)),
+            b'B' => self.move_to(self.x, sum16(self.y, self.count(0))),
+            b'C' => self.move_to(sum16(self.x, self.count(0)), self.y),
+            b'D' => self.move_to(self.x - min16(self.count(0), self.x), self.y),
+            b'E' => self.move_to(0, sum16(self.y, self.count(0))),
+            b'F' => self.move_to(0, self.y - min16(self.count(0), self.y)),
+            b'G' | b'`' => self.move_to(self.count(0) - 1, self.y),
+            b'd' => self.move_to(self.x, self.count(0) - 1),
+            b'J' => {
+                let total = self.size.area()
+                let here = self.here()
+                match self.param(0) {
+                    0 => self.erase(here, total),
+                    1 => self.erase(0, here + 1),
+                    2 => self.erase(0, total),
+                    _ => {},
+                }
+            },
+            b'K' => {
+                let start = self.y as usize * width as usize
+                let here = self.here()
+                match self.param(0) {
+                    0 => self.erase(here, start + width as usize),
+                    1 => self.erase(start, here + 1),
+                    2 => self.erase(start, start + width as usize),
+                    _ => {},
+                }
+            },
+            b'X' => {
+                let here = self.here()
+                let end = self.y as usize * width as usize + width as usize
+                self.erase(here, min(here + self.count(0) as usize, end))
+            },
+            b'm' => self.sgr(),
+            b's' => self.save_cursor(),
+            b'u' => self.restore_cursor(),
+            b'S' => {
+                self.last = Option::None
+                self.grid.scroll_up(self.count(0) as usize, self.pen.bg)
+            },
+            b'T' => {
+                if self.param_count <= 1 {
+                    self.last = Option::None
+                    self.grid.scroll_down(self.count(0) as usize, self.pen.bg)
+                }
+            },
+            _ => {},
+        }
+    }
+
+    // The index of the cursor's cell.
+    fn here(self) -> usize {
+        self.grid.index(self.x, self.y)
+    }
+
+    fn erase(mut self, _ from: usize, _ to: usize) {
+        self.last = Option::None
+        self.pending_wrap = false
+        if from < to && to <= self.size.area() {
+            self.grid.erase(from, to, self.pen.bg)
+        }
+    }
+
+    // Moves the cursor to `(x, y)`, clamped to the screen.
+    fn move_to(mut self, _ x: u16, _ y: u16) {
+        self.last = Option::None
+        self.pending_wrap = false
+        self.x = if x < self.size.width {
+            x
+        } else {
+            self.size.width.saturating_sub(1)
+        }
+        self.y = if y < self.size.height {
+            y
+        } else {
+            self.size.height.saturating_sub(1)
+        }
+    }
+
+    fn line_feed(mut self) {
+        if self.y + 1 < self.size.height {
+            self.y += 1
+        } else if self.size.height > 0 {
+            self.grid.scroll_up(1, self.pen.bg)
+        }
+    }
+
+    fn save_cursor(mut self) {
+        self.last = Option::None
+        self.grid.saved = Option::Some(
+            Saved { x: self.x, y: self.y, pending_wrap: self.pending_wrap, pen: self.pen },
+        )
+    }
+
+    fn restore_cursor(mut self) {
+        let saved = match self.grid.saved {
+            Option::Some(saved) => saved,
+            Option::None => Saved { x: 0, y: 0, pending_wrap: false, pen: Pen::DEFAULT },
+        }
+        self.move_to(saved.x, saved.y)
+        self.pending_wrap = saved.pending_wrap && self.x + 1 == self.size.width
+        self.pen = saved.pen
+    }
+
+    fn set_mode(mut self, _ mode: u32, _ on: bool) {
+        let bit = mode_bit(mode)
+        if bit == 0 || (self.modes & bit != 0) == on {
+            return
+        }
+        self.modes ^= bit
+        if mode != 1049 { return }
+        // 1049 saves the cursor, shows the other screen and clears it, and
+        // the reverse.
+        if on { self.save_cursor() }
+        let shown = replace(mut self.grid, Screen::new(Size { width: 0, height: 0 }))
+        self.grid = replace(mut self.other, shown)
+        if on {
+            self.erase(0, self.size.area())
+        } else {
+            self.restore_cursor()
+        }
+    }
+
+    // `CSI > flags u` pushes, `CSI < n u` pops and `CSI = flags ; how u` sets
+    // the kitty keyboard flags: `how` 1 replaces them, 2 adds and 3 removes
+    // bits.
+    fn keyboard(mut self, _ marker: u8) {
+        let flags = self.param(0)
+        let how = self.param(1)
+        var n = self.count(0) as usize
+        let stack = mut self.grid.keyboard
+        let top = stack.len() - 1
+        if marker == b'>' {
+            stack.push(flags)
+        } else if marker == b'<' {
+            while n > 0 && stack.len() > 1 {
+                stack.pop()
+                n -= 1
+            }
+            if n > 0 { stack[0] = 0 }
+        } else if marker == b'=' {
+            stack[top] = match how {
+                2 => stack[top] | flags,
+                3 => stack[top] & (flags ^ 0xffffffff),
+                _ => flags,
+            }
+        }
+    }
+
+    fn reset(mut self) {
+        let size = self.size
+        self = Vt::new(size)
+    }
+
+    fn sgr(mut self) {
+        if self.param_count == 0 {
+            self.pen = Pen::DEFAULT
+            return
+        }
+        var i: usize = 0
+        while i < self.param_count && i < MAX_PARAMS {
+            let p = self.params[i]
+            // The parameters a colon joins to this one.
+            var group: usize = 1
+            while i + group < MAX_PARAMS
+                && self.colons >> (i + group).downcast_truncate() & 1 != 0 {
+                group += 1
+            }
+            let m = self.pen.modifier
+            if p == 0 {
+                self.pen = Pen::DEFAULT
+            } else if p == 1 {
+                self.pen.modifier = m | Modifier::BOLD
+            } else if p == 2 {
+                self.pen.modifier = m | Modifier::DIM
+            } else if p == 3 {
+                self.pen.modifier = m | Modifier::ITALIC
+            } else if p == 4 || p == 21 {
+                // `4:0` is no underline; other styles underline.
+                let off = p == 4 && group > 1 && self.param(i + 1) == 0
+                self.pen.modifier = if off {
+                    m.without(Modifier::UNDERLINED)
+                } else {
+                    m | Modifier::UNDERLINED
+                }
+            } else if p == 5 || p == 6 {
+                self.pen.modifier = m | Modifier::BLINK
+            } else if p == 7 {
+                self.pen.modifier = m | Modifier::REVERSED
+            } else if p == 8 {
+                self.pen.modifier = m | Modifier::HIDDEN
+            } else if p == 9 {
+                self.pen.modifier = m | Modifier::CROSSED_OUT
+            } else if p == 22 {
+                self.pen.modifier = m.without(Modifier::BOLD | Modifier::DIM)
+            } else if p == 23 {
+                self.pen.modifier = m.without(Modifier::ITALIC)
+            } else if p == 24 {
+                self.pen.modifier = m.without(Modifier::UNDERLINED)
+            } else if p == 25 {
+                self.pen.modifier = m.without(Modifier::BLINK)
+            } else if p == 27 {
+                self.pen.modifier = m.without(Modifier::REVERSED)
+            } else if p == 28 {
+                self.pen.modifier = m.without(Modifier::HIDDEN)
+            } else if p == 29 {
+                self.pen.modifier = m.without(Modifier::CROSSED_OUT)
+            } else if p >= 30 && p <= 37 {
+                self.pen.fg = Color::ansi((p - 30).downcast_truncate())
+            } else if p == 39 {
+                self.pen.fg = Color::RESET
+            } else if p >= 40 && p <= 47 {
+                self.pen.bg = Color::ansi((p - 40).downcast_truncate())
+            } else if p == 49 {
+                self.pen.bg = Color::RESET
+            } else if p >= 90 && p <= 97 {
+                self.pen.fg = Color::ansi((p - 82).downcast_truncate())
+            } else if p >= 100 && p <= 107 {
+                self.pen.bg = Color::ansi((p - 92).downcast_truncate())
+            } else if p == 38 || p == 48 || p == 58 {
+                let (color, used) = self.extended_color(i, group)
+                if used == 0 { return }
+                if let Option::Some(color) = color {
+                    if p == 38 {
+                        self.pen.fg = color
+                    } else if p == 48 {
+                        self.pen.bg = color
+                    }
+                }
+                if group == 1 { group = used }
+            }
+            i += group
+        }
+    }
+
+    // The color of the SGR 38, 48 or 58 at parameter `i`, if it is valid,
+    // and the parameters it takes: `group` in the colon forms `38:5:n`,
+    // `38:2::r:g:b` and `38:2:r:g:b`, or 3 or 5 in the forms `38;5;n` and
+    // `38;2;r;g;b`; 0 if the parameters run out, which ends the SGR
+    // sequence.
+    fn extended_color(self, _ i: usize, _ group: usize) -> (Option<Color>, usize) {
+        let colon = group > 1
+        let kind = self.param(i + 1)
+        if kind == 5 {
+            if !colon && i + 3 > self.param_count {
+                return (Option::None, 0)
+            }
+            let n = self.param(i + 2)
+            let color = if n > 255 {
+                Option::None
+            } else {
+                Option::Some(Color::indexed(n.downcast_truncate()))
+            }
+            return (color, if colon { group } else { 3 })
+        }
+        if kind == 2 {
+            if !colon && i + 5 > self.param_count {
+                return (Option::None, 0)
+            }
+            // The colon form may hold a color space before the channels.
+            let first = if colon && group >= 6 { i + 3 } else { i + 2 }
+            let r = self.param(first)
+            let g = self.param(first + 1)
+            let b = self.param(first + 2)
+            if r > 255 || g > 255 || b > 255 {
+                return (Option::None, if colon { group } else { 5 })
+            }
+            let color = Color::rgb(
+                r.downcast_truncate(),
+                g.downcast_truncate(),
+                b.downcast_truncate(),
+            )
+            return (Option::Some(color), if colon { group } else { 5 })
+        }
+        (Option::None, if colon { group } else { 2 })
+    }
+
+    fn print(mut self, _ value: u32) {
+        if is_control(value) {
+            self.last = Option::None
+            return
+        }
+        if self.size.width == 0 || self.size.height == 0 {
+            return
+        }
+        self.scratch.clear()
+        encode(value, mut self.scratch)
+        if let Option::Some(last) = self.last {
+            var cluster = last.cluster
+            if cluster.extend(value) {
+                let index = self.grid.index(last.x, last.y)
+                self.grid.cells[index].symbol.extend_from(self.scratch.span())
+                if cluster.width() > last.cluster.width() {
+                    // Written again where it began, wider.
+                    self.scratch.clear()
+                    self.scratch.extend_from(self.grid.cells[index].symbol.span())
+                    self.x = last.x
+                    self.y = last.y
+                    self.pending_wrap = false
+                    self.place(cluster)
+                } else {
+                    self.last = Option::Some(Last { x: last.x, y: last.y, cluster })
+                }
+                return
+            }
+        }
+        let cluster = Grapheme::new(value)
+        if cluster.width() > 0 {
+            self.place(cluster)
+            return
+        }
+        // A zero-width scalar no cluster takes joins the cell before the
+        // cursor, if there is one on its row.
+        var x = self.x
+        if !self.pending_wrap {
+            if x == 0 { return }
+            x -= 1
+        }
+        var index = self.grid.index(x, self.y)
+        if self.grid.cells[index].width == 0 {
+            index -= 1
+        }
+        self.grid.cells[index].symbol.extend_from(self.scratch.span())
+    }
+
+    // Writes the cluster in `scratch` at the cursor.
+    fn place(mut self, _ cluster: Grapheme) {
+        let columns = self.size.width
+        let width: u16 = if cluster.width() as u16 > columns {
+            columns
+        } else {
+            cluster.width() as u16
+        }
+        if self.pending_wrap {
+            self.pending_wrap = false
+            self.x = 0
+            self.line_feed()
+        }
+        if self.x + width > columns {
+            let here = self.here()
+            self.grid.erase(here, here + 1, self.pen.bg)
+            self.x = 0
+            self.line_feed()
+        }
+        let here = self.here()
+        self.grid.split_edges(here, here + width as usize)
+        self.grid.cells[here].set(self.scratch.span(), width.downcast_truncate(), self.pen)
+        if width == 2 {
+            self.grid.cells[here + 1].set(MemBuffer::empty().span(), 0, self.pen)
+        }
+        self.last = Option::Some(Last { x: self.x, y: self.y, cluster })
+        self.x += width
+        if self.x >= columns {
+            self.x = columns - 1
+            self.pending_wrap = true
+        }
+    }
+}
+
+fn min16(_ a: u16, _ b: u16) -> u16 {
+    if a < b { a } else { b }
+}
+
+// `a + b`, at most 65535.
+fn sum16(_ a: u16, _ b: u16) -> u16 {
+    a.saturating_add(b)
+}
