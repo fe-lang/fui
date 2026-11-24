@@ -1,0 +1,1082 @@
+//! A grid of cells: what one frame shows.
+//!
+//! A `Buffer` holds a `Cell` for each column and row of an area, row by row.
+//! Drawing writes grapheme clusters into cells and applies styles over them.
+//! Every drawing call clips: a position or an area outside the buffer draws
+//! nothing there, and nothing panics.
+//!
+//! A symbol of width 2, such as a CJK ideograph or most emoji, takes its
+//! cell and the next one, which becomes a *continuation*: a cell of width 0
+//! with no symbol, in the same style. Writing over either half of a wide
+//! symbol turns the other half into a space, so the grid always holds whole
+//! symbols.
+//!
+//! Text never puts control characters in cells, since a terminal would act
+//! on them: a cluster with a C0 control (below `0x20`), DEL (`0x7f`) or a C1
+//! control (U+0080 to U+009F) is skipped, as is any cluster of width 0, so
+//! a drawn string takes exactly the columns `text::width` counts for its
+//! other clusters. A byte that is no UTF-8 is drawn as U+FFFD.
+use core::ops::Eq
+use super::geom::{Pos, Rect, Size, min}
+use super::style::{Color, Modifier, Style}
+use super::text::{Cluster, next_cluster}
+
+// `Cell::len` of a symbol in the side table, whose word holds its offset in
+// the low 32 bits and its length in the high 32.
+const LONG: u8 = 0xff
+
+/// One cell of a `Buffer`: a symbol, its colors, its attributes and its
+/// width. A symbol of up to 8 bytes is held in the cell, and a longer one in
+/// its buffer. Cells compare with `==` by their contents, except that a
+/// cell whose symbol is in its buffer equals no cell, not even itself:
+/// `Buffer::cell_eq` compares those by their bytes.
+pub struct Cell {
+    // Up to 8 bytes of UTF-8 from the low byte up, or a side-table entry.
+    symbol: u64,
+    // The bytes of an inline symbol, or `LONG`.
+    len: u8,
+    width: u8,
+    fg: Color,
+    bg: Color,
+    modifier: Modifier,
+}
+
+impl Copy for Cell {}
+
+impl Eq for Cell {
+    fn eq(self, _ other: Self) -> bool {
+        self.len != LONG
+            && self.symbol == other.symbol
+            && self.len == other.len
+            && self.width == other.width
+            && self.fg == other.fg
+            && self.bg == other.bg
+            && self.modifier == other.modifier
+    }
+}
+
+impl Cell {
+    /// A space in the terminal's default colors, without attributes: every
+    /// cell of a new or cleared buffer.
+    pub const EMPTY: Cell = Cell {
+        symbol: 0x20,
+        len: 1,
+        width: 1,
+        fg: Color::RESET,
+        bg: Color::RESET,
+        modifier: Modifier::NONE,
+    }
+
+    /// The columns the symbol takes: 1 or 2, or 0 for the continuation of
+    /// the wide symbol before it.
+    pub fn width(self) -> u8 {
+        self.width
+    }
+
+    /// Whether this is the second cell of a wide symbol.
+    pub fn is_continuation(self) -> bool {
+        self.width == 0
+    }
+
+    /// The text color, never `Color::KEEP`.
+    pub fn fg(self) -> Color {
+        self.fg
+    }
+
+    /// The background color, never `Color::KEEP`.
+    pub fn bg(self) -> Color {
+        self.bg
+    }
+
+    /// The attributes.
+    pub fn modifier(self) -> Modifier {
+        self.modifier
+    }
+
+    /// The style that gives a cell this cell's colors and attributes,
+    /// whatever it had.
+    pub fn style(self) -> Style {
+        Style {
+            fg: self.fg,
+            bg: self.bg,
+            add: self.modifier,
+            remove: Modifier::ALL.without(self.modifier),
+        }
+    }
+
+    // This cell with `style` applied over its colors and attributes.
+    fn patched(self, _ style: Style) -> Cell {
+        Cell {
+            symbol: self.symbol,
+            len: self.len,
+            width: self.width,
+            fg: style.fg.over(self.fg),
+            bg: style.bg.over(self.bg),
+            modifier: style.apply_modifier(self.modifier),
+        }
+    }
+
+    // `glyph` in this cell's colors and attributes.
+    fn with_glyph(self, _ glyph: Glyph) -> Cell {
+        Cell {
+            symbol: glyph.symbol,
+            len: glyph.len,
+            width: glyph.width,
+            fg: self.fg,
+            bg: self.bg,
+            modifier: self.modifier,
+        }
+    }
+}
+
+// A symbol as a cell stores it, with its width.
+struct Glyph { symbol: u64, len: u8, width: u8 }
+
+impl Copy for Glyph {}
+
+impl Glyph {
+    const SPACE: Glyph = Glyph { symbol: 0x20, len: 1, width: 1 }
+    const CONTINUATION: Glyph = Glyph { symbol: 0, len: 0, width: 0 }
+    // U+FFFD, for a byte that is no UTF-8.
+    const REPLACEMENT: Glyph = Glyph { symbol: 0xbdbfef, len: 3, width: 1 }
+}
+
+/// A grid of cells, row by row, with the side table that holds symbols
+/// longer than a cell does.
+pub struct Buffer {
+    size: Size,
+    cells: MemArray<Cell>,
+    // The bytes of the symbols of more than 8 bytes, each stored once.
+    long: MemBuffer,
+    // The cell words of the symbols in `long`.
+    longs: MemVec<u64>,
+}
+
+impl Buffer {
+    /// A buffer of `size` empty cells.
+    pub fn new(_ size: Size) -> Self {
+        Buffer {
+            size,
+            cells: MemArray::from_fn(size.area(), |_| Cell::EMPTY),
+            long: MemBuffer::empty(),
+            longs: MemVec::new(),
+        }
+    }
+
+    pub fn size(self) -> Size {
+        self.size
+    }
+
+    /// The rectangle of all cells, from `(0, 0)`.
+    pub fn area(self) -> Rect {
+        Rect::of(self.size)
+    }
+
+    /// Makes this a buffer of `size` empty cells.
+    pub fn resize(mut self, _ size: Size) {
+        if size == self.size {
+            self.clear()
+            return
+        }
+        self.size = size
+        self.cells = MemArray::from_fn(size.area(), |_| Cell::EMPTY)
+        self.long.clear()
+        self.longs.clear()
+    }
+
+    /// Makes every cell empty.
+    pub fn clear(mut self) {
+        for mut cell in self.cells {
+            cell = Cell::EMPTY
+        }
+        self.long.clear()
+        self.longs.clear()
+    }
+
+    /// The cell at `pos`, if it is in the buffer.
+    pub fn get(self, _ pos: Pos) -> Option<Cell> {
+        if !self.area().contains(pos) {
+            return Option::None
+        }
+        Option::Some(self.cells[self.index(pos)])
+    }
+
+    /// All cells, row by row: the cell at `(x, y)` is at
+    /// `y * size().width + x`.
+    pub fn cells(self) -> ref MemSlice<Cell> {
+        self.cells.as_slice()
+    }
+
+    /// The cells of row `y`, which must be in the buffer.
+    pub fn row(self, _ y: u16) -> ref MemSlice<Cell> {
+        let width = self.size.width as usize
+        self.cells.as_slice().slice(offset: y as usize * width, len: width)
+    }
+
+    /// Writes the first grapheme cluster of `symbol` at `pos`, with `style`
+    /// applied over the cell's style. Returns the columns written: 0 if
+    /// `pos` is outside the buffer or the symbol is empty, a control or of
+    /// width 0, and 1 for a wide symbol in the last column, which becomes a
+    /// space.
+    pub fn set_symbol(mut self, _ pos: Pos, _ symbol: MemSpan, _ style: Style) -> u16 {
+        if symbol.is_empty() {
+            return 0
+        }
+        let cluster = next_cluster(symbol, 0)
+        self.draw(
+            pos,
+            symbol.slice(offset: 0, len: cluster.len),
+            style,
+            from: pos.x,
+            to: self.size.width,
+        )
+    }
+
+    /// Writes the grapheme clusters of `text` from `pos` to the right, with
+    /// `style` applied over each cell's style, in at most `max_width`
+    /// columns and up to the buffer's right edge. A wide cluster that does
+    /// not fit leaves a space in the one column left. Returns the columns
+    /// written.
+    pub fn set_string(
+        mut self,
+        _ pos: Pos,
+        _ text: MemSpan,
+        _ style: Style,
+        max_width: u16,
+    ) -> u16 {
+        let end = pos.x as u32 + max_width as u32
+        let to: u16 = if end < self.size.width as u32 {
+            end.downcast_truncate()
+        } else {
+            self.size.width
+        }
+        self.draw(pos, text, style, from: pos.x, to)
+    }
+
+    /// Applies `style` over the style of each cell in `area`. A wide symbol
+    /// with either half in `area` is styled whole.
+    pub fn set_style(mut self, _ area: Rect, _ style: Style) {
+        let area = area.intersect(self.area())
+        let width = self.size.width as usize
+        for y in area.y as usize .. area.bottom() as usize {
+            for i in y * width + area.x as usize .. y * width + area.right() as usize {
+                self.restyle(i, style)
+            }
+        }
+    }
+
+    /// Writes the first grapheme cluster of `symbol` into every cell of
+    /// `area`, with `style` applied over each cell's style. A wide symbol
+    /// fills each two columns, and a space the last one if one is left. An
+    /// empty, control or zero-width symbol fills with spaces.
+    pub fn fill(mut self, _ area: Rect, _ symbol: MemSpan, _ style: Style) {
+        let glyph = if symbol.is_empty() {
+            Glyph::SPACE
+        } else {
+            let cluster = next_cluster(symbol, 0)
+            match self.glyph(symbol.slice(offset: 0, len: cluster.len), cluster) {
+                Option::Some(glyph) => glyph,
+                Option::None => Glyph::SPACE,
+            }
+        }
+        self.fill_glyph(area, glyph, style)
+    }
+
+    /// Makes every cell of `area` empty.
+    pub fn reset(mut self, _ area: Rect) {
+        self.fill_glyph(area, Glyph::SPACE, Style::reset())
+    }
+
+    /// Copies the cells of `area` of `source` to this buffer, with the top
+    /// left one at `to`, as far as both buffers reach. A wide symbol cut by
+    /// the edge of either becomes a space.
+    pub fn copy_from(mut self, _ source: Buffer, area: Rect, to: Pos) {
+        let area = area.intersect(source.area())
+        if area.is_empty() || !self.area().contains(to) {
+            return
+        }
+        let width = min(area.width, self.size.width - to.x) as usize
+        let height = min(area.height, self.size.height - to.y) as usize
+        for dy in 0 .. height {
+            let from = source.index(area.pos()) + dy * source.size.width as usize
+            let at = self.index(to) + dy * self.size.width as usize
+            var dx: usize = 0
+            while dx < width {
+                let cell = source.cells[from + dx]
+                let glyph = if cell.width == 0 || cell.width == 2 && dx + 1 >= width {
+                    Glyph::SPACE
+                } else if cell.len == LONG {
+                    let (symbol, len) = self.intern(source.long_symbol(cell.symbol))
+                    Glyph { symbol, len, width: cell.width }
+                } else {
+                    Glyph { symbol: cell.symbol, len: cell.len, width: cell.width }
+                }
+                self.put(at + dx, glyph, cell.style())
+                dx += glyph.width as usize
+            }
+        }
+    }
+
+    /// Appends the bytes of `cell`'s symbol, a cell of this buffer, to
+    /// `out`. A continuation has none.
+    pub fn write_symbol(self, _ cell: Cell, _ out: mut MemBuffer) {
+        if cell.len == LONG {
+            out.extend_from(self.long_symbol(cell.symbol))
+            return
+        }
+        var word = cell.symbol
+        for _ in 0 .. cell.len as usize {
+            out.push((word & 0xff).downcast_truncate())
+            word = word >> 8
+        }
+    }
+
+    /// Whether `a`, a cell of this buffer, and `b`, a cell of `other`, look
+    /// the same: the same symbol, width, colors and attributes. `other` may
+    /// be this buffer.
+    pub fn cell_eq(self, _ a: Cell, _ other: Buffer, _ b: Cell) -> bool {
+        if a.len == LONG && b.len == LONG {
+            return a.width == b.width
+                && a.fg == b.fg
+                && a.bg == b.bg
+                && a.modifier == b.modifier
+                && self.long_symbol(a.symbol) == other.long_symbol(b.symbol)
+        }
+        a == b
+    }
+
+    /// The symbols of the buffer as text, for tests: its rows joined by
+    /// `\n`, without the spaces that end each row. A wide symbol is written
+    /// once.
+    pub fn to_text(self) -> MemBuffer {
+        var out = MemBuffer::with_capacity(self.cells.len() + self.size.height as usize)
+        let width = self.size.width as usize
+        var row_start: usize = 0
+        for (i, cell) in self.cells.enumerate() {
+            if i > 0 && i % width == 0 {
+                trim_spaces(mut out, row_start)
+                out.push(b'\n')
+                row_start = out.len()
+            }
+            self.write_symbol(cell, mut out)
+        }
+        trim_spaces(mut out, row_start)
+        out
+    }
+
+    // Draws the clusters of `text` as if from `pos`, writing only the
+    // columns in `from..to`: one cut by `from` or `to` becomes a space. `to`
+    // is at most the buffer's width. Returns the columns written.
+    pub(ingot) fn draw(
+        mut self,
+        _ pos: Pos,
+        _ text: MemSpan,
+        _ style: Style,
+        from: u16,
+        to: u16,
+    ) -> u16 {
+        if pos.y >= self.size.height || from >= to {
+            return 0
+        }
+        let from = from as u32
+        let to = to as u32
+        let row = pos.y as usize * self.size.width as usize
+        var column = pos.x as u32
+        var written: u32 = 0
+        var offset: usize = 0
+        while offset < text.len() && column < to {
+            let cluster = next_cluster(text, offset)
+            let bytes = text.slice(offset, len: cluster.len)
+            offset += cluster.len
+            let glyph = match self.glyph(bytes, cluster) {
+                Option::Some(glyph) => glyph,
+                Option::None => {
+                    continue
+                },
+            }
+            let end = column + glyph.width as u32
+            if end <= from {
+                column = end
+                continue
+            }
+            let (glyph, at) = if column < from {
+                (Glyph::SPACE, from)
+            } else if end > to {
+                (Glyph::SPACE, column)
+            } else {
+                (glyph, column)
+            }
+            self.put(row + at as usize, glyph, style)
+            written += glyph.width as u32
+            column = end
+        }
+        written.downcast_truncate()
+    }
+
+    // Writes `glyph` into every cell of `area`, as `fill` does.
+    pub(ingot) fn fill_glyph(mut self, _ area: Rect, _ glyph: Glyph, _ style: Style) {
+        let area = area.intersect(self.area())
+        let width = self.size.width as usize
+        for y in area.y as usize .. area.bottom() as usize {
+            let end = y * width + area.right() as usize
+            var i = y * width + area.x as usize
+            while i < end {
+                self.put(
+                    i,
+                    if i + glyph.width as usize > end {
+                        Glyph::SPACE
+                    } else {
+                        glyph
+                    },
+                    style,
+                )
+                i += glyph.width as usize
+            }
+        }
+    }
+
+    // The glyph of `cluster`, whose bytes are `bytes`: `None` for a
+    // control or a cluster of width 0, U+FFFD for bytes that are no UTF-8.
+    fn glyph(mut self, _ bytes: MemSpan, _ cluster: Cluster) -> Option<Glyph> {
+        if cluster.width == 0 {
+            return Option::None
+        }
+        match kind(bytes) {
+            Kind::Control => {
+                return Option::None
+            },
+            Kind::Invalid => {
+                return Option::Some(Glyph::REPLACEMENT)
+            },
+            Kind::Text => {},
+        }
+        let (symbol, len) = self.intern(bytes)
+        Option::Some(
+            Glyph { symbol, len, width: if cluster.width > 1 { 2 } else { 1 } },
+        )
+    }
+
+    // The cell word and length of a symbol: its bytes inline, or its entry
+    // in the side table, added if it has none.
+    fn intern(mut self, _ bytes: MemSpan) -> (u64, u8) {
+        if bytes.len() <= 8 {
+            var word: u64 = 0
+            for (i, byte) in bytes.enumerate() {
+                let shift: u64 = (i * 8).downcast_truncate()
+                word = word | (byte as u64) << shift
+            }
+            return (word, bytes.len().downcast_truncate())
+        }
+        for word in self.longs {
+            if self.long_symbol(word) == bytes {
+                return (word, LONG)
+            }
+        }
+        let offset: u64 = self.long.len().downcast_truncate()
+        let len: u64 = bytes.len().downcast_truncate()
+        let word = offset | len << 32
+        self.long.extend_from(bytes)
+        self.longs.push(word)
+        (word, LONG)
+    }
+
+    // The bytes of the side-table symbol of the cell word `word`.
+    fn long_symbol(self, _ word: u64) -> ref MemSpan {
+        self.long
+            .slice(
+                offset: (word & 0xffffffff).downcast_truncate(),
+                len: (word >> 32).downcast_truncate(),
+            )
+    }
+
+    fn index(self, _ pos: Pos) -> usize {
+        pos.y as usize * self.size.width as usize + pos.x as usize
+    }
+
+    // Writes `glyph` into cell `i` with `style` applied over the cell's
+    // style; a wide glyph takes cell `i + 1` too, which must be in the same
+    // row. The other half of a wide symbol it overwrites becomes a space.
+    fn put(mut self, _ i: usize, _ glyph: Glyph, _ style: Style) {
+        self.split_wide(i)
+        if glyph.width == 2 {
+            self.split_wide(i + 1)
+        }
+        let cell = self.cells[i].patched(style).with_glyph(glyph)
+        self.cells[i] = cell
+        if glyph.width == 2 {
+            self.cells[i + 1] = cell.with_glyph(Glyph::CONTINUATION)
+        }
+    }
+
+    // Before cell `i` is overwritten: turns the other half of the wide
+    // symbol it is part of into a space. A continuation follows its wide
+    // cell in the same row, so neither neighbour is in another row.
+    fn split_wide(mut self, _ i: usize) {
+        let width = self.cells[i].width
+        if width == 0 {
+            self.cells[i - 1] = self.cells[i - 1].with_glyph(Glyph::SPACE)
+        } else if width == 2 {
+            self.cells[i + 1] = self.cells[i + 1].with_glyph(Glyph::SPACE)
+        }
+    }
+
+    // Applies `style` over cell `i` and the whole wide symbol it is part of.
+    fn restyle(mut self, _ i: usize, _ style: Style) {
+        let i = if self.cells[i].width == 0 { i - 1 } else { i }
+        let cell = self.cells[i].patched(style)
+        self.cells[i] = cell
+        if cell.width == 2 {
+            self.cells[i + 1] = cell.with_glyph(Glyph::CONTINUATION)
+        }
+    }
+}
+
+// What the bytes of a cluster hold.
+enum Kind {
+    // UTF-8 without controls.
+    Text,
+    // A C0 control, DEL or a C1 control (U+0080 to U+009F).
+    Control,
+    // Bytes that are no UTF-8.
+    Invalid,
+}
+
+fn kind(_ bytes: MemSpan) -> Kind {
+    var i: usize = 0
+    while i < bytes.len() {
+        let lead = bytes[i]
+        if lead < 0x80 {
+            if lead < 0x20 || lead == 0x7f {
+                return Kind::Control
+            }
+            i += 1
+            continue
+        }
+        if lead < 0xc2 || lead > 0xf4 {
+            return Kind::Invalid
+        }
+        let len: usize = if lead < 0xe0 {
+            2
+        } else if lead < 0xf0 { 3 } else { 4 }
+        if len > bytes.len() - i {
+            return Kind::Invalid
+        }
+        // The second byte's range keeps the form shortest and within the
+        // scalars (Unicode table 3-7).
+        let second = bytes[i + 1]
+        let low: u8 = if lead == 0xe0 {
+            0xa0
+        } else if lead == 0xf0 { 0x90 } else { 0x80 }
+        let high: u8 = if lead == 0xed {
+            0x9f
+        } else if lead == 0xf4 { 0x8f } else { 0xbf }
+        if second < low || second > high {
+            return Kind::Invalid
+        }
+        for byte in bytes.slice(offset: i + 2, len: len - 2) {
+            if byte < 0x80 || byte > 0xbf {
+                return Kind::Invalid
+            }
+        }
+        if lead == 0xc2 && second < 0xa0 {
+            return Kind::Control
+        }
+        i += len
+    }
+    Kind::Text
+}
+
+// Removes the spaces that end `out` after `start`.
+fn trim_spaces(_ out: mut MemBuffer, _ start: usize) {
+    var len = out.len()
+    while len > start && out[len - 1] == b' ' {
+        len -= 1
+    }
+    out.truncate(len)
+}
+
+#[test]
+fn a_new_buffer_is_empty() {
+    let buffer = Buffer::new(Size::new(width: 3, height: 2))
+    assert(buffer.cells().len() == 6)
+    assert(
+        buffer.get(Pos::new(x: 2, y: 1)) == Option::Some(Cell::EMPTY),
+    )
+    assert(buffer.get(Pos::new(x: 3, y: 0)).is_none())
+    assert(buffer.to_text() == "\n")
+    let none = Buffer::new(Size::new(width: 0, height: 0))
+    assert(
+        none.to_text().is_empty() && none.get(Pos::new(x: 0, y: 0)).is_none(),
+    )
+}
+
+// Writes `symbol` at `pos` as a symbol of width `width`, whatever its
+// clusters are, to test wide and long symbols apart from `text`.
+fn put_symbol(_ buffer: mut Buffer, _ pos: Pos, _ symbol: MemSpan, width: u8, _ style: Style) {
+    let (word, len) = buffer.intern(symbol)
+    let i = buffer.index(pos)
+    buffer.put(i, Glyph { symbol: word, len, width }, style)
+}
+
+fn at(_ buffer: Buffer, _ x: u16, _ y: u16) -> Cell {
+    buffer.get(Pos::new(x, y)).unwrap()
+}
+
+#[test]
+fn strings_clip_at_the_width_and_the_edge() {
+    var buffer = Buffer::new(Size::new(width: 6, height: 2))
+    let style = Style::new()
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 1, y: 0),
+                    format!("hello").span(),
+                    style,
+                    max_width: 3,
+                ) == 3,
+    )
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 3, y: 1),
+                    format!("hello").span(),
+                    style,
+                    max_width: 10,
+                ) == 3,
+    )
+    assert(buffer.to_text() == " hel\n   hel")
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 6, y: 0),
+                    format!("x").span(),
+                    style,
+                    max_width: 1,
+                ) == 0,
+    )
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 2),
+                    format!("x").span(),
+                    style,
+                    max_width: 1,
+                ) == 0,
+    )
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    format!("x").span(),
+                    style,
+                    max_width: 0,
+                ) == 0,
+    )
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    format!("").span(),
+                    style,
+                    max_width: 4,
+                ) == 0,
+    )
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 65535, y: 0),
+                    format!("x").span(),
+                    style,
+                    max_width: 65535,
+                )
+            == 0,
+    )
+    assert(buffer.to_text() == " hel\n   hel")
+}
+
+#[test]
+fn styles_apply_over_the_cells() {
+    var buffer = Buffer::new(Size::new(width: 4, height: 1))
+    buffer
+        .set_style(
+            Rect::new(x: 0, y: 0, width: 3, height: 1),
+            Style::new().bg(Color::BLUE).bold(),
+        )
+    buffer
+        .set_string(
+            Pos::new(x: 1, y: 0),
+            format!("ab").span(),
+            Style::new().fg(Color::RED),
+            max_width: 9,
+        )
+    let a = at(buffer, 1, 0)
+    assert(
+        a.fg() == Color::RED && a.bg() == Color::BLUE && a.modifier() == Modifier::BOLD,
+    )
+    let b = at(buffer, 2, 0)
+    assert(b.fg() == Color::RED && b.bg() == Color::BLUE)
+    let c = at(buffer, 3, 0)
+    assert(
+        c.fg() == Color::RESET && c.bg() == Color::RESET && c.modifier().is_empty(),
+    )
+    assert(
+        at(buffer, 0, 0).style() == Style::reset().bg(Color::BLUE).bold(),
+    )
+    buffer
+        .set_style(
+            Rect::new(x: 1, y: 0, width: 50, height: 50),
+            Style::new().without(Modifier::BOLD),
+        )
+    assert(
+        at(buffer, 2, 0).modifier().is_empty() && at(buffer, 0, 0).modifier() == Modifier::BOLD,
+    )
+    buffer.set_style(
+            Rect::new(x: 9, y: 9, width: 2, height: 2),
+            Style::new().italic(),
+        )
+    buffer.set_style(Rect::ZERO, Style::new().italic())
+    assert(at(buffer, 0, 0).modifier() == Modifier::BOLD)
+}
+
+#[test]
+fn controls_never_reach_a_cell() {
+    var text = MemBuffer::empty()
+    text.push(b'a')
+    text.push(0x1b)
+    text.push(b'[')
+    text.push(b'b')
+    text.push(b'\t')
+    text.push(b'\n')
+    text.push(0x7f)
+    text.push(0)
+    text.push(0xc2)
+    text.push(0x9b)
+    text.push(b'c')
+    text.push(0xc2)
+    text.push(0xa0)
+    var buffer = Buffer::new(Size::new(width: 8, height: 1))
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    text.span(),
+                    Style::new(),
+                    max_width: 8,
+                ) == 5,
+    )
+    var expected = format!("a[bc")
+    expected.push(0xc2)
+    expected.push(0xa0)
+    assert(buffer.to_text() == expected)
+    var escape = MemBuffer::empty()
+    escape.push(0x1b)
+    assert(
+        buffer.set_symbol(Pos::new(x: 6, y: 0), escape.span(), Style::new()) == 0,
+    )
+    buffer.fill(
+            Rect::new(x: 6, y: 0, width: 2, height: 1),
+            escape.span(),
+            Style::new(),
+        )
+    assert(
+        at(buffer, 6, 0) == Cell::EMPTY && at(buffer, 7, 0) == Cell::EMPTY,
+    )
+}
+
+#[test]
+fn bytes_that_are_no_utf8_draw_as_replacements() {
+    var text = MemBuffer::empty()
+    text.push(b'a')
+    text.push(0xff)
+    text.push(b'b')
+    var buffer = Buffer::new(Size::new(width: 4, height: 1))
+    assert(
+        buffer.set_string(
+                    Pos::new(x: 0, y: 0),
+                    text.span(),
+                    Style::new(),
+                    max_width: 4,
+                ) == 3,
+    )
+    assert(buffer.to_text() == "a�b")
+}
+
+#[test]
+fn symbols_take_their_first_cluster() {
+    var buffer = Buffer::new(Size::new(width: 3, height: 1))
+    assert(
+        buffer.set_symbol(Pos::new(x: 1, y: 0), format!("─x").span(), Style::new()) == 1,
+    )
+    assert(
+        buffer.set_symbol(Pos::new(x: 2, y: 0), format!("").span(), Style::new()) == 0,
+    )
+    assert(
+        buffer.set_symbol(Pos::new(x: 3, y: 0), format!("y").span(), Style::new()) == 0,
+    )
+    assert(buffer.to_text() == " ─")
+    var out = MemBuffer::empty()
+    buffer.write_symbol(at(buffer, 1, 0), mut out)
+    assert(out == "─")
+}
+
+#[test]
+fn fills_clip_to_the_buffer() {
+    var buffer = Buffer::new(Size::new(width: 4, height: 3))
+    buffer
+        .fill(
+            Rect::new(x: 1, y: 1, width: 9, height: 9),
+            format!("#!").span(),
+            Style::new().fg(Color::GREEN),
+        )
+    assert(buffer.to_text() == "\n ###\n ###")
+    assert(
+        at(buffer, 3, 2).fg() == Color::GREEN && at(buffer, 0, 2).fg() == Color::RESET,
+    )
+    buffer.fill(
+            Rect::new(x: 2, y: 0, width: 1, height: 3),
+            format!("").span(),
+            Style::new(),
+        )
+    assert(buffer.to_text() == "\n # #\n # #")
+    buffer.reset(Rect::new(x: 0, y: 2, width: 4, height: 1))
+    assert(buffer.to_text() == "\n # #\n")
+    assert(
+        at(buffer, 3, 2) == Cell::EMPTY && at(buffer, 3, 1).fg() == Color::GREEN,
+    )
+    buffer.fill(Rect::ZERO, format!("x").span(), Style::new())
+    buffer.fill(
+            Rect::new(x: 4, y: 0, width: 3, height: 3),
+            format!("x").span(),
+            Style::new(),
+        )
+    assert(buffer.to_text() == "\n # #\n")
+}
+
+#[test]
+fn overwriting_half_a_wide_symbol_blanks_the_other() {
+    let style = Style::new().fg(Color::CYAN)
+    var buffer = Buffer::new(Size::new(width: 6, height: 1))
+    put_symbol(
+        mut buffer,
+        Pos::new(x: 1, y: 0),
+        format!("界").span(),
+        width: 2,
+        style,
+    )
+    assert(
+        at(buffer, 1, 0).width() == 2 && at(buffer, 2, 0).is_continuation(),
+    )
+    assert(at(buffer, 2, 0).fg() == Color::CYAN)
+    assert(buffer.to_text() == " 界")
+    // The left half: the continuation becomes a space in its style.
+    buffer.set_string(
+            Pos::new(x: 1, y: 0),
+            format!("a").span(),
+            Style::new(),
+            max_width: 1,
+        )
+    assert(buffer.to_text() == " a")
+    assert(
+        at(buffer, 2, 0).width() == 1 && at(buffer, 2, 0).fg() == Color::CYAN,
+    )
+    // The continuation: the left half becomes a space.
+    put_symbol(
+        mut buffer,
+        Pos::new(x: 1, y: 0),
+        format!("界").span(),
+        width: 2,
+        style,
+    )
+    buffer.set_string(
+            Pos::new(x: 2, y: 0),
+            format!("b").span(),
+            Style::new(),
+            max_width: 1,
+        )
+    assert(buffer.to_text() == "  b")
+    assert(at(buffer, 1, 0).width() == 1)
+    // A wide symbol over the continuation of another.
+    put_symbol(
+        mut buffer,
+        Pos::new(x: 3, y: 0),
+        format!("界").span(),
+        width: 2,
+        style,
+    )
+    put_symbol(
+        mut buffer,
+        Pos::new(x: 2, y: 0),
+        format!("世").span(),
+        width: 2,
+        style,
+    )
+    assert(buffer.to_text() == "  世")
+    assert(at(buffer, 4, 0) == at(buffer, 1, 0))
+    // A wide symbol over the left half of another.
+    put_symbol(
+        mut buffer,
+        Pos::new(x: 3, y: 0),
+        format!("界").span(),
+        width: 2,
+        style,
+    )
+    assert(buffer.to_text() == "   界")
+    assert(at(buffer, 2, 0).width() == 1)
+}
+
+#[test]
+fn styling_half_a_wide_symbol_styles_it_whole() {
+    var buffer = Buffer::new(Size::new(width: 4, height: 1))
+    put_symbol(
+        mut buffer,
+        Pos::new(x: 0, y: 0),
+        format!("界").span(),
+        width: 2,
+        Style::new(),
+    )
+    buffer.set_style(
+            Rect::new(x: 1, y: 0, width: 1, height: 1),
+            Style::new().bg(Color::RED),
+        )
+    assert(
+        at(buffer, 0, 0).bg() == Color::RED && at(buffer, 1, 0).bg() == Color::RED,
+    )
+    assert(at(buffer, 1, 0).is_continuation())
+    buffer.set_style(
+            Rect::new(x: 0, y: 0, width: 1, height: 1),
+            Style::new().bold(),
+        )
+    assert(at(buffer, 1, 0).modifier() == Modifier::BOLD)
+}
+
+#[test]
+fn wide_fills_leave_a_space_in_an_odd_column() {
+    var buffer = Buffer::new(Size::new(width: 5, height: 1))
+    let (word, len) = buffer.intern(format!("界").span())
+    buffer.fill_glyph(
+            buffer.area(),
+            Glyph { symbol: word, len, width: 2 },
+            Style::new(),
+        )
+    assert(buffer.to_text() == "界界")
+    assert(
+        at(buffer, 4, 0).width() == 1 && at(buffer, 3, 0).is_continuation(),
+    )
+}
+
+#[test]
+fn long_symbols_live_in_the_side_table() {
+    // A family emoji: four people joined by ZWJs, 25 bytes.
+    let family = format!("👨‍👩‍👧‍👦")
+    var a = Buffer::new(Size::new(width: 6, height: 1))
+    var b = Buffer::new(Size::new(width: 6, height: 1))
+    put_symbol(
+        mut b,
+        Pos::new(x: 4, y: 0),
+        format!("123456789").span(),
+        width: 1,
+        Style::new(),
+    )
+    put_symbol(
+        mut a,
+        Pos::new(x: 0, y: 0),
+        family.span(),
+        width: 2,
+        Style::new(),
+    )
+    put_symbol(
+        mut a,
+        Pos::new(x: 2, y: 0),
+        family.span(),
+        width: 2,
+        Style::new(),
+    )
+    put_symbol(
+        mut b,
+        Pos::new(x: 0, y: 0),
+        family.span(),
+        width: 2,
+        Style::new(),
+    )
+    assert(a.longs.len() == 1 && a.long.len() == family.len())
+    var out = MemBuffer::empty()
+    a.write_symbol(at(a, 2, 0), mut out)
+    assert(out == family)
+    // `==` never equates cells whose symbols are in their buffers.
+    assert(at(a, 0, 0) != at(a, 0, 0))
+    assert(a.cell_eq(at(a, 0, 0), a, at(a, 2, 0)))
+    assert(a.cell_eq(at(a, 0, 0), b, at(b, 0, 0)))
+    assert(a.cell_eq(at(a, 1, 0), b, at(b, 1, 0)))
+    assert(!a.cell_eq(at(a, 0, 0), b, at(b, 4, 0)))
+    assert(!a.cell_eq(at(a, 4, 0), b, at(b, 4, 0)))
+    assert(a.cell_eq(at(a, 5, 0), b, at(b, 5, 0)))
+    var expected = MemBuffer::empty()
+    expected.extend_from(family.span())
+    expected.extend_from(family.span())
+    assert(a.to_text() == expected)
+    a.clear()
+    assert(
+        a.longs.len() == 0 && a.long.len() == 0 && a.to_text().is_empty(),
+    )
+    b.resize(Size::new(width: 2, height: 2))
+    assert(
+        b.longs.len() == 0 && b.long.len() == 0 && b.to_text() == "\n",
+    )
+}
+
+#[test]
+fn copies_keep_symbols_and_cut_wide_ones_at_the_edges() {
+    var source = Buffer::new(Size::new(width: 6, height: 2))
+    let family = format!("👨‍👩‍👧‍👦")
+    put_symbol(
+        mut source,
+        Pos::new(x: 0, y: 0),
+        family.span(),
+        width: 2,
+        Style::new().fg(Color::RED),
+    )
+    put_symbol(
+        mut source,
+        Pos::new(x: 3, y: 0),
+        format!("界").span(),
+        width: 2,
+        Style::new(),
+    )
+    source
+        .set_string(
+            Pos::new(x: 0, y: 1),
+            format!("abcdef").span(),
+            Style::new().bold(),
+            max_width: 6,
+        )
+    var target = Buffer::new(Size::new(width: 4, height: 3))
+    target.copy_from(source, area: source.area(), to: Pos::new(x: 1, y: 1))
+    var expected = format!("\n ")
+    expected.extend_from(family.span())
+    expected.extend_from(format!("\n abc").span())
+    assert(target.to_text() == expected)
+    assert(target.cell_eq(at(target, 1, 1), source, at(source, 0, 0)))
+    assert(at(target, 3, 2).modifier() == Modifier::BOLD)
+    target
+        .copy_from(
+            source,
+            area: Rect::new(x: 3, y: 0, width: 2, height: 1),
+            to: Pos::new(x: 0, y: 0),
+        )
+    assert(
+        at(target, 0, 0).width() == 2 && at(target, 1, 0).is_continuation(),
+    )
+    // A copy that starts on a continuation, and one cut by the right edge.
+    target
+        .copy_from(
+            source,
+            area: Rect::new(x: 4, y: 0, width: 2, height: 1),
+            to: Pos::new(x: 1, y: 0),
+        )
+    target
+        .copy_from(
+            source,
+            area: Rect::new(x: 3, y: 0, width: 2, height: 1),
+            to: Pos::new(x: 3, y: 0),
+        )
+    assert(
+        at(target, 0, 0).width() == 1 && at(target, 1, 0).width() == 1,
+    )
+    assert(
+        at(target, 3, 0).width() == 1 && target.to_text().span().slice(offset: 0, len: 1) == "\n",
+    )
+    target.copy_from(source, area: source.area(), to: Pos::new(x: 4, y: 0))
+    target.copy_from(source, area: Rect::ZERO, to: Pos::new(x: 0, y: 0))
+}

@@ -4,3 +4,4 @@ pub use style::{Color, Modifier, Style}
 pub use geom
 pub use style
 pub use text
+pub use buffer
