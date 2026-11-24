@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes the Unicode tables of `tui::text`: src/text/tables.fe, the
+"""Writes the Unicode tables of `fui::text`: src/text/tables.fe, the
 properties of each scalar, and src/text/grapheme_tests.fe, the cases of
 GraphemeBreakTest.txt as a test.
 

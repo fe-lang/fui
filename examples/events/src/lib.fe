@@ -7,8 +7,8 @@
 //! without. `q` alone or Ctrl+C quits.
 use std::term::Tty
 use std::time::Clock
-use tui::{App, Event, Flow, Frame, KeyboardFlags, MouseTracking, Options, Pos, Rect}
-use tui::frame::{print, theme}
+use fui::{App, Event, Flow, Frame, KeyboardFlags, MouseTracking, Options, Pos, Rect}
+use fui::frame::{print, theme}
 
 // The most lines kept: more than any screen shows.
 const KEPT: usize = 500
@@ -73,7 +73,7 @@ pub fn options() -> Options {
 
 pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
     var events = Events::new()
-    match tui::run(mut events, options()) {
+    match fui::run(mut events, options()) {
         Result::Ok(()) => 0,
         Result::Err(_) => 1,
     }
@@ -81,7 +81,7 @@ pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
 
 #[test]
 fn events_are_listed_newest_last() {
-    use tui::{Harness, KeyCode, Modifiers, Size}
+    use fui::{Harness, KeyCode, Modifiers, Size}
 
     var harness = Harness::with_options(Events::new(), Size::new(width: 40, height: 4), options())
     assert(harness.screen() == "Events (q or Ctrl+C quits)\n\n\n")
@@ -101,7 +101,7 @@ fn events_are_listed_newest_last() {
 
 #[test]
 fn raw_reports_are_decoded() {
-    use tui::{Harness, Size}
+    use fui::{Harness, Size}
 
     var harness = Harness::with_options(Events::new(), Size::new(width: 40, height: 4), options())
     var input = MemBuffer::empty()

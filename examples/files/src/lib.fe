@@ -20,8 +20,8 @@ use std::io::{Display, Error, Read}
 use std::process::{Command, Spawn}
 use std::term::Tty
 use std::time::Clock
-use tui::prelude::*
-use tui::text::valid_up_to
+use fui::prelude::*
+use fui::text::valid_up_to
 
 // The bytes of a file the preview reads: more than a screen shows.
 const PREVIEW_BYTES: usize = 8192
@@ -362,13 +362,16 @@ fn printable(_ bytes: MemBuffer, cut: bool) -> MemBuffer {
     shown
 }
 
-// A fresh, empty directory for the test `name`, under the scratch
-// directory of the TUI project: never `/tmp`, which is memory here.
+// A fresh, empty directory for the test `name` in the temporary directory:
+// `TMPDIR`, or `/tmp`.
 fn scratch_dir<N: Display>(_ name: N) -> MemBuffer
 uses (env: Env, fs: mut Fs, proc: mut Spawn)
 {
-    let home = env.lookup("HOME").unwrap()
-    let root = format!(home, "/.cache/fe-tui/f1/files-test/", name)
+    let tmp = match env.lookup("TMPDIR") {
+        Option::Some(dir) => dir,
+        Option::None => format!("/tmp"),
+    }
+    let root = format!(tmp, "/fui-files-test/", name)
     remove(root)
     fs.create_dir_all(root).unwrap()
     fs.canonicalize(root).unwrap()

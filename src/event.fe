@@ -1,5 +1,5 @@
 //! The events a program handles: keys, mouse actions, pastes, resizes and
-//! focus changes from the terminal (read by `tui::input::Parser`), and the
+//! focus changes from the terminal (read by `fui::input::Parser`), and the
 //! ticks and signals the runtime adds. They are made to be matched, with
 //! byte literals for ASCII keys and predicates where a pattern cannot say
 //! it:
@@ -604,7 +604,7 @@ impl Display for Mouse {
     }
 }
 
-/// A terminal's answer to one of the queries in `tui::input`.
+/// A terminal's answer to one of the queries in `fui::input`.
 pub enum Reply {
     /// The cursor's cell, answering `request_cursor_position`.
     CursorPosition(Pos),
@@ -680,7 +680,7 @@ impl Display for Reply {
 }
 
 /// The progressive enhancements of the kitty keyboard protocol, which
-/// `tui::input::push_keyboard_flags` asks for. The parser reads every form
+/// `fui::input::push_keyboard_flags` asks for. The parser reads every form
 /// they produce, and ignores the alternate keys and the text they add.
 pub struct KeyboardFlags { bits: u8 }
 

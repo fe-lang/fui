@@ -1,4 +1,4 @@
-//! What a typical app needs, for `use tui::prelude::*`.
+//! What a typical app needs, for `use fui::prelude::*`.
 //!
 //! The app trait and its loop, the test harness, the geometry, styles,
 //! layout, drawing functions, widgets with their states, styled text and

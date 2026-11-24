@@ -4,7 +4,7 @@
 //! shell's screen. `q` quits.
 use std::term::Tty
 use std::time::Clock
-use tui::prelude::*
+use fui::prelude::*
 
 /// The model: a list that `p` reads one past the end of.
 pub struct Buggy { pub values: MemVec<u64> }

@@ -1,4 +1,4 @@
-# tui
+# fui
 
 Terminal user interfaces for [Fe](https://github.com/argotorg/fe) programs:
 layout, widgets, styled text, keyboard and mouse input, a diffing renderer and
@@ -12,7 +12,7 @@ support. The library has no `unsafe` and no `extern`.
 
 ```toml
 [dependencies]
-tui = { source = "<repository URL>", rev = "<commit>" }
+fui = { source = "https://github.com/fe-lang/fui", rev = "<commit>" }
 ```
 
 ## A complete program
@@ -22,7 +22,7 @@ tui = { source = "<repository URL>", rev = "<commit>" }
 ```fe
 use std::term::Tty
 use std::time::Clock
-use tui::prelude::*
+use fui::prelude::*
 
 /// The model: the count.
 pub struct Counter { pub count: u64 }

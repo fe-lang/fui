@@ -1,4 +1,4 @@
 [ingot]
-name = "tui"
+name = "fui"
 version = "0.1.0"
 target = "native"

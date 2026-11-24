@@ -1,7 +1,7 @@
 //! Splitting a rectangle into rows or columns by constraints.
 //!
 //! ```fe
-//! use tui::layout::Constraint::{Fill, Length}
+//! use fui::layout::Constraint::{Fill, Length}
 //!
 //! let (head, body, status) = area.rows((Length(1), Fill(1), Length(1)))
 //! let parts = area.columns([Length(20), Fill(1)])   // [Rect; 2]

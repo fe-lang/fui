@@ -4,7 +4,7 @@
 //! or Ctrl+C quits. Ctrl+Z suspends, as in any program.
 use std::term::Tty
 use std::time::Clock
-use tui::prelude::*
+use fui::prelude::*
 
 /// The model: the count.
 pub struct Counter { pub count: u64 }

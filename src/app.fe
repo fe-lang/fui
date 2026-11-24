@@ -31,7 +31,7 @@
 //!
 //! pub fn main() -> i32 uses (tty: mut Tty, clock: Clock) {
 //!     var app = Counter { count: 0 }
-//!     match tui::run(mut app, Options::new()) {
+//!     match fui::run(mut app, Options::new()) {
 //!         Result::Ok(()) => 0,
 //!         Result::Err(_) => 1,
 //!     }

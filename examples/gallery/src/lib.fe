@@ -12,7 +12,7 @@ use std::term::Tty
 use std::abi::DynString
 use std::io::Display
 use std::time::{Clock, Duration}
-use tui::prelude::*
+use fui::prelude::*
 
 const PAGES: [String<8>; 4] = ["Items", "Table", "Form", "Progress"]
 const FORM: usize = 2

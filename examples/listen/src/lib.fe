@@ -24,8 +24,8 @@ use std::net::{
 }
 use std::term::Tty
 use std::time::Clock
-use tui::prelude::*
-use tui::{Session, TermBackend}
+use fui::prelude::*
+use fui::{Session, TermBackend}
 
 /// The model: the port listened on, and the peers accepted, oldest first.
 pub struct Server { pub port: u16, pub peers: MemVec<MemBuffer>, pub list: ListState }
