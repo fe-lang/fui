@@ -1,0 +1,242 @@
+//! A small bar chart of recent values.
+use core::ops::{Index, Len}
+use ingot::frame::{Frame, fill, theme}
+use ingot::geom::{Pos, Rect, min}
+use ingot::style::{Color, Style}
+use super::{clamp_u16, drawn, drawn_text}
+
+/// A bar for each value, a column wide, in the bottom-up eighths
+/// `▁▂▃▄▅▆▇█`:
+///
+/// ```fe
+/// fn view(self, _ area: Rect) uses (frame: mut Frame) {
+///     Sparkline::new().max(100).render(area, self.load.as_slice())
+/// }
+/// ```
+///
+/// The values are any indexable list of `u64`s, oldest first, such as a
+/// `MemSlice<u64>`. The chart shows the most recent values that fit, one
+/// per column, from the left edge, or with the last at the right edge if
+/// right-aligned. A bar grows in eighths of a cell over all rows of the
+/// area: a value of the maximum or more fills its column, and one that
+/// rounds down to no eighth shows none. The maximum is the one set, or else
+/// the largest value shown.
+///
+/// The bars take the theme's `accent` style, with the sparkline's style
+/// over it.
+pub struct Sparkline { style: Style, max: Option<u64>, right_aligned: bool }
+
+impl Copy for Sparkline {}
+
+impl Sparkline {
+    pub fn new() -> Self {
+        Sparkline { style: Style::NONE, max: Option::None, right_aligned: false }
+    }
+
+    /// The style for the bars, over the theme's `accent` style.
+    pub fn style(var own self, _ style: Style) -> Self {
+        self.style = style
+        self
+    }
+
+    /// Scales the bars so that `max` fills a column.
+    pub fn max(var own self, _ max: u64) -> Self {
+        self.max = Option::Some(max)
+        self
+    }
+
+    /// Draws the last value at the right edge when the values do not fill
+    /// the width.
+    pub fn right_aligned(var own self) -> Self {
+        self.right_aligned = true
+        self
+    }
+
+    /// Draws the most recent of `data` that fit over `area`.
+    pub fn render<C: Len + Index<usize, Output = u64>>(self, _ area: Rect, _ data: C)
+    uses (frame: mut Frame, C::E)
+    {
+        let count = data.len()
+        let shown = min(clamp_u16(count), area.width)
+        if area.is_empty() || shown == 0 {
+            return
+        }
+        let start = count - shown as usize
+        let max = match self.max {
+            Option::Some(max) => max,
+            Option::None => {
+                var max: u64 = 0
+                for i in start .. count {
+                    if data[i] > max {
+                        max = data[i]
+                    }
+                }
+                max
+            },
+        }
+        let style = theme().accent.patch(self.style)
+        let rows = area.height as u128 * 8
+        var x = area.x + self.right_aligned as u16 * (area.width - shown)
+        for i in start .. count {
+            let value = data[i]
+            let eighths: u128 = if max == 0 {
+                0
+            } else if value >= max {
+                rows
+            } else {
+                value as u128 * rows / max as u128
+            }
+            let column = Rect { x, y: area.y, width: 1, height: area.height }
+            let (rest, full) = column.split_bottom((eighths / 8).downcast_truncate())
+            fill(full, "█", style)
+            let (rest, edge) = rest.split_bottom((eighths % 8 > 0) as u16)
+            fill(edge, BARS[(eighths % 8).downcast_truncate()], style)
+            fill(rest, " ", style)
+            x += 1
+        }
+    }
+}
+
+// Bars of no eighth to seven eighths of a cell.
+const BARS: [String<3>; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"]
+
+#[test]
+fn values_draw_as_eighths_of_the_maximum() {
+    let data: [u64; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    let text = drawn_text(
+        width: 9,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Sparkline::new().render(area, data)
+            }
+        },
+    )
+    assert(text == " ▁▂▃▄▅▆▇█")
+    // Two rows hold 16 eighths of the largest value: 8 fills the bottom
+    // row, and 12 it and half the top one.
+    let text = drawn_text(
+        width: 4,
+        height: 2,
+        |frame, area| {
+            with (frame) {
+                Sparkline::new().render(area, [8 as u64, 3, 16, 12])
+            }
+        },
+    )
+    assert(text == "  █▄\n█▃██")
+    // A set maximum scales the bars, and caps them.
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Sparkline::new().max(16).render(area, [8 as u64, 3, 16, 99])
+            }
+        },
+    )
+    assert(text == "▄▁██")
+    let text = drawn_text(
+        width: 3,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Sparkline::new().render(area, [0 as u64, 0, 0])
+            }
+        },
+    )
+    assert(text == "")
+    let text = drawn_text(
+        width: 3,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Sparkline::new().max(0).render(area, [5 as u64, 0, 1])
+            }
+        },
+    )
+    assert(text == "")
+}
+
+#[test]
+fn the_most_recent_values_show() {
+    let values: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8]
+    var data: MemVec<u64> = MemVec::new()
+    for value in values {
+        data.push(value)
+    }
+    // The last four, scaled to the largest of them.
+    let text = drawn_text(
+        width: 4,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Sparkline::new().render(area, data.as_slice())
+            }
+        },
+    )
+    assert(text == "▅▆▇█")
+    let text = drawn_text(
+        width: 6,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                Sparkline::new().max(8).render(area, [8 as u64, 4])
+            }
+        },
+    )
+    assert(text == "█▄....")
+    let text = drawn_text(
+        width: 6,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                Sparkline::new().max(8).right_aligned().render(area, [8 as u64, 4])
+            }
+        },
+    )
+    assert(text == "....█▄")
+    let text = drawn_text(
+        width: 3,
+        height: 1,
+        |frame, area| {
+            with (frame) {
+                Sparkline::new().right_aligned().render(area, values)
+            }
+        },
+    )
+    assert(text == "▆▇█")
+}
+
+#[test]
+fn sparklines_draw_only_in_their_area() {
+    let buffer = drawn(
+        width: 5,
+        height: 4,
+        |frame, area| {
+            with (frame) {
+                fill(area, ".", Style::new())
+                Sparkline::new()
+                    .style(Style::new().fg(Color::RED))
+                    .render(
+                        Rect::new(x: 1, y: 1, width: 3, height: 2),
+                        [1 as u64, 4, 2, 0],
+                    )
+                Sparkline::new().render(Rect::new(x: 1, y: 0, width: 0, height: 4), [1 as u64])
+                Sparkline::new().render(Rect::new(x: 1, y: 3, width: 4, height: 0), [1 as u64])
+                let none: [u64; 0] = []
+                Sparkline::new().render(Rect::new(x: 0, y: 3, width: 4, height: 1), none)
+            }
+        },
+    )
+    // 4, 2 and 0 over two rows: 16, 8 and 0 eighths.
+    assert(buffer.to_text() == ".....\n.█  .\n.██ .\n.....")
+    assert(
+        buffer.get(Pos::new(x: 2, y: 2)).unwrap().fg() == Color::RED,
+    )
+    assert(
+        buffer.get(Pos::new(x: 3, y: 1)).unwrap().fg() == Color::RED,
+    )
+}
